@@ -14,6 +14,7 @@ import (
 	"testing/quick"
 	"time"
 
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 )
@@ -95,12 +96,12 @@ func TestPropertiesSave(t *testing.T) {
 
 	check1 := func(e *Properties) {
 		// Check that we can save properties and read them back.
-		var w rawBlockWriter
-		w.restartInterval = propertiesBlockRestartInterval
+		var w rowblk.Writer
+		w.RestartInterval = propertiesBlockRestartInterval
 		e.save(TableFormatPebblev2, &w)
 		var props Properties
 
-		require.NoError(t, props.load(w.finish(), 0, make(map[string]struct{})))
+		require.NoError(t, props.load(w.Finish(), make(map[string]struct{})))
 		props.Loaded = nil
 		if diff := pretty.Diff(*e, props); diff != nil {
 			t.Fatalf("%s", strings.Join(diff, "\n"))
@@ -122,15 +123,15 @@ func TestPropertiesSave(t *testing.T) {
 }
 
 func BenchmarkPropertiesLoad(b *testing.B) {
-	var w rawBlockWriter
-	w.restartInterval = propertiesBlockRestartInterval
+	var w rowblk.Writer
+	w.RestartInterval = propertiesBlockRestartInterval
 	testProps.save(TableFormatPebblev2, &w)
-	block := w.finish()
+	block := w.Finish()
 
 	b.ResetTimer()
 	p := &Properties{}
 	for i := 0; i < b.N; i++ {
 		*p = Properties{}
-		require.NoError(b, p.load(block, 0, nil))
+		require.NoError(b, p.load(block, nil))
 	}
 }

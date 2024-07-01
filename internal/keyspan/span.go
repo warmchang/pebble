@@ -7,8 +7,8 @@ package keyspan // import "github.com/cockroachdb/pebble/internal/keyspan"
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -47,7 +47,7 @@ type Span struct {
 type KeysOrder int8
 
 const (
-	// ByTrailerDesc indicates a Span's keys are sorted by Trailer descending.
+	// ByTrailerDesc indicates a Span's keys are sorted by InternalKeyTrailer descending.
 	// This is the default ordering, and the ordering used during physical
 	// storage.
 	ByTrailerDesc KeysOrder = iota
@@ -61,7 +61,7 @@ const (
 // is applied.
 type Key struct {
 	// Trailer contains the key kind and sequence number.
-	Trailer uint64
+	Trailer base.InternalKeyTrailer
 	// Suffix holds an optional suffix associated with the key. This is only
 	// non-nil for RANGEKEYSET and RANGEKEYUNSET keys.
 	Suffix []byte
@@ -72,17 +72,17 @@ type Key struct {
 }
 
 // SeqNum returns the sequence number component of the key.
-func (k Key) SeqNum() uint64 {
-	return k.Trailer >> 8
+func (k Key) SeqNum() base.SeqNum {
+	return k.Trailer.SeqNum()
 }
 
 // VisibleAt returns true if the provided key is visible at the provided
 // snapshot sequence number. It interprets batch sequence numbers as always
 // visible, because non-visible batch span keys are filtered when they're
 // fragmented.
-func (k Key) VisibleAt(snapshot uint64) bool {
+func (k Key) VisibleAt(snapshot base.SeqNum) bool {
 	seq := k.SeqNum()
-	return seq < snapshot || seq&base.InternalKeySeqNumBatch != 0
+	return seq < snapshot || seq&base.SeqNumBatchBit != 0
 }
 
 // Kind returns the kind component of the key.
@@ -97,6 +97,28 @@ func (k Key) Equal(equal base.Equal, b Key) bool {
 	return k.Trailer == b.Trailer &&
 		equal(k.Suffix, b.Suffix) &&
 		bytes.Equal(k.Value, b.Value)
+}
+
+// CopyFrom copies the contents of another key, retaining the Suffix and Value slices.
+func (k *Key) CopyFrom(other Key) {
+	k.Trailer = other.Trailer
+	k.Suffix = append(k.Suffix[:0], other.Suffix...)
+	k.Value = append(k.Value[:0], other.Value...)
+}
+
+// Clone creates a deep clone of the key, copying the Suffix and Value
+// slices.
+func (k Key) Clone() Key {
+	res := Key{
+		Trailer: k.Trailer,
+	}
+	if len(k.Suffix) > 0 {
+		res.Suffix = slices.Clone(k.Suffix)
+	}
+	if len(k.Value) > 0 {
+		res.Value = slices.Clone(k.Value)
+	}
+	return res
 }
 
 func (k Key) String() string {
@@ -169,7 +191,7 @@ func (s *Span) LargestKey() base.InternalKey {
 // SmallestSeqNum returns the smallest sequence number of a key contained within
 // the span. It requires the Span's keys be in ByTrailerDesc order. It panics if
 // the span contains no keys or its keys are sorted in a different order.
-func (s *Span) SmallestSeqNum() uint64 {
+func (s *Span) SmallestSeqNum() base.SeqNum {
 	if len(s.Keys) == 0 {
 		panic("pebble: Span contains no keys")
 	} else if s.KeysOrder != ByTrailerDesc {
@@ -182,7 +204,7 @@ func (s *Span) SmallestSeqNum() uint64 {
 // LargestSeqNum returns the largest sequence number of a key contained within
 // the span. It requires the Span's keys be in ByTrailerDesc order. It panics if
 // the span contains no keys or its keys are sorted in a different order.
-func (s *Span) LargestSeqNum() uint64 {
+func (s *Span) LargestSeqNum() base.SeqNum {
 	if len(s.Keys) == 0 {
 		panic("pebble: Span contains no keys")
 	} else if s.KeysOrder != ByTrailerDesc {
@@ -195,7 +217,7 @@ func (s *Span) LargestSeqNum() uint64 {
 // within the span that's also visible at the provided snapshot sequence number.
 // It requires the Span's keys be in ByTrailerDesc order. It panics if the span
 // contains no keys or its keys are sorted in a different order.
-func (s *Span) LargestVisibleSeqNum(snapshot uint64) (largest uint64, ok bool) {
+func (s *Span) LargestVisibleSeqNum(snapshot base.SeqNum) (largest base.SeqNum, ok bool) {
 	if s == nil {
 		return 0, false
 	} else if len(s.Keys) == 0 {
@@ -220,7 +242,7 @@ func (s *Span) LargestVisibleSeqNum(snapshot uint64) (largest uint64, ok bool) {
 //
 // Visible may incur an allocation, so callers should prefer targeted,
 // non-allocating methods when possible.
-func (s Span) Visible(snapshot uint64) Span {
+func (s Span) Visible(snapshot base.SeqNum) Span {
 	if s.KeysOrder != ByTrailerDesc {
 		panic("pebble: span's keys unexpectedly not in trailer order")
 	}
@@ -250,7 +272,7 @@ func (s Span) Visible(snapshot uint64) Span {
 	lastBatchIdx := -1
 	lastNonVisibleIdx := -1
 	for i := range s.Keys {
-		if seqNum := s.Keys[i].SeqNum(); seqNum&base.InternalKeySeqNumBatch != 0 {
+		if seqNum := s.Keys[i].SeqNum(); seqNum&base.SeqNumBatchBit != 0 {
 			// Batch key. Always visible.
 			lastBatchIdx = i
 		} else if seqNum >= snapshot {
@@ -297,13 +319,13 @@ func (s Span) Visible(snapshot uint64) Span {
 //
 // VisibleAt requires the Span's keys be in ByTrailerDesc order. It panics if
 // the span's keys are sorted in a different order.
-func (s *Span) VisibleAt(snapshot uint64) bool {
+func (s *Span) VisibleAt(snapshot base.SeqNum) bool {
 	if s.KeysOrder != ByTrailerDesc {
 		panic("pebble: span's keys unexpectedly not in trailer order")
 	}
 	if len(s.Keys) == 0 {
 		return false
-	} else if first := s.Keys[0].SeqNum(); first&base.InternalKeySeqNumBatch != 0 {
+	} else if first := s.Keys[0].SeqNum(); first&base.SeqNumBatchBit != 0 {
 		// Only visible batch keys are included when an Iterator's batch spans
 		// are fragmented. They must always be visible.
 		return true
@@ -317,41 +339,17 @@ func (s *Span) VisibleAt(snapshot uint64) bool {
 	}
 }
 
-// ShallowClone returns the span with a Keys slice owned by the span itself.
-// None of the key byte slices are cloned (see Span.DeepClone).
-func (s *Span) ShallowClone() Span {
+// Clone clones the span, creating copies of all contained slices. Clone is
+// allocation heavy and should not be used in hot paths.
+func (s *Span) Clone() Span {
 	c := Span{
-		Start:     s.Start,
-		End:       s.End,
-		Keys:      make([]Key, len(s.Keys)),
+		Start:     slices.Clone(s.Start),
+		End:       slices.Clone(s.End),
 		KeysOrder: s.KeysOrder,
 	}
-	copy(c.Keys, s.Keys)
-	return c
-}
-
-// DeepClone clones the span, creating copies of all contained slices. DeepClone
-// is intended for non-production code paths like tests, the level checker, etc
-// because it is allocation heavy.
-func (s *Span) DeepClone() Span {
-	c := Span{
-		Start:     make([]byte, len(s.Start)),
-		End:       make([]byte, len(s.End)),
-		Keys:      make([]Key, len(s.Keys)),
-		KeysOrder: s.KeysOrder,
-	}
-	copy(c.Start, s.Start)
-	copy(c.End, s.End)
-	for i := range s.Keys {
-		c.Keys[i].Trailer = s.Keys[i].Trailer
-		if len(s.Keys[i].Suffix) > 0 {
-			c.Keys[i].Suffix = make([]byte, len(s.Keys[i].Suffix))
-			copy(c.Keys[i].Suffix, s.Keys[i].Suffix)
-		}
-		if len(s.Keys[i].Value) > 0 {
-			c.Keys[i].Value = make([]byte, len(s.Keys[i].Value))
-			copy(c.Keys[i].Value, s.Keys[i].Value)
-		}
+	c.Keys = make([]Key, len(s.Keys))
+	for i := range c.Keys {
+		c.Keys[i] = s.Keys[i].Clone()
 	}
 	return c
 }
@@ -365,7 +363,7 @@ func (s *Span) Contains(cmp base.Compare, key []byte) bool {
 //
 // Covers requires the Span's keys be in ByTrailerDesc order. It panics if the
 // span's keys are sorted in a different order.
-func (s Span) Covers(seqNum uint64) bool {
+func (s Span) Covers(seqNum base.SeqNum) bool {
 	if s.KeysOrder != ByTrailerDesc {
 		panic("pebble: span's keys unexpectedly not in trailer order")
 	}
@@ -381,14 +379,14 @@ func (s Span) Covers(seqNum uint64) bool {
 //
 // CoversAt requires the Span's keys be in ByTrailerDesc order. It panics if the
 // span's keys are sorted in a different order.
-func (s *Span) CoversAt(snapshot, seqNum uint64) bool {
+func (s *Span) CoversAt(snapshot, seqNum base.SeqNum) bool {
 	if s.KeysOrder != ByTrailerDesc {
 		panic("pebble: span's keys unexpectedly not in trailer order")
 	}
 	// NB: A key is visible at `snapshot` if its sequence number is strictly
 	// less than `snapshot`. See base.Visible.
 	for i := range s.Keys {
-		if kseq := s.Keys[i].SeqNum(); kseq&base.InternalKeySeqNumBatch != 0 {
+		if kseq := s.Keys[i].SeqNum(); kseq&base.SeqNumBatchBit != 0 {
 			// Only visible batch keys are included when an Iterator's batch spans
 			// are fragmented. They must always be visible.
 			return kseq > seqNum
@@ -407,12 +405,22 @@ func (s *Span) Reset() {
 	s.Keys = s.Keys[:0]
 }
 
-// CopyFrom copies the contents of the other span, retaining the slices
-// allocated in this span. Key.Suffix and Key.Value slices are not cloned.
+// CopyFrom deep-copies the contents of the other span, retaining the slices
+// allocated in this span.
 func (s *Span) CopyFrom(other *Span) {
 	s.Start = append(s.Start[:0], other.Start...)
 	s.End = append(s.End[:0], other.End...)
-	s.Keys = append(s.Keys[:0], other.Keys...)
+
+	// We want to preserve any existing Suffix/Value buffers.
+	if cap(s.Keys) >= len(other.Keys) {
+		s.Keys = s.Keys[:len(other.Keys)]
+	} else {
+		s.Keys = append(s.Keys[:cap(s.Keys)], make([]Key, len(other.Keys)-cap(s.Keys))...)
+	}
+	for i := range other.Keys {
+		s.Keys[i].CopyFrom(other.Keys[i])
+	}
+
 	s.KeysOrder = other.KeysOrder
 }
 
@@ -483,9 +491,12 @@ func ParseSpan(input string) Span {
 	// Each of the remaining parts represents a single Key.
 	s.Keys = make([]Key, 0, len(parts)-2)
 	for _, p := range parts[2:] {
+		if len(p) >= 2 && p[0] == '(' && p[len(p)-1] == ')' {
+			p = p[1 : len(p)-1]
+		}
 		keyFields := strings.FieldsFunc(p, func(r rune) bool {
 			switch r {
-			case '#', ',', '(', ')':
+			case '#', ',':
 				return true
 			default:
 				return unicode.IsSpace(r)
@@ -493,12 +504,7 @@ func ParseSpan(input string) Span {
 		})
 
 		var k Key
-		// Parse the sequence number.
-		seqNum, err := strconv.ParseUint(keyFields[0], 10, 64)
-		if err != nil {
-			panic(fmt.Sprintf("invalid sequence number: %q: %s", keyFields[0], err))
-		}
-		// Parse the key kind.
+		seqNum := base.ParseSeqNum(keyFields[0])
 		kind := base.ParseKind(keyFields[1])
 		k.Trailer = base.MakeTrailer(seqNum, kind)
 		// Parse the optional suffix.

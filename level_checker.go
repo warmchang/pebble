@@ -54,9 +54,17 @@ type simpleMergingIterLevel struct {
 	tombstone *keyspan.Span
 }
 
+func (ml *simpleMergingIterLevel) setRangeDelIter(iter keyspan.FragmentIterator) {
+	ml.tombstone = nil
+	if ml.rangeDelIter != nil {
+		ml.rangeDelIter.Close()
+	}
+	ml.rangeDelIter = iter
+}
+
 type simpleMergingIter struct {
 	levels   []simpleMergingIterLevel
-	snapshot uint64
+	snapshot base.SeqNum
 	heap     simpleMergingIterHeap
 	// The last point's key and level. For validation.
 	lastKey     InternalKey
@@ -74,7 +82,7 @@ type simpleMergingIter struct {
 func (m *simpleMergingIter) init(
 	merge Merge,
 	cmp Compare,
-	snapshot uint64,
+	snapshot base.SeqNum,
 	formatKey base.FormatKey,
 	levels ...simpleMergingIterLevel,
 ) {
@@ -128,7 +136,7 @@ func (m *simpleMergingIter) step() bool {
 	item := &m.heap.items[0]
 	l := &m.levels[item.index]
 	// Sentinels are not relevant for this point checking.
-	if !item.key.IsExclusiveSentinel() && item.key.Visible(m.snapshot, base.InternalKeySeqNumMax) {
+	if !item.key.IsExclusiveSentinel() && item.key.Visible(m.snapshot, base.SeqNumMax) {
 		// This is a visible point key.
 		if !m.handleVisiblePoint(item, l) {
 			return false
@@ -358,7 +366,7 @@ type checkConfig struct {
 	comparer  *Comparer
 	readState *readState
 	newIters  tableNewIters
-	seqNum    uint64
+	seqNum    base.SeqNum
 	stats     *CheckLevelsStats
 	merge     Merge
 	formatKey base.FormatKey
@@ -448,7 +456,7 @@ func addTombstonesFromIter(
 	lsmLevel int,
 	fileNum FileNum,
 	tombstones []tombstoneWithLevel,
-	seqNum uint64,
+	seqNum base.SeqNum,
 	cmp Compare,
 	formatKey base.FormatKey,
 ) (_ []tombstoneWithLevel, err error) {
@@ -459,7 +467,7 @@ func addTombstonesFromIter(
 		if t.Empty() {
 			continue
 		}
-		t = t.DeepClone()
+		t = t.Clone()
 		// This is mainly a test for rangeDelV2 formatted blocks which are expected to
 		// be ordered and fragmented on disk. But we anyways check for memtables,
 		// rangeDelV1 as well.
@@ -634,7 +642,7 @@ func checkLevelsInternal(c *checkConfig) (err error) {
 		li := &levelIter{}
 		li.init(context.Background(), iterOpts, c.comparer, c.newIters, manifestIter,
 			manifest.L0Sublevel(sublevel), internalIterOpts{})
-		li.initRangeDel(&mlevelAlloc[0].rangeDelIter)
+		li.initRangeDel(mlevelAlloc[0].setRangeDelIter)
 		mlevelAlloc[0].iter = li
 		mlevelAlloc = mlevelAlloc[1:]
 	}
@@ -647,7 +655,7 @@ func checkLevelsInternal(c *checkConfig) (err error) {
 		li := &levelIter{}
 		li.init(context.Background(), iterOpts, c.comparer, c.newIters,
 			current.Levels[level].Iter(), manifest.Level(level), internalIterOpts{})
-		li.initRangeDel(&mlevelAlloc[0].rangeDelIter)
+		li.initRangeDel(mlevelAlloc[0].setRangeDelIter)
 		mlevelAlloc[0].iter = li
 		mlevelAlloc = mlevelAlloc[1:]
 	}

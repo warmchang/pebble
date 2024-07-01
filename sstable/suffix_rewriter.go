@@ -6,13 +6,14 @@ import (
 	"math"
 	"sync"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/bytealloc"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
 // RewriteKeySuffixesAndReturnFormat copies the content of the passed SSTable
@@ -147,12 +148,13 @@ var errBadKind = errors.New("key does not have expected kind (set)")
 type blockWithSpan struct {
 	start, end InternalKey
 	data       []byte
+	trailer    block.Trailer
 }
 
 func rewriteBlocks(
 	r *Reader,
 	restartInterval int,
-	checksumType ChecksumType,
+	checksumType block.ChecksumType,
 	compression Compression,
 	input []BlockHandleWithProperties,
 	output []blockWithSpan,
@@ -160,21 +162,15 @@ func rewriteBlocks(
 	from, to []byte,
 	split Split,
 ) error {
-	bw := blockWriter{
-		restartInterval: restartInterval,
-	}
-	buf := blockBuf{checksummer: checksummer{checksumType: checksumType}}
-	if checksumType == ChecksumTypeXXHash {
-		buf.checksummer.xxHasher = xxhash.New()
-	}
-
+	bw := rowblk.Writer{RestartInterval: restartInterval}
+	buf := blockBuf{checksummer: block.Checksummer{Type: checksumType}}
 	var blockAlloc bytealloc.A
 	var keyAlloc bytealloc.A
 	var scratch InternalKey
 
 	var inputBlock, inputBlockBuf []byte
 
-	iter := &blockIter{}
+	iter := &rowblk.Iter{}
 
 	// We'll assume all blocks are _roughly_ equal so round-robin static partition
 	// of each worker doing every ith block is probably enough.
@@ -182,23 +178,27 @@ func rewriteBlocks(
 		bh := input[i]
 
 		var err error
-		inputBlock, inputBlockBuf, err = readBlockBuf(r, bh.BlockHandle, inputBlockBuf)
+		inputBlock, inputBlockBuf, err = readBlockBuf(r, bh.Handle, inputBlockBuf)
 		if err != nil {
 			return err
 		}
-		if err := iter.init(r.Compare, r.Split, inputBlock, NoTransforms); err != nil {
+		if err := iter.Init(r.Compare, r.Split, inputBlock, NoTransforms); err != nil {
 			return err
 		}
 
-		if cap(bw.restarts) < int(iter.restarts) {
-			bw.restarts = make([]uint32, 0, iter.restarts)
-		}
-		if cap(bw.buf) == 0 {
-			bw.buf = make([]byte, 0, len(inputBlock))
-		}
-		if cap(bw.restarts) < int(iter.numRestarts) {
-			bw.restarts = make([]uint32, 0, iter.numRestarts)
-		}
+		/*
+			TODO(jackson): Move rewriteBlocks into rowblk.
+
+			if cap(bw.restarts) < int(iter.restarts) {
+				bw.restarts = make([]uint32, 0, iter.restarts)
+			}
+			if cap(bw.buf) == 0 {
+				bw.buf = make([]byte, 0, len(inputBlock))
+			}
+			if cap(bw.restarts) < int(iter.numRestarts) {
+				bw.restarts = make([]uint32, 0, iter.numRestarts)
+			}
+		*/
 
 		for kv := iter.First(); kv != nil; kv = iter.Next() {
 			if kv.Kind() != InternalKeyKindSet {
@@ -230,29 +230,29 @@ func rewriteBlocks(
 				if len(v) < 1 {
 					return errors.Errorf("value has no prefix")
 				}
-				prefix := valuePrefix(v[0])
-				if isValueHandle(prefix) {
+				prefix := block.ValuePrefix(v[0])
+				if prefix.IsValueHandle() {
 					return errors.Errorf("value prefix is incorrect")
 				}
-				if setHasSamePrefix(prefix) {
+				if prefix.SetHasSamePrefix() {
 					return errors.Errorf("multiple keys with same key prefix")
 				}
 			}
-			bw.add(scratch, v)
+			bw.Add(scratch, v)
 			if output[i].start.UserKey == nil {
 				keyAlloc, output[i].start = cloneKeyWithBuf(scratch, keyAlloc)
 			}
 		}
-		*iter = iter.resetForReuse()
+		*iter = iter.ResetForReuse()
 
 		keyAlloc, output[i].end = cloneKeyWithBuf(scratch, keyAlloc)
 
-		finished := compressAndChecksum(bw.finish(), compression, &buf)
+		finished, trailer := compressAndChecksum(bw.Finish(), compression, &buf)
 
 		// copy our finished block into the output buffer.
-		blockAlloc, output[i].data = blockAlloc.Alloc(len(finished) + blockTrailerLen)
+		blockAlloc, output[i].data = blockAlloc.Alloc(len(finished))
 		copy(output[i].data, finished)
-		copy(output[i].data[len(finished):], buf.tmp[:blockTrailerLen])
+		output[i].trailer = trailer
 	}
 	return nil
 }
@@ -296,8 +296,8 @@ func rewriteDataBlocksToWriter(
 			defer g.Done()
 			err := rewriteBlocks(
 				r,
-				w.dataBlockBuf.dataBlock.restartInterval,
-				w.blockBuf.checksummer.checksumType,
+				w.dataBlockBuf.dataBlock.RestartInterval,
+				w.blockBuf.checksummer.Type,
 				w.compression,
 				data,
 				blocks,
@@ -341,14 +341,10 @@ func rewriteDataBlocksToWriter(
 
 	for i := range blocks {
 		// Write the rewritten block to the file.
-		if err := w.writable.Write(blocks[i].data); err != nil {
+		bh, err := w.layout.WritePrecompressedDataBlock(blocks[i].data, blocks[i].trailer)
+		if err != nil {
 			return err
 		}
-
-		n := len(blocks[i].data)
-		bh := BlockHandle{Offset: w.meta.Size, Length: uint64(n) - blockTrailerLen}
-		// Update the overall size.
-		w.meta.Size += uint64(n)
 
 		// Load any previous values for our prop collectors into oldProps.
 		for i := range oldProps {
@@ -384,6 +380,7 @@ func rewriteDataBlocksToWriter(
 		}
 	}
 
+	w.meta.Size = w.layout.offset
 	w.meta.updateSeqNum(blocks[0].start.SeqNum())
 	w.props.NumEntries = r.Properties.NumEntries
 	w.props.RawKeySize = r.Properties.RawKeySize
@@ -394,7 +391,7 @@ func rewriteDataBlocksToWriter(
 }
 
 func rewriteRangeKeyBlockToWriter(r *Reader, w *Writer, from, to []byte) error {
-	iter, err := r.NewRawRangeKeyIter(NoTransforms)
+	iter, err := r.NewRawRangeKeyIter(NoFragmentTransforms)
 	if err != nil {
 		return err
 	}
@@ -491,9 +488,7 @@ func RewriteKeySuffixesViaWriter(
 		if err != nil {
 			return nil, err
 		}
-		if w.addPoint(scratch, val, false); err != nil {
-			return nil, err
-		}
+		w.addPoint(scratch, val, false)
 		kv = i.Next()
 	}
 	if err := rewriteRangeKeyBlockToWriter(r, w, from, to); err != nil {
@@ -513,8 +508,8 @@ func NewMemReader(sst []byte, o ReaderOptions) (*Reader, error) {
 	return NewReader(newMemReader(sst), o)
 }
 
-func readBlockBuf(r *Reader, bh BlockHandle, buf []byte) ([]byte, []byte, error) {
-	raw := r.readable.(*memReader).b[bh.Offset : bh.Offset+bh.Length+blockTrailerLen]
+func readBlockBuf(r *Reader, bh block.Handle, buf []byte) ([]byte, []byte, error) {
+	raw := r.readable.(*memReader).b[bh.Offset : bh.Offset+bh.Length+block.TrailerLen]
 	if err := checkChecksum(r.checksumType, raw, bh, 0); err != nil {
 		return nil, buf, err
 	}

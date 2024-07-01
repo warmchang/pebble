@@ -80,9 +80,9 @@ func loadVersion(t *testing.T, d *datadriven.TestData) (*version, *Options, stri
 				var key InternalKey
 				if level == 0 {
 					// For L0, make `size` overlapping files.
-					key = base.MakeInternalKey([]byte(fmt.Sprintf("%04d", 1)), i, InternalKeyKindSet)
+					key = base.MakeInternalKey([]byte(fmt.Sprintf("%04d", 1)), base.SeqNum(i), InternalKeyKindSet)
 				} else {
-					key = base.MakeInternalKey([]byte(fmt.Sprintf("%04d", i)), i, InternalKeyKindSet)
+					key = base.MakeInternalKey([]byte(fmt.Sprintf("%04d", i)), base.SeqNum(i), InternalKeyKindSet)
 				}
 				m := (&fileMetadata{
 					FileNum:               base.FileNum(uint64(level)*100_000 + i),
@@ -107,7 +107,7 @@ func loadVersion(t *testing.T, d *datadriven.TestData) (*version, *Options, stri
 					// TestCompactionPickerTargetLevel. Clean this up somehow.
 					m.Size = size
 					if level != 0 {
-						endKey := base.MakeInternalKey([]byte(fmt.Sprintf("%04d", size)), i, InternalKeyKindSet)
+						endKey := base.MakeInternalKey([]byte(fmt.Sprintf("%04d", size)), base.SeqNum(i), InternalKeyKindSet)
 						m.ExtendPointKeyBounds(opts.Comparer.Compare, key, endKey)
 					}
 				}
@@ -227,7 +227,7 @@ func TestCompactionPickerTargetLevel(t *testing.T) {
 				for {
 					env := compactionEnv{
 						diskAvailBytes:          math.MaxUint64,
-						earliestUnflushedSeqNum: InternalKeySeqNumMax,
+						earliestUnflushedSeqNum: base.SeqNumMax,
 						inProgressCompactions:   inProgress,
 					}
 					pc := pickerByScore.pickAuto(env)
@@ -299,7 +299,7 @@ func TestCompactionPickerTargetLevel(t *testing.T) {
 				var b strings.Builder
 				fmt.Fprintf(&b, "Initial state before pick:\n%s", runVersionFileSizes(vers))
 				pc := pickerByScore.pickAuto(compactionEnv{
-					earliestUnflushedSeqNum: InternalKeySeqNumMax,
+					earliestUnflushedSeqNum: base.SeqNumMax,
 					inProgressCompactions:   inProgress,
 				})
 				if pc != nil {
@@ -316,7 +316,7 @@ func TestCompactionPickerTargetLevel(t *testing.T) {
 				d.MaybeScanArgs(t, "start", &start)
 				d.MaybeScanArgs(t, "end", &end)
 
-				iStart := base.MakeInternalKey([]byte(start), InternalKeySeqNumMax, InternalKeyKindMax)
+				iStart := base.MakeInternalKey([]byte(start), base.SeqNumMax, InternalKeyKindMax)
 				iEnd := base.MakeInternalKey([]byte(end), 0, 0)
 				manual := &manualCompaction{
 					done:  make(chan error, 1),
@@ -329,7 +329,7 @@ func TestCompactionPickerTargetLevel(t *testing.T) {
 					pickerByScore.vers,
 					opts,
 					compactionEnv{
-						earliestUnflushedSeqNum: InternalKeySeqNumMax,
+						earliestUnflushedSeqNum: base.SeqNumMax,
 					},
 					pickerByScore.getBaseLevel(),
 					manual)

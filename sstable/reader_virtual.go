@@ -10,6 +10,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/rangekey"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 // VirtualReader wraps Reader. Its purpose is to restrict functionality of the
@@ -94,7 +95,7 @@ func (v *VirtualReader) NewCompactionIter(
 	categoryAndQoS CategoryAndQoS,
 	statsCollector *CategoryStatsCollector,
 	rp ReaderProvider,
-	bufferPool *BufferPool,
+	bufferPool *block.BufferPool,
 ) (Iterator, error) {
 	return v.reader.newCompactionIter(
 		transforms, categoryAndQoS, statsCollector, rp, &v.vState, bufferPool)
@@ -128,7 +129,7 @@ func (v *VirtualReader) ValidateBlockChecksumsOnBacking() error {
 
 // NewRawRangeDelIter wraps Reader.NewRawRangeDelIter.
 func (v *VirtualReader) NewRawRangeDelIter(
-	transforms IterTransforms,
+	transforms FragmentIterTransforms,
 ) (keyspan.FragmentIterator, error) {
 	iter, err := v.reader.NewRawRangeDelIter(transforms)
 	if err != nil {
@@ -154,7 +155,7 @@ func (v *VirtualReader) NewRawRangeDelIter(
 
 // NewRawRangeKeyIter wraps Reader.NewRawRangeKeyIter.
 func (v *VirtualReader) NewRawRangeKeyIter(
-	transforms IterTransforms,
+	transforms FragmentIterTransforms,
 ) (keyspan.FragmentIterator, error) {
 	syntheticSeqNum := transforms.SyntheticSeqNum
 	if v.vState.isSharedIngested {
@@ -179,7 +180,7 @@ func (v *VirtualReader) NewRawRangeKeyIter(
 		// transform iter into VirtualReader.
 		transform := &rangekey.ForeignSSTTransformer{
 			Equal:  v.reader.Equal,
-			SeqNum: uint64(syntheticSeqNum),
+			SeqNum: base.SeqNum(syntheticSeqNum),
 		}
 		transformIter := &keyspan.TransformerIter{
 			FragmentIterator: iter,

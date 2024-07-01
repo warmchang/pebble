@@ -20,7 +20,7 @@ import (
 type getIter struct {
 	comparer *Comparer
 	newIters tableNewIters
-	snapshot uint64
+	snapshot base.SeqNum
 	iterOpts IterOptions
 	key      []byte
 	prefix   []byte
@@ -36,7 +36,7 @@ type getIter struct {
 	// deletion encounterd transitions tombstoned to true. The tombstonedSeqNum
 	// field is updated to hold the sequence number of the tombstone.
 	tombstoned       bool
-	tombstonedSeqNum uint64
+	tombstonedSeqNum base.SeqNum
 	err              error
 }
 
@@ -110,7 +110,7 @@ func (g *getIter) Next() *base.InternalKV {
 					// If the KV pair is not visible at the get's snapshot,
 					// Next. The level may still contain older keys with the
 					// same user key that are visible.
-					if !g.iterKV.Visible(g.snapshot, base.InternalKeySeqNumMax) {
+					if !g.iterKV.Visible(g.snapshot, base.SeqNumMax) {
 						g.iterKV = g.iter.Next()
 						continue
 					}
@@ -173,7 +173,7 @@ func (g *getIter) initializeNextIterator() (ok bool) {
 		if !g.maybeSetTombstone(g.batch.newRangeDelIter(nil,
 			// Get always reads the entirety of the batch's history, so no
 			// batch keys should be filtered.
-			base.InternalKeySeqNumMax,
+			base.SeqNumMax,
 		)) {
 			return false
 		}

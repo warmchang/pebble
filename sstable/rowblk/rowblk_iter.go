@@ -2,55 +2,58 @@
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
-package sstable
+package rowblk
 
 import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
+	"io"
+	"slices"
+	"sort"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/manual"
-	"golang.org/x/exp/slices"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
-// blockIter is an iterator over a single block of data.
+// Iter is an iterator over a single block of data.
 //
-// A blockIter provides an additional guarantee around key stability when a
-// block has a restart interval of 1 (i.e. when there is no prefix
-// compression). Key stability refers to whether the InternalKey.UserKey bytes
-// returned by a positioning call will remain stable after a subsequent
-// positioning call. The normal case is that a positioning call will invalidate
-// any previously returned InternalKey.UserKey. If a block has a restart
-// interval of 1 (no prefix compression), blockIter guarantees that
-// InternalKey.UserKey will point to the key as stored in the block itself
-// which will remain valid until the blockIter is closed. The key stability
-// guarantee is used by the range tombstone and range key code, which knows that
-// the respective blocks are always encoded with a restart interval of 1. This
-// per-block key stability guarantee is sufficient for range tombstones and
-// range deletes as they are always encoded in a single block. Note: this
-// stability guarantee no longer holds for a block iter with synthetic suffix
-// replacement, but this doesn't matter, as the user will not open
-// an iterator with a synthetic suffix on a block with rangekeys (for now).
+// An Iter provides an additional guarantee around key stability when a block
+// has a restart interval of 1 (i.e. when there is no prefix compression). Key
+// stability refers to whether the InternalKey.UserKey bytes returned by a
+// positioning call will remain stable after a subsequent positioning call. The
+// normal case is that a positioning call will invalidate any previously
+// returned InternalKey.UserKey. If a block has a restart interval of 1 (no
+// prefix compression), Iter guarantees that InternalKey.UserKey will point to
+// the key as stored in the block itself which will remain valid until the Iter
+// is closed. The key stability guarantee is used by the range tombstone and
+// range key code, which knows that the respective blocks are always encoded
+// with a restart interval of 1. This per-block key stability guarantee is
+// sufficient for range tombstones and range deletes as they are always encoded
+// in a single block. Note: this stability guarantee no longer holds for a block
+// iter with synthetic prefix/suffix replacement, but we don't use the synthetic
+// suffix/prefix functionality of Iter for range keys.
 //
-// A blockIter also provides a value stability guarantee for range deletions and
+// An Iter also provides a value stability guarantee for range deletions and
 // range keys since there is only a single range deletion and range key block
-// per sstable and the blockIter will not release the bytes for the block until
-// it is closed.
+// per sstable and the Iter will not release the bytes for the block until it is
+// closed.
 //
-// Note on why blockIter knows about lazyValueHandling:
+// Note on why Iter knows about lazyValueHandling:
 //
-// blockIter's positioning functions (that return a LazyValue), are too
-// complex to inline even prior to lazyValueHandling. blockIter.Next and
-// blockIter.First were by far the cheapest and had costs 195 and 180
+// Iter's positioning functions (that return a LazyValue), are too
+// complex to inline even prior to lazyValueHandling. Iter.Next and
+// Iter.First were by far the cheapest and had costs 195 and 180
 // respectively, which exceeds the budget of 80. We initially tried to keep
-// the lazyValueHandling logic out of blockIter by wrapping it with a
+// the lazyValueHandling logic out of Iter by wrapping it with a
 // lazyValueDataBlockIter. singleLevelIter and twoLevelIter would use this
 // wrapped iter. The functions in lazyValueDataBlockIter were simple, in that
-// they called the corresponding blockIter func and then decided whether the
+// they called the corresponding Iter func and then decided whether the
 // value was in fact in-place (so return immediately) or needed further
 // handling. But these also turned out too costly for mid-stack inlining since
 // simple calls like the following have a high cost that is barely under the
@@ -61,7 +64,7 @@ import (
 //
 // We have 2 options for minimizing performance regressions:
 //   - Include the lazyValueHandling logic in the already non-inlineable
-//     blockIter functions: Since most of the time is spent in data block iters,
+//     Iter functions: Since most of the time is spent in data block iters,
 //     it is acceptable to take the small hit of unnecessary branching (which
 //     hopefully branch prediction will predict correctly) for other kinds of
 //     blocks.
@@ -70,9 +73,9 @@ import (
 //     v3 sstable. We would want to manage these copies via code generation.
 //
 // We have picked the first option here.
-type blockIter struct {
-	cmp   Compare
-	split Split
+type Iter struct {
+	cmp   base.Compare
+	split base.Split
 
 	// Iterator transforms.
 	//
@@ -107,7 +110,7 @@ type blockIter struct {
 	//
 	// In addition, we also assume that any block with rangekeys will not contain
 	// a synthetic suffix.
-	transforms IterTransforms
+	transforms block.IterTransforms
 
 	// offset is the byte index that marks where the current key/value is
 	// encoded in the block.
@@ -179,11 +182,11 @@ type blockIter struct {
 	// restart points.
 	cached    []blockEntry
 	cachedBuf []byte
-	handle    bufferHandle
+	handle    block.BufferHandle
 	// for block iteration for already loaded blocks.
 	firstUserKey      []byte
 	lazyValueHandling struct {
-		vbr            *valueBlockReader
+		getLazyValue   func([]byte) base.LazyValue
 		hasValuePrefix bool
 	}
 	synthSuffixBuf            []byte
@@ -199,21 +202,26 @@ type blockEntry struct {
 }
 
 // blockIter implements the base.InternalIterator interface.
-var _ base.InternalIterator = (*blockIter)(nil)
+var _ base.InternalIterator = (*Iter)(nil)
 
-func newBlockIter(
-	cmp Compare, split Split, block block, transforms IterTransforms,
-) (*blockIter, error) {
-	i := &blockIter{}
-	return i, i.init(cmp, split, block, transforms)
+// NewIter constructs a new row-oriented block iterator over the provided serialized block.
+func NewIter(
+	cmp base.Compare, split base.Split, block []byte, transforms block.IterTransforms,
+) (*Iter, error) {
+	i := &Iter{}
+	return i, i.Init(cmp, split, block, transforms)
 }
 
-func (i *blockIter) String() string {
+// String implements fmt.Stringer.
+func (i *Iter) String() string {
 	return "block"
 }
 
-func (i *blockIter) init(cmp Compare, split Split, block block, transforms IterTransforms) error {
-	numRestarts := int32(binary.LittleEndian.Uint32(block[len(block)-4:]))
+// Init initializes the block iterator from the provided block.
+func (i *Iter) Init(
+	cmp base.Compare, split base.Split, blk []byte, transforms block.IterTransforms,
+) error {
+	numRestarts := int32(binary.LittleEndian.Uint32(blk[len(blk)-4:]))
 	if numRestarts == 0 {
 		return base.CorruptionErrorf("pebble/table: invalid table (block has no restart points)")
 	}
@@ -221,10 +229,10 @@ func (i *blockIter) init(cmp Compare, split Split, block block, transforms IterT
 	i.synthSuffixBuf = i.synthSuffixBuf[:0]
 	i.split = split
 	i.cmp = cmp
-	i.restarts = int32(len(block)) - 4*(1+numRestarts)
+	i.restarts = int32(len(blk)) - 4*(1+numRestarts)
 	i.numRestarts = numRestarts
-	i.ptr = unsafe.Pointer(&block[0])
-	i.data = block
+	i.ptr = unsafe.Pointer(&blk[0])
+	i.data = blk
 	if i.transforms.SyntheticPrefix.IsSet() {
 		i.fullKey = append(i.fullKey[:0], i.transforms.SyntheticPrefix...)
 	} else {
@@ -243,19 +251,40 @@ func (i *blockIter) init(cmp Compare, split Split, block block, transforms IterT
 	return nil
 }
 
+// InitHandle initializes an iterator from the provided block handle.
 // NB: two cases of hideObsoletePoints:
 //   - Local sstable iteration: syntheticSeqNum will be set iff the sstable was
 //     ingested.
 //   - Foreign sstable iteration: syntheticSeqNum is always set.
-func (i *blockIter) initHandle(
-	cmp Compare, split Split, block bufferHandle, transforms IterTransforms,
+func (i *Iter) InitHandle(
+	cmp base.Compare, split base.Split, block block.BufferHandle, transforms block.IterTransforms,
 ) error {
 	i.handle.Release()
 	i.handle = block
-	return i.init(cmp, split, block.Get(), transforms)
+	return i.Init(cmp, split, block.Get(), transforms)
 }
 
-func (i *blockIter) invalidate() {
+// SetHasValuePrefix sets whether or not the block iterator should expect values
+// corresponding to Set keys to have a prefix byte.
+func (i *Iter) SetHasValuePrefix(hasValuePrefix bool) {
+	i.lazyValueHandling.hasValuePrefix = hasValuePrefix
+}
+
+// SetGetLazyValue sets the function the iterator should use to get lazy values
+// when the value encodes a value prefix.
+func (i *Iter) SetGetLazyValue(fn func([]byte) base.LazyValue) {
+	i.lazyValueHandling.getLazyValue = fn
+}
+
+// Handle returns the underlying block buffer handle, if the iterator was
+// initialized with one.
+func (i *Iter) Handle() block.BufferHandle {
+	return i.handle
+}
+
+// Invalidate invalidates the block iterator, removing references to the block
+// it was initialized with.
+func (i *Iter) Invalidate() {
 	i.clearCache()
 	i.offset = 0
 	i.nextOffset = 0
@@ -264,15 +293,17 @@ func (i *blockIter) invalidate() {
 	i.data = nil
 }
 
-// isDataInvalidated returns true when the blockIter has been invalidated
+// IsDataInvalidated returns true when the blockIter has been invalidated
 // using an invalidate call. NB: this is different from blockIter.Valid
 // which is part of the InternalIterator implementation.
-func (i *blockIter) isDataInvalidated() bool {
+func (i *Iter) IsDataInvalidated() bool {
 	return i.data == nil
 }
 
-func (i *blockIter) resetForReuse() blockIter {
-	return blockIter{
+// ResetForReuse resets the blockIter for reuse, retaining buffers to avoid
+// future allocations.
+func (i *Iter) ResetForReuse() Iter {
+	return Iter{
 		fullKey:                   i.fullKey[:0],
 		cached:                    i.cached[:0],
 		cachedBuf:                 i.cachedBuf[:0],
@@ -281,7 +312,7 @@ func (i *blockIter) resetForReuse() blockIter {
 	}
 }
 
-func (i *blockIter) readEntry() {
+func (i *Iter) readEntry() {
 	ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(i.offset))
 
 	// This is an ugly performance hack. Reading entries from blocks is one of
@@ -366,7 +397,7 @@ func (i *blockIter) readEntry() {
 	i.nextOffset = int32(uintptr(ptr)-uintptr(i.ptr)) + int32(value)
 }
 
-func (i *blockIter) readFirstKey() error {
+func (i *Iter) readFirstKey() error {
 	ptr := i.ptr
 
 	// This is an ugly performance hack. Reading entries from blocks is one of
@@ -434,25 +465,20 @@ func (i *blockIter) readFirstKey() error {
 	return nil
 }
 
-// The sstable internal obsolete bit is set when writing a block and unset by
-// blockIter, so no code outside block writing/reading code ever sees it.
-const trailerObsoleteBit = uint64(base.InternalKeyKindSSTableInternalObsoleteBit)
-const trailerObsoleteMask = (InternalKeySeqNumMax << 8) | uint64(base.InternalKeyKindSSTableInternalObsoleteMask)
-
-func (i *blockIter) decodeInternalKey(key []byte) (hiddenPoint bool) {
+func (i *Iter) decodeInternalKey(key []byte) (hiddenPoint bool) {
 	// Manually inlining base.DecodeInternalKey provides a 5-10% speedup on
 	// BlockIter benchmarks.
 	if n := len(key) - 8; n >= 0 {
-		trailer := binary.LittleEndian.Uint64(key[n:])
+		trailer := base.InternalKeyTrailer(binary.LittleEndian.Uint64(key[n:]))
 		hiddenPoint = i.transforms.HideObsoletePoints &&
-			(trailer&trailerObsoleteBit != 0)
-		i.ikv.K.Trailer = trailer & trailerObsoleteMask
+			(trailer&TrailerObsoleteBit != 0)
+		i.ikv.K.Trailer = trailer & TrailerObsoleteMask
 		i.ikv.K.UserKey = key[:n:n]
 		if n := i.transforms.SyntheticSeqNum; n != 0 {
-			i.ikv.K.SetSeqNum(uint64(n))
+			i.ikv.K.SetSeqNum(base.SeqNum(n))
 		}
 	} else {
-		i.ikv.K.Trailer = uint64(InternalKeyKindInvalid)
+		i.ikv.K.Trailer = base.InternalKeyTrailer(base.InternalKeyKindInvalid)
 		i.ikv.K.UserKey = nil
 	}
 	return hiddenPoint
@@ -460,7 +486,7 @@ func (i *blockIter) decodeInternalKey(key []byte) (hiddenPoint bool) {
 
 // maybeReplaceSuffix replaces the suffix in i.ikey.UserKey with
 // i.transforms.syntheticSuffix.
-func (i *blockIter) maybeReplaceSuffix() {
+func (i *Iter) maybeReplaceSuffix() {
 	if i.transforms.SyntheticSuffix.IsSet() && i.ikv.K.UserKey != nil {
 		prefixLen := i.split(i.ikv.K.UserKey)
 		// If ikey is cached or may get cached, we must copy
@@ -471,12 +497,12 @@ func (i *blockIter) maybeReplaceSuffix() {
 	}
 }
 
-func (i *blockIter) clearCache() {
+func (i *Iter) clearCache() {
 	i.cached = i.cached[:0]
 	i.cachedBuf = i.cachedBuf[:0]
 }
 
-func (i *blockIter) cacheEntry() {
+func (i *Iter) cacheEntry() {
 	var valStart int32
 	valSize := int32(len(i.val))
 	if valSize > 0 {
@@ -493,14 +519,15 @@ func (i *blockIter) cacheEntry() {
 	i.cachedBuf = append(i.cachedBuf, i.key...)
 }
 
-func (i *blockIter) getFirstUserKey() []byte {
+// FirstUserKey returns the user key of the first key in the block.
+func (i *Iter) FirstUserKey() []byte {
 	return i.firstUserKey
 }
 
 // SeekGE implements internalIterator.SeekGE, as documented in the pebble
 // package.
-func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
-	if invariants.Enabled && i.isDataInvalidated() {
+func (i *Iter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+	if invariants.Enabled && i.IsDataInvalidated() {
 		panic(errors.AssertionFailedf("invalidated blockIter used"))
 	}
 	searchKey := key
@@ -615,7 +642,7 @@ func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV 
 	hiddenPoint := i.decodeInternalKey(i.key)
 
 	// Iterate from that restart point to somewhere >= the key sought.
-	if !i.valid() {
+	if !i.Valid() {
 		return nil
 	}
 
@@ -652,16 +679,16 @@ func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV 
 	if !hiddenPoint && i.cmp(i.ikv.K.UserKey, key) >= 0 {
 		// Initialize i.lazyValue
 		if !i.lazyValueHandling.hasValuePrefix ||
-			base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+			i.ikv.K.Kind() != base.InternalKeyKindSet {
 			i.ikv.V = base.MakeInPlaceValue(i.val)
-		} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+		} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 			i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 		} else {
-			i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+			i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 		}
 		return &i.ikv
 	}
-	for i.Next(); i.valid(); i.Next() {
+	for i.Next(); i.Valid(); i.Next() {
 		if i.cmp(i.ikv.K.UserKey, key) >= 0 {
 			// i.Next() has already initialized i.ikv.LazyValue.
 			return &i.ikv
@@ -672,15 +699,15 @@ func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV 
 
 // SeekPrefixGE implements internalIterator.SeekPrefixGE, as documented in the
 // pebble package.
-func (i *blockIter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
+func (i *Iter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
 	// This should never be called as prefix iteration is handled by sstable.Iterator.
 	panic("pebble: SeekPrefixGE unimplemented")
 }
 
 // SeekLT implements internalIterator.SeekLT, as documented in the pebble
 // package.
-func (i *blockIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
-	if invariants.Enabled && i.isDataInvalidated() {
+func (i *Iter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+	if invariants.Enabled && i.IsDataInvalidated() {
 		panic(errors.AssertionFailedf("invalidated blockIter used"))
 	}
 	searchKey := key
@@ -931,29 +958,29 @@ func (i *blockIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV 
 		i.cacheEntry()
 	}
 
-	if !i.valid() {
+	if !i.Valid() {
 		return nil
 	}
 	if !i.lazyValueHandling.hasValuePrefix ||
-		base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+		i.ikv.K.Kind() != base.InternalKeyKindSet {
 		i.ikv.V = base.MakeInPlaceValue(i.val)
-	} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+	} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 		i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 	} else {
-		i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+		i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 	}
 	return &i.ikv
 }
 
 // First implements internalIterator.First, as documented in the pebble
 // package.
-func (i *blockIter) First() *base.InternalKV {
-	if invariants.Enabled && i.isDataInvalidated() {
+func (i *Iter) First() *base.InternalKV {
+	if invariants.Enabled && i.IsDataInvalidated() {
 		panic(errors.AssertionFailedf("invalidated blockIter used"))
 	}
 
 	i.offset = 0
-	if !i.valid() {
+	if !i.Valid() {
 		return nil
 	}
 	i.clearCache()
@@ -964,15 +991,18 @@ func (i *blockIter) First() *base.InternalKV {
 	}
 	i.maybeReplaceSuffix()
 	if !i.lazyValueHandling.hasValuePrefix ||
-		base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+		i.ikv.K.Kind() != base.InternalKeyKindSet {
 		i.ikv.V = base.MakeInPlaceValue(i.val)
-	} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+	} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 		i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 	} else {
-		i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+		i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 	}
 	return &i.ikv
 }
+
+const restartMaskLittleEndianHighByteWithoutSetHasSamePrefix byte = 0b0111_1111
+const restartMaskLittleEndianHighByteOnlySetHasSamePrefix byte = 0b1000_0000
 
 func decodeRestart(b []byte) int32 {
 	_ = b[3] // bounds check hint to compiler; see golang.org/issue/14808
@@ -981,14 +1011,14 @@ func decodeRestart(b []byte) int32 {
 }
 
 // Last implements internalIterator.Last, as documented in the pebble package.
-func (i *blockIter) Last() *base.InternalKV {
-	if invariants.Enabled && i.isDataInvalidated() {
+func (i *Iter) Last() *base.InternalKV {
+	if invariants.Enabled && i.IsDataInvalidated() {
 		panic(errors.AssertionFailedf("invalidated blockIter used"))
 	}
 
 	// Seek forward from the last restart point.
 	i.offset = decodeRestart(i.data[i.restarts+4*(i.numRestarts-1):])
-	if !i.valid() {
+	if !i.Valid() {
 		return nil
 	}
 
@@ -1007,19 +1037,19 @@ func (i *blockIter) Last() *base.InternalKV {
 	}
 	i.maybeReplaceSuffix()
 	if !i.lazyValueHandling.hasValuePrefix ||
-		base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+		i.ikv.K.Kind() != base.InternalKeyKindSet {
 		i.ikv.V = base.MakeInPlaceValue(i.val)
-	} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+	} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 		i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 	} else {
-		i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+		i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 	}
 	return &i.ikv
 }
 
 // Next implements internalIterator.Next, as documented in the pebble
 // package.
-func (i *blockIter) Next() *base.InternalKV {
+func (i *Iter) Next() *base.InternalKV {
 	if len(i.cachedBuf) > 0 {
 		// We're switching from reverse iteration to forward iteration. We need to
 		// populate i.fullKey with the current key we're positioned at so that
@@ -1037,19 +1067,19 @@ func (i *blockIter) Next() *base.InternalKV {
 
 start:
 	i.offset = i.nextOffset
-	if !i.valid() {
+	if !i.Valid() {
 		return nil
 	}
 	i.readEntry()
 	// Manually inlined version of i.decodeInternalKey(i.key).
 	if n := len(i.key) - 8; n >= 0 {
-		trailer := binary.LittleEndian.Uint64(i.key[n:])
+		trailer := base.InternalKeyTrailer(binary.LittleEndian.Uint64(i.key[n:]))
 		hiddenPoint := i.transforms.HideObsoletePoints &&
-			(trailer&trailerObsoleteBit != 0)
-		i.ikv.K.Trailer = trailer & trailerObsoleteMask
+			(trailer&TrailerObsoleteBit != 0)
+		i.ikv.K.Trailer = trailer & TrailerObsoleteMask
 		i.ikv.K.UserKey = i.key[:n:n]
 		if n := i.transforms.SyntheticSeqNum; n != 0 {
-			i.ikv.K.SetSeqNum(uint64(n))
+			i.ikv.K.SetSeqNum(base.SeqNum(n))
 		}
 		if hiddenPoint {
 			goto start
@@ -1062,22 +1092,22 @@ start:
 			i.ikv.K.UserKey = i.synthSuffixBuf
 		}
 	} else {
-		i.ikv.K.Trailer = uint64(InternalKeyKindInvalid)
+		i.ikv.K.Trailer = base.InternalKeyTrailer(base.InternalKeyKindInvalid)
 		i.ikv.K.UserKey = nil
 	}
 	if !i.lazyValueHandling.hasValuePrefix ||
-		base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+		i.ikv.K.Kind() != base.InternalKeyKindSet {
 		i.ikv.V = base.MakeInPlaceValue(i.val)
-	} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+	} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 		i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 	} else {
-		i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+		i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 	}
 	return &i.ikv
 }
 
 // NextPrefix implements (base.InternalIterator).NextPrefix.
-func (i *blockIter) NextPrefix(succKey []byte) *base.InternalKV {
+func (i *Iter) NextPrefix(succKey []byte) *base.InternalKV {
 	if i.lazyValueHandling.hasValuePrefix {
 		return i.nextPrefixV3(succKey)
 	}
@@ -1092,7 +1122,7 @@ func (i *blockIter) NextPrefix(succKey []byte) *base.InternalKV {
 	return kv
 }
 
-func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
+func (i *Iter) nextPrefixV3(succKey []byte) *base.InternalKV {
 	// Doing nexts that involve a key comparison can be expensive (and the cost
 	// depends on the key length), so we use the same threshold of 3 that we use
 	// for TableFormatPebblev2 in blockIter.nextPrefix above. The next fast path
@@ -1114,13 +1144,13 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 	nextFastCount := 0
 	usedRestarts := false
 	// INVARIANT: blockIter is valid.
-	if invariants.Enabled && !i.valid() {
+	if invariants.Enabled && !i.Valid() {
 		panic(errors.AssertionFailedf("nextPrefixV3 called on invalid blockIter"))
 	}
-	prevKeyIsSet := i.ikv.Kind() == InternalKeyKindSet
+	prevKeyIsSet := i.ikv.Kind() == base.InternalKeyKindSet
 	for {
 		i.offset = i.nextOffset
-		if !i.valid() {
+		if !i.Valid() {
 			return nil
 		}
 		// Need to decode the length integers, so we can compute nextOffset.
@@ -1204,15 +1234,15 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 		}
 		// The trailer is written in little endian, so the key kind is the first
 		// byte in the trailer that is encoded in the slice [unshared-8:unshared].
-		keyKind := InternalKeyKind((*[manual.MaxArrayLen]byte)(ptr)[unshared-8])
+		keyKind := base.InternalKeyKind((*[manual.MaxArrayLen]byte)(ptr)[unshared-8])
 		keyKind = keyKind & base.InternalKeyKindSSTableInternalObsoleteMask
 		prefixChanged := false
-		if keyKind == InternalKeyKindSet {
+		if keyKind == base.InternalKeyKindSet {
 			if invariants.Enabled && value == 0 {
 				panic(errors.AssertionFailedf("value is of length 0, but we expect a valuePrefix"))
 			}
-			valPrefix := *((*valuePrefix)(valuePtr))
-			if setHasSamePrefix(valPrefix) {
+			valPrefix := *((*block.ValuePrefix)(valuePtr))
+			if valPrefix.SetHasSamePrefix() {
 				// Fast-path. No need to assemble i.fullKey, or update i.key. We know
 				// that subsequent keys will not have a shared length that is greater
 				// than the prefix of the current key, which is also the prefix of
@@ -1323,15 +1353,15 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 		// Manually inlined version of i.decodeInternalKey(i.key).
 		hiddenPoint := false
 		if n := len(i.key) - 8; n >= 0 {
-			trailer := binary.LittleEndian.Uint64(i.key[n:])
+			trailer := base.InternalKeyTrailer(binary.LittleEndian.Uint64(i.key[n:]))
 			hiddenPoint = i.transforms.HideObsoletePoints &&
-				(trailer&trailerObsoleteBit != 0)
+				(trailer&TrailerObsoleteBit != 0)
 			i.ikv.K = base.InternalKey{
-				Trailer: trailer & trailerObsoleteMask,
+				Trailer: trailer & TrailerObsoleteMask,
 				UserKey: i.key[:n:n],
 			}
 			if n := i.transforms.SyntheticSeqNum; n != 0 {
-				i.ikv.K.SetSeqNum(uint64(n))
+				i.ikv.K.SetSeqNum(base.SeqNum(n))
 			}
 			if i.transforms.SyntheticSuffix.IsSet() {
 				// Inlined version of i.maybeReplaceSuffix()
@@ -1341,7 +1371,7 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 				i.ikv.K.UserKey = i.synthSuffixBuf
 			}
 		} else {
-			i.ikv.K.Trailer = uint64(InternalKeyKindInvalid)
+			i.ikv.K.Trailer = base.InternalKeyTrailer(base.InternalKeyKindInvalid)
 			i.ikv.K.UserKey = nil
 		}
 		nextCmpCount++
@@ -1357,12 +1387,12 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 			if invariants.Enabled && !i.lazyValueHandling.hasValuePrefix {
 				panic(errors.AssertionFailedf("nextPrefixV3 being run for non-v3 sstable"))
 			}
-			if base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+			if i.ikv.K.Kind() != base.InternalKeyKindSet {
 				i.ikv.V = base.MakeInPlaceValue(i.val)
-			} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+			} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 				i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 			} else {
-				i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+				i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 			}
 			return &i.ikv
 		}
@@ -1377,7 +1407,7 @@ func (i *blockIter) nextPrefixV3(succKey []byte) *base.InternalKV {
 
 // Prev implements internalIterator.Prev, as documented in the pebble
 // package.
-func (i *blockIter) Prev() *base.InternalKV {
+func (i *Iter) Prev() *base.InternalKV {
 start:
 	for n := len(i.cached) - 1; n >= 0; n-- {
 		i.nextOffset = i.offset
@@ -1387,18 +1417,18 @@ start:
 		// Manually inlined version of i.decodeInternalKey(i.key).
 		i.key = i.cachedBuf[e.keyStart:e.keyEnd]
 		if n := len(i.key) - 8; n >= 0 {
-			trailer := binary.LittleEndian.Uint64(i.key[n:])
+			trailer := base.InternalKeyTrailer(binary.LittleEndian.Uint64(i.key[n:]))
 			hiddenPoint := i.transforms.HideObsoletePoints &&
-				(trailer&trailerObsoleteBit != 0)
+				(trailer&TrailerObsoleteBit != 0)
 			if hiddenPoint {
 				continue
 			}
 			i.ikv.K = base.InternalKey{
-				Trailer: trailer & trailerObsoleteMask,
+				Trailer: trailer & TrailerObsoleteMask,
 				UserKey: i.key[:n:n],
 			}
 			if n := i.transforms.SyntheticSeqNum; n != 0 {
-				i.ikv.K.SetSeqNum(uint64(n))
+				i.ikv.K.SetSeqNum(base.SeqNum(n))
 			}
 			if i.transforms.SyntheticSuffix.IsSet() {
 				// Inlined version of i.maybeReplaceSuffix()
@@ -1410,17 +1440,17 @@ start:
 				i.ikv.K.UserKey = i.synthSuffixBuf
 			}
 		} else {
-			i.ikv.K.Trailer = uint64(InternalKeyKindInvalid)
+			i.ikv.K.Trailer = base.InternalKeyTrailer(base.InternalKeyKindInvalid)
 			i.ikv.K.UserKey = nil
 		}
 		i.cached = i.cached[:n]
 		if !i.lazyValueHandling.hasValuePrefix ||
-			base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+			i.ikv.K.Kind() != base.InternalKeyKindSet {
 			i.ikv.V = base.MakeInPlaceValue(i.val)
-		} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+		} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 			i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 		} else {
-			i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+			i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 		}
 		return &i.ikv
 	}
@@ -1496,54 +1526,420 @@ start:
 		i.ikv.K.UserKey = i.synthSuffixBuf
 	}
 	if !i.lazyValueHandling.hasValuePrefix ||
-		base.TrailerKind(i.ikv.K.Trailer) != InternalKeyKindSet {
+		i.ikv.K.Kind() != base.InternalKeyKindSet {
 		i.ikv.V = base.MakeInPlaceValue(i.val)
-	} else if i.lazyValueHandling.vbr == nil || !isValueHandle(valuePrefix(i.val[0])) {
+	} else if i.lazyValueHandling.getLazyValue == nil || !block.ValuePrefix(i.val[0]).IsValueHandle() {
 		i.ikv.V = base.MakeInPlaceValue(i.val[1:])
 	} else {
-		i.ikv.V = i.lazyValueHandling.vbr.getLazyValueForPrefixAndValueHandle(i.val)
+		i.ikv.V = i.lazyValueHandling.getLazyValue(i.val)
 	}
 	return &i.ikv
 }
 
 // Key returns the internal key at the current iterator position.
-func (i *blockIter) Key() *InternalKey {
+func (i *Iter) Key() *base.InternalKey {
 	return &i.ikv.K
 }
 
 // KV returns the internal KV at the current iterator position.
-func (i *blockIter) KV() *base.InternalKV {
+func (i *Iter) KV() *base.InternalKV {
 	return &i.ikv
 }
 
-func (i *blockIter) value() base.LazyValue {
+// Value returns the value at the current iterator position.
+func (i *Iter) Value() base.LazyValue {
 	return i.ikv.V
 }
 
 // Error implements internalIterator.Error, as documented in the pebble
 // package.
-func (i *blockIter) Error() error {
+func (i *Iter) Error() error {
 	return nil // infallible
 }
 
 // Close implements internalIterator.Close, as documented in the pebble
 // package.
-func (i *blockIter) Close() error {
+func (i *Iter) Close() error {
 	i.handle.Release()
-	i.handle = bufferHandle{}
+	i.handle = block.BufferHandle{}
 	i.val = nil
 	i.ikv = base.InternalKV{}
-	i.lazyValueHandling.vbr = nil
+	i.lazyValueHandling.getLazyValue = nil
 	return nil
 }
 
-func (i *blockIter) SetBounds(lower, upper []byte) {
+// SetBounds implements base.InternalIterator. It panics, as bounds should
+// always be handled the by the parent sstable iterator.
+func (i *Iter) SetBounds(lower, upper []byte) {
 	// This should never be called as bounds are handled by sstable.Iterator.
 	panic("pebble: SetBounds unimplemented")
 }
 
-func (i *blockIter) SetContext(_ context.Context) {}
+// SetContext implements base.InternalIterator.
+func (i *Iter) SetContext(_ context.Context) {}
 
-func (i *blockIter) valid() bool {
+// Valid returns true if the iterator is currently positioned at a valid KV.
+func (i *Iter) Valid() bool {
 	return i.offset >= 0 && i.offset < i.restarts
+}
+
+func (i *Iter) getRestart(idx int) int32 {
+	return int32(binary.LittleEndian.Uint32(i.data[i.restarts+4*int32(idx):]))
+}
+
+func (i *Iter) isRestartPoint() bool {
+	j := sort.Search(int(i.numRestarts), func(j int) bool {
+		return i.getRestart(j) >= i.offset
+	})
+	return j < int(i.numRestarts) && i.getRestart(j) == i.offset
+}
+
+// DescribeKV is a function that formats a key-value pair, writing the
+// description to w.
+type DescribeKV func(w io.Writer, key *base.InternalKey, val []byte, enc KVEncoding)
+
+// KVEncoding describes the encoding of a key-value pair within the block.
+type KVEncoding struct {
+	// IsRestart is true if the key is a restart point.
+	IsRestart bool
+	// Offset is the position within the block at which the key-value pair is
+	// encoded.
+	Offset int32
+	// Length is the total length of the KV pair as it is encoded in the block
+	// format.
+	Length int32
+	// KeyShared is the number of bytes this KV's user key shared with its predecessor.
+	KeyShared uint32
+	// KeyUnshared is the number of bytes this KV's user key did not share with
+	// its predecessor.
+	KeyUnshared uint32
+	// ValueLen is the length of the internal value.
+	ValueLen uint32
+}
+
+// Describe describes the contents of a block, writing the description to w.
+// It invokes fmtKV to describe each key-value pair.
+func (i *Iter) Describe(w io.Writer, blkOffset uint64, fmtKV DescribeKV) {
+	for kv := i.First(); kv != nil; kv = i.Next() {
+		enc := KVEncoding{
+			IsRestart: i.isRestartPoint(),
+			Offset:    i.offset,
+			Length:    int32(i.nextOffset - i.offset),
+		}
+		ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(i.offset))
+		enc.KeyShared, ptr = decodeVarint(ptr)
+		enc.KeyUnshared, ptr = decodeVarint(ptr)
+		enc.ValueLen, _ = decodeVarint(ptr)
+		fmtKV(w, &kv.K, kv.V.ValueOrHandle, enc)
+	}
+	// Format the restart points.
+	for j := 0; j < int(i.numRestarts); j++ {
+		offset := i.getRestart(j)
+		// TODO(jackson): This formatting seems bizarre. We're taking blkOffset
+		// which is an offset in the physical, compressed file, and adding the
+		// offset of the KV pair within the uncompressed block. We should just
+		// print offsets relative to the block start.
+		fmt.Fprintf(w, "%10d    [restart %d]\n",
+			blkOffset+uint64(i.restarts+4*int32(j)), blkOffset+uint64(offset))
+	}
+}
+
+// RawIter is an iterator over a single block of data. Unlike blockIter,
+// keys are stored in "raw" format (i.e. not as internal keys). Note that there
+// is significant similarity between this code and the code in blockIter. Yet
+// reducing duplication is difficult due to the blockIter being performance
+// critical. RawIter must only be used for blocks where the value is
+// stored together with the key.
+type RawIter struct {
+	cmp         base.Compare
+	offset      int32
+	nextOffset  int32
+	restarts    int32
+	numRestarts int32
+	ptr         unsafe.Pointer
+	data        []byte
+	key, val    []byte
+	ikey        base.InternalKey
+	cached      []blockEntry
+	cachedBuf   []byte
+}
+
+// NewRawIter constructs a new raw block iterator.
+func NewRawIter(cmp base.Compare, block []byte) (*RawIter, error) {
+	i := &RawIter{}
+	return i, i.Init(cmp, block)
+}
+
+// Init initializes the raw block iterator.
+func (i *RawIter) Init(cmp base.Compare, blk []byte) error {
+	numRestarts := int32(binary.LittleEndian.Uint32(blk[len(blk)-4:]))
+	if numRestarts == 0 {
+		return base.CorruptionErrorf("pebble/table: invalid table (block has no restart points)")
+	}
+	i.cmp = cmp
+	i.restarts = int32(len(blk)) - 4*(1+numRestarts)
+	i.numRestarts = numRestarts
+	i.ptr = unsafe.Pointer(&blk[0])
+	i.data = blk
+	if i.key == nil {
+		i.key = make([]byte, 0, 256)
+	} else {
+		i.key = i.key[:0]
+	}
+	i.val = nil
+	i.clearCache()
+	return nil
+}
+
+func (i *RawIter) readEntry() {
+	ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(i.offset))
+	shared, ptr := decodeVarint(ptr)
+	unshared, ptr := decodeVarint(ptr)
+	value, ptr := decodeVarint(ptr)
+	i.key = append(i.key[:shared], getBytes(ptr, int(unshared))...)
+	i.key = i.key[:len(i.key):len(i.key)]
+	ptr = unsafe.Pointer(uintptr(ptr) + uintptr(unshared))
+	i.val = getBytes(ptr, int(value))
+	i.nextOffset = int32(uintptr(ptr)-uintptr(i.ptr)) + int32(value)
+}
+
+func (i *RawIter) loadEntry() {
+	i.readEntry()
+	i.ikey.UserKey = i.key
+}
+
+func (i *RawIter) clearCache() {
+	i.cached = i.cached[:0]
+	i.cachedBuf = i.cachedBuf[:0]
+}
+
+func (i *RawIter) cacheEntry() {
+	var valStart int32
+	valSize := int32(len(i.val))
+	if valSize > 0 {
+		valStart = int32(uintptr(unsafe.Pointer(&i.val[0])) - uintptr(i.ptr))
+	}
+
+	i.cached = append(i.cached, blockEntry{
+		offset:   i.offset,
+		keyStart: int32(len(i.cachedBuf)),
+		keyEnd:   int32(len(i.cachedBuf) + len(i.key)),
+		valStart: valStart,
+		valSize:  valSize,
+	})
+	i.cachedBuf = append(i.cachedBuf, i.key...)
+}
+
+// SeekGE implements internalIterator.SeekGE, as documented in the pebble
+// package.
+func (i *RawIter) SeekGE(key []byte) bool {
+	// Find the index of the smallest restart point whose key is > the key
+	// sought; index will be numRestarts if there is no such restart point.
+	i.offset = 0
+	index := sort.Search(int(i.numRestarts), func(j int) bool {
+		offset := int32(binary.LittleEndian.Uint32(i.data[int(i.restarts)+4*j:]))
+		// For a restart point, there are 0 bytes shared with the previous key.
+		// The varint encoding of 0 occupies 1 byte.
+		ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(offset+1))
+		// Decode the key at that restart point, and compare it to the key sought.
+		v1, ptr := decodeVarint(ptr)
+		_, ptr = decodeVarint(ptr)
+		s := getBytes(ptr, int(v1))
+		return i.cmp(key, s) < 0
+	})
+
+	// Since keys are strictly increasing, if index > 0 then the restart point at
+	// index-1 will be the largest whose key is <= the key sought.  If index ==
+	// 0, then all keys in this block are larger than the key sought, and offset
+	// remains at zero.
+	if index > 0 {
+		i.offset = int32(binary.LittleEndian.Uint32(i.data[int(i.restarts)+4*(index-1):]))
+	}
+	i.loadEntry()
+
+	// Iterate from that restart point to somewhere >= the key sought.
+	for valid := i.Valid(); valid; valid = i.Next() {
+		if i.cmp(key, i.key) <= 0 {
+			break
+		}
+	}
+	return i.Valid()
+}
+
+// First implements internalIterator.First, as documented in the pebble
+// package.
+func (i *RawIter) First() bool {
+	i.offset = 0
+	i.loadEntry()
+	return i.Valid()
+}
+
+// Last implements internalIterator.Last, as documented in the pebble package.
+func (i *RawIter) Last() bool {
+	// Seek forward from the last restart point.
+	i.offset = int32(binary.LittleEndian.Uint32(i.data[i.restarts+4*(i.numRestarts-1):]))
+
+	i.readEntry()
+	i.clearCache()
+	i.cacheEntry()
+
+	for i.nextOffset < i.restarts {
+		i.offset = i.nextOffset
+		i.readEntry()
+		i.cacheEntry()
+	}
+
+	i.ikey.UserKey = i.key
+	return i.Valid()
+}
+
+// Next implements internalIterator.Next, as documented in the pebble
+// package.
+func (i *RawIter) Next() bool {
+	i.offset = i.nextOffset
+	if !i.Valid() {
+		return false
+	}
+	i.loadEntry()
+	return true
+}
+
+// Prev implements internalIterator.Prev, as documented in the pebble
+// package.
+func (i *RawIter) Prev() bool {
+	if n := len(i.cached) - 1; n > 0 && i.cached[n].offset == i.offset {
+		i.nextOffset = i.offset
+		e := &i.cached[n-1]
+		i.offset = e.offset
+		i.val = getBytes(unsafe.Pointer(uintptr(i.ptr)+uintptr(e.valStart)), int(e.valSize))
+		i.ikey.UserKey = i.cachedBuf[e.keyStart:e.keyEnd]
+		i.cached = i.cached[:n]
+		return true
+	}
+
+	if i.offset == 0 {
+		i.offset = -1
+		i.nextOffset = 0
+		return false
+	}
+
+	targetOffset := i.offset
+	index := sort.Search(int(i.numRestarts), func(j int) bool {
+		offset := int32(binary.LittleEndian.Uint32(i.data[int(i.restarts)+4*j:]))
+		return offset >= targetOffset
+	})
+	i.offset = 0
+	if index > 0 {
+		i.offset = int32(binary.LittleEndian.Uint32(i.data[int(i.restarts)+4*(index-1):]))
+	}
+
+	i.readEntry()
+	i.clearCache()
+	i.cacheEntry()
+
+	for i.nextOffset < targetOffset {
+		i.offset = i.nextOffset
+		i.readEntry()
+		i.cacheEntry()
+	}
+
+	i.ikey.UserKey = i.key
+	return true
+}
+
+// Key implements internalIterator.Key, as documented in the pebble package.
+func (i *RawIter) Key() base.InternalKey {
+	return i.ikey
+}
+
+// Value implements internalIterator.Value, as documented in the pebble
+// package.
+func (i *RawIter) Value() []byte {
+	return i.val
+}
+
+// Valid implements internalIterator.Valid, as documented in the pebble
+// package.
+func (i *RawIter) Valid() bool {
+	return i.offset >= 0 && i.offset < i.restarts
+}
+
+// Error implements internalIterator.Error, as documented in the pebble
+// package.
+func (i *RawIter) Error() error {
+	return nil
+}
+
+// Close implements internalIterator.Close, as documented in the pebble
+// package.
+func (i *RawIter) Close() error {
+	i.val = nil
+	return nil
+}
+
+func (i *RawIter) getRestart(idx int) int32 {
+	return int32(binary.LittleEndian.Uint32(i.data[i.restarts+4*int32(idx):]))
+}
+
+func (i *RawIter) isRestartPoint() bool {
+	j := sort.Search(int(i.numRestarts), func(j int) bool {
+		return i.getRestart(j) >= i.offset
+	})
+	return j < int(i.numRestarts) && i.getRestart(j) == i.offset
+}
+
+// Describe describes the contents of a block, writing the description to w.
+// It invokes fmtKV to describe each key-value pair.
+func (i *RawIter) Describe(w io.Writer, blkOffset uint64, fmtKV DescribeKV) {
+	for valid := i.First(); valid; valid = i.Next() {
+		enc := KVEncoding{
+			IsRestart: i.isRestartPoint(),
+			Offset:    i.offset,
+			Length:    int32(i.nextOffset - i.offset),
+		}
+		ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(i.offset))
+		enc.KeyShared, ptr = decodeVarint(ptr)
+		enc.KeyUnshared, ptr = decodeVarint(ptr)
+		enc.ValueLen, _ = decodeVarint(ptr)
+		fmtKV(w, &i.ikey, i.val, enc)
+		if i.isRestartPoint() {
+			fmt.Fprintf(w, " [restart]\n")
+		} else {
+			fmt.Fprintf(w, "\n")
+		}
+	}
+	// Format the restart points.
+	for j := 0; j < int(i.numRestarts); j++ {
+		offset := i.getRestart(j)
+		// TODO(jackson): This formatting seems bizarre. We're taking blkOffset
+		// which is an offset in the physical, compressed file, and adding the
+		// offset of the KV pair within the uncompressed block. We should just
+		// print offsets relative to the block start.
+		fmt.Fprintf(w, "%10d    [restart %d]\n",
+			blkOffset+uint64(i.restarts+4*int32(j)), blkOffset+uint64(offset))
+	}
+}
+
+func getBytes(ptr unsafe.Pointer, length int) []byte {
+	return (*[manual.MaxArrayLen]byte)(ptr)[:length:length]
+}
+
+func decodeVarint(ptr unsafe.Pointer) (uint32, unsafe.Pointer) {
+	if a := *((*uint8)(ptr)); a < 128 {
+		return uint32(a),
+			unsafe.Pointer(uintptr(ptr) + 1)
+	} else if a, b := a&0x7f, *((*uint8)(unsafe.Pointer(uintptr(ptr) + 1))); b < 128 {
+		return uint32(b)<<7 | uint32(a),
+			unsafe.Pointer(uintptr(ptr) + 2)
+	} else if b, c := b&0x7f, *((*uint8)(unsafe.Pointer(uintptr(ptr) + 2))); c < 128 {
+		return uint32(c)<<14 | uint32(b)<<7 | uint32(a),
+			unsafe.Pointer(uintptr(ptr) + 3)
+	} else if c, d := c&0x7f, *((*uint8)(unsafe.Pointer(uintptr(ptr) + 3))); d < 128 {
+		return uint32(d)<<21 | uint32(c)<<14 | uint32(b)<<7 | uint32(a),
+			unsafe.Pointer(uintptr(ptr) + 4)
+	} else {
+		d, e := d&0x7f, *((*uint8)(unsafe.Pointer(uintptr(ptr) + 4)))
+		return uint32(e)<<28 | uint32(d)<<21 | uint32(c)<<14 | uint32(b)<<7 | uint32(a),
+			unsafe.Pointer(uintptr(ptr) + 5)
+	}
 }

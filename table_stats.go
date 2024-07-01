@@ -377,7 +377,7 @@ func (d *DB) loadTableRangeDelStats(
 		start, end := s.Start, s.End
 		// We only need to consider deletion size estimates for tables that contain
 		// RANGEDELs.
-		var maxRangeDeleteSeqNum uint64
+		var maxRangeDeleteSeqNum base.SeqNum
 		for _, k := range s.Keys {
 			if k.Kind() == base.InternalKeyKindRangeDelete && maxRangeDeleteSeqNum < k.SeqNum() {
 				maxRangeDeleteSeqNum = k.SeqNum()
@@ -540,7 +540,7 @@ func (d *DB) estimateSizesBeneath(
 
 func (d *DB) estimateReclaimedSizeBeneath(
 	v *version, level int, start, end []byte, hintType deleteCompactionHintType,
-) (estimate uint64, hintSeqNum uint64, err error) {
+) (estimate uint64, hintSeqNum base.SeqNum, err error) {
 	// Find all files in lower levels that overlap with the deleted range
 	// [start, end).
 	//
@@ -906,7 +906,7 @@ func newCombinedDeletionKeyspanIter(
 	})
 	mIter.Init(comparer, transform, new(keyspanimpl.MergingBuffers))
 
-	iter, err := cr.NewRawRangeDelIter(m.IterTransforms())
+	iter, err := cr.NewRawRangeDelIter(m.FragmentIterTransforms())
 	if err != nil {
 		return nil, err
 	}
@@ -957,13 +957,13 @@ func newCombinedDeletionKeyspanIter(
 		mIter.AddLevel(iter)
 	}
 
-	iter, err = cr.NewRawRangeKeyIter(m.IterTransforms())
+	iter, err = cr.NewRawRangeKeyIter(m.FragmentIterTransforms())
 	if err != nil {
 		return nil, err
 	}
 	if iter != nil {
 		// Assert expected bounds in tests.
-		if invariants.Enabled {
+		if invariants.Sometimes(50) {
 			iter = keyspan.AssertBounds(
 				iter, m.SmallestRangeKey, m.LargestRangeKey.UserKey, comparer.Compare,
 			)

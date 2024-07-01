@@ -12,7 +12,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 )
 
-// Assert wraps an iterator and asserts that operations return sane results.
+// Assert wraps an iterator which asserts that operations return sane results.
 func Assert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
 	return &assertIter{
 		iter: iter,
@@ -20,13 +20,15 @@ func Assert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
 	}
 }
 
-// MaybeAssert wraps an iterator and asserts that operations return sane
-// results if we are in testing mode.
+// MaybeAssert potentially wraps an iterator with Assert and/or
+// NewInvalidatingIter if we are in testing mode.
 func MaybeAssert(iter FragmentIterator, cmp base.Compare) FragmentIterator {
-	if invariants.Enabled && iter != nil {
-		// Don't wrap an assertIter.
-		if _, ok := iter.(*assertIter); !ok {
-			return Assert(iter, cmp)
+	if invariants.Enabled {
+		if invariants.Sometimes(60 /* percent */) {
+			iter = NewInvalidatingIter(iter)
+		}
+		if invariants.Sometimes(60 /* percent */) {
+			iter = Assert(iter, cmp)
 		}
 	}
 	return iter

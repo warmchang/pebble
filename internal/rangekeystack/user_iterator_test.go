@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,12 +34,10 @@ func TestIter(t *testing.T) {
 		buf.Reset()
 		switch td.Cmd {
 		case "define":
-			visibleSeqNum := base.InternalKeySeqNumMax
+			visibleSeqNum := base.SeqNumMax
 			for _, arg := range td.CmdArgs {
 				if arg.Key == "visible-seq-num" {
-					var err error
-					visibleSeqNum, err = strconv.ParseUint(arg.Vals[0], 10, 64)
-					require.NoError(t, err)
+					visibleSeqNum = base.ParseSeqNum(arg.Vals[0])
 				}
 			}
 
@@ -125,7 +122,7 @@ func TestDefragmenting(t *testing.T) {
 			return ""
 		case "iter":
 			var userIterCfg UserIteratorConfig
-			iter := userIterCfg.Init(testkeys.Comparer, base.InternalKeySeqNumMax,
+			iter := userIterCfg.Init(testkeys.Comparer, base.SeqNumMax,
 				nil /* lower */, nil, /* upper */
 				&hasPrefix, &prefix, false /* internalKeys */, new(Buffers),
 				keyspan.NewIter(cmp, spans))
@@ -177,7 +174,7 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 		}
 
 		key := keyspan.Key{
-			Trailer: base.MakeTrailer(uint64(i), base.InternalKeyKindRangeKeySet),
+			Trailer: base.MakeTrailer(base.SeqNum(i), base.InternalKeyKindRangeKeySet),
 			Value:   []byte(fmt.Sprintf("v%d", rng.Intn(3))),
 		}
 		// Generate suffixes 0, 1, 2, or 3 with 0 indicating none.
@@ -207,11 +204,11 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 	fragmented = fragment(cmp, formatKey, fragmented)
 
 	var referenceCfg, fragmentedCfg UserIteratorConfig
-	referenceIter := referenceCfg.Init(testkeys.Comparer, base.InternalKeySeqNumMax,
+	referenceIter := referenceCfg.Init(testkeys.Comparer, base.SeqNumMax,
 		nil /* lower */, nil, /* upper */
 		new(bool), new([]byte), false /* internalKeys */, new(Buffers),
 		keyspan.NewIter(cmp, original))
-	fragmentedIter := fragmentedCfg.Init(testkeys.Comparer, base.InternalKeySeqNumMax,
+	fragmentedIter := fragmentedCfg.Init(testkeys.Comparer, base.SeqNumMax,
 		nil /* lower */, nil, /* upper */
 		new(bool), new([]byte), false /* internalKeys */, new(Buffers),
 		keyspan.NewIter(cmp, fragmented))
@@ -375,7 +372,7 @@ func BenchmarkTransform(b *testing.B) {
 					var keys []keyspan.Key
 					for k := 0; k < n; k++ {
 						keys = append(keys, keyspan.Key{
-							Trailer: base.MakeTrailer(uint64(n-k), base.InternalKeyKindRangeKeySet),
+							Trailer: base.MakeTrailer(base.SeqNum(n-k), base.InternalKeyKindRangeKeySet),
 							Suffix:  suffixes[k],
 						})
 					}

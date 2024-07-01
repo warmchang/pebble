@@ -1,141 +1,23 @@
-// Copyright 2018 The LevelDB-Go and Pebble Authors. All rights reserved. Use
+// Copyright 2024 The LevelDB-Go and Pebble Authors. All rights reserved. Use
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
-package sstable
+package rowblk
 
 import (
 	"bytes"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/itertest"
 	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
-
-func ikey(s string) InternalKey {
-	return InternalKey{UserKey: []byte(s)}
-}
-
-func TestBlockWriter(t *testing.T) {
-	w := &rawBlockWriter{
-		blockWriter: blockWriter{restartInterval: 16},
-	}
-	w.add(ikey("apple"), nil)
-	w.add(ikey("apricot"), nil)
-	w.add(ikey("banana"), nil)
-	block := w.finish()
-
-	expected := []byte(
-		"\x00\x05\x00apple" +
-			"\x02\x05\x00ricot" +
-			"\x00\x06\x00banana" +
-			"\x00\x00\x00\x00\x01\x00\x00\x00")
-	if !bytes.Equal(expected, block) {
-		t.Fatalf("expected\n%q\nfound\n%q", expected, block)
-	}
-}
-
-func TestBlockWriterWithPrefix(t *testing.T) {
-	w := &rawBlockWriter{
-		blockWriter: blockWriter{restartInterval: 2},
-	}
-	curKey := func() string {
-		return string(base.DecodeInternalKey(w.curKey).UserKey)
-	}
-	addAdapter := func(
-		key InternalKey,
-		value []byte,
-		addValuePrefix bool,
-		valuePrefix valuePrefix,
-		setHasSameKeyPrefix bool) {
-		w.addWithOptionalValuePrefix(
-			key, false, value, len(key.UserKey), addValuePrefix, valuePrefix, setHasSameKeyPrefix)
-	}
-	addAdapter(
-		ikey("apple"), []byte("red"), false, 0, true)
-	require.Equal(t, "apple", curKey())
-	require.Equal(t, "red", string(w.curValue))
-	addAdapter(
-		ikey("apricot"), []byte("orange"), true, '\xff', false)
-	require.Equal(t, "apricot", curKey())
-	require.Equal(t, "orange", string(w.curValue))
-	// Even though this call has setHasSameKeyPrefix=true, the previous call,
-	// which was after the last restart set it to false. So the restart encoded
-	// with banana has this cumulative bit set to false.
-	addAdapter(
-		ikey("banana"), []byte("yellow"), true, '\x00', true)
-	require.Equal(t, "banana", curKey())
-	require.Equal(t, "yellow", string(w.curValue))
-	addAdapter(
-		ikey("cherry"), []byte("red"), false, 0, true)
-	require.Equal(t, "cherry", curKey())
-	require.Equal(t, "red", string(w.curValue))
-	// All intervening calls has setHasSameKeyPrefix=true, so the cumulative bit
-	// will be set to true in this restart.
-	addAdapter(
-		ikey("mango"), []byte("juicy"), false, 0, true)
-	require.Equal(t, "mango", curKey())
-	require.Equal(t, "juicy", string(w.curValue))
-
-	block := w.finish()
-
-	expected := []byte(
-		"\x00\x0d\x03apple\x00\x00\x00\x00\x00\x00\x00\x00red" +
-			"\x02\x0d\x07ricot\x00\x00\x00\x00\x00\x00\x00\x00\xfforange" +
-			"\x00\x0e\x07banana\x00\x00\x00\x00\x00\x00\x00\x00\x00yellow" +
-			"\x00\x0e\x03cherry\x00\x00\x00\x00\x00\x00\x00\x00red" +
-			"\x00\x0d\x05mango\x00\x00\x00\x00\x00\x00\x00\x00juicy" +
-			// Restarts are:
-			// 00000000 (restart at apple), 2a000000 (restart at banana), 56000080 (restart at mango)
-			// 03000000 (number of restart, i.e., 3). The restart at mango has 1 in the most significant
-			// bit of the uint32, so the last byte in the little endian encoding is \x80.
-			"\x00\x00\x00\x00\x2a\x00\x00\x00\x56\x00\x00\x80\x03\x00\x00\x00")
-	if !bytes.Equal(expected, block) {
-		t.Fatalf("expected\n%x\nfound\n%x", expected, block)
-	}
-}
-
-func testBlockCleared(t *testing.T, w, b *blockWriter) {
-	require.Equal(t, w.restartInterval, b.restartInterval)
-	require.Equal(t, w.nEntries, b.nEntries)
-	require.Equal(t, w.nextRestart, b.nextRestart)
-	require.Equal(t, len(w.buf), len(b.buf))
-	require.Equal(t, len(w.restarts), len(b.restarts))
-	require.Equal(t, len(w.curKey), len(b.curKey))
-	require.Equal(t, len(w.prevKey), len(b.prevKey))
-	require.Equal(t, len(w.curValue), len(b.curValue))
-	require.Equal(t, w.tmp, b.tmp)
-
-	// Make sure that we didn't lose the allocated byte slices.
-	require.True(t, cap(w.buf) > 0 && cap(b.buf) == 0)
-	require.True(t, cap(w.restarts) > 0 && cap(b.restarts) == 0)
-	require.True(t, cap(w.curKey) > 0 && cap(b.curKey) == 0)
-	require.True(t, cap(w.prevKey) > 0 && cap(b.prevKey) == 0)
-	require.True(t, cap(w.curValue) > 0 && cap(b.curValue) == 0)
-}
-
-func TestBlockClear(t *testing.T) {
-	w := blockWriter{restartInterval: 16}
-	w.add(ikey("apple"), nil)
-	w.add(ikey("apricot"), nil)
-	w.add(ikey("banana"), nil)
-
-	w.clear()
-
-	// Once a block is cleared, we expect its fields to be cleared, but we expect
-	// it to keep its allocated byte slices.
-	b := blockWriter{}
-	testBlockCleared(t, &w, &b)
-}
 
 func TestInvalidInternalKeyDecoding(t *testing.T) {
 	// Invalid keys since they don't have an 8 byte trailer.
@@ -145,20 +27,20 @@ func TestInvalidInternalKeyDecoding(t *testing.T) {
 		"foo",
 	}
 	for _, tc := range testCases {
-		i := blockIter{}
+		i := Iter{}
 		i.decodeInternalKey([]byte(tc))
 		require.Nil(t, i.ikv.K.UserKey)
-		require.Equal(t, uint64(InternalKeyKindInvalid), i.ikv.K.Trailer)
+		require.Equal(t, base.InternalKeyTrailer(base.InternalKeyKindInvalid), i.ikv.K.Trailer)
 	}
 }
 
 func TestBlockIter(t *testing.T) {
 	// k is a block that maps three keys "apple", "apricot", "banana" to empty strings.
-	k := block([]byte(
+	k := []byte(
 		"\x00\x05\x00apple" +
 			"\x02\x05\x00ricot" +
 			"\x00\x06\x00banana" +
-			"\x00\x00\x00\x00\x01\x00\x00\x00"))
+			"\x00\x00\x00\x00\x01\x00\x00\x00")
 	var testcases = []struct {
 		index int
 		key   string
@@ -179,7 +61,7 @@ func TestBlockIter(t *testing.T) {
 		{3, "c"},
 	}
 	for _, tc := range testcases {
-		i, err := newRawBlockIter(bytes.Compare, k)
+		i, err := NewRawIter(bytes.Compare, k)
 		require.NoError(t, err)
 		i.SeekGE([]byte(tc.key))
 		for j, keyWant := range []string{"apple", "apricot", "banana"}[tc.index:] {
@@ -200,7 +82,7 @@ func TestBlockIter(t *testing.T) {
 	}
 
 	{
-		i, err := newRawBlockIter(bytes.Compare, k)
+		i, err := NewRawIter(bytes.Compare, k)
 		require.NoError(t, err)
 		i.Last()
 		for j, keyWant := range []string{"banana", "apricot", "apple"} {
@@ -222,36 +104,31 @@ func TestBlockIter(t *testing.T) {
 }
 
 func TestBlockIter2(t *testing.T) {
-	makeIkey := func(s string) InternalKey {
+	makeIkey := func(s string) base.InternalKey {
 		j := strings.Index(s, ":")
-		seqNum, err := strconv.Atoi(s[j+1:])
-		if err != nil {
-			panic(err)
-		}
-		return base.MakeInternalKey([]byte(s[:j]), uint64(seqNum), InternalKeyKindSet)
+		seqNum := base.ParseSeqNum(s[j+1:])
+		return base.MakeInternalKey([]byte(s[:j]), seqNum, base.InternalKeyKindSet)
 	}
 
-	var block []byte
+	var blk []byte
 
 	for _, r := range []int{1, 2, 3, 4} {
 		t.Run(fmt.Sprintf("restart=%d", r), func(t *testing.T) {
-			datadriven.RunTest(t, "testdata/block", func(t *testing.T, d *datadriven.TestData) string {
+			datadriven.RunTest(t, "testdata/rowblk_iter", func(t *testing.T, d *datadriven.TestData) string {
 				switch d.Cmd {
 				case "build":
-					w := &blockWriter{restartInterval: r}
+					w := &Writer{RestartInterval: r}
 					for _, e := range strings.Split(strings.TrimSpace(d.Input), ",") {
-						w.add(makeIkey(e), nil)
+						w.Add(makeIkey(e), nil)
 					}
-					block = w.finish()
+					blk = w.Finish()
 					return ""
 
 				case "iter":
-					globalSeqNum, err := scanGlobalSeqNum(d)
-					transforms := IterTransforms{SyntheticSeqNum: SyntheticSeqNum(globalSeqNum)}
-					if err != nil {
-						return err.Error()
-					}
-					iter, err := newBlockIter(bytes.Compare, nil, block, transforms)
+					var globalSeqNum uint64
+					d.MaybeScanArgs(t, "globalSeqNum", &globalSeqNum)
+					transforms := block.IterTransforms{SyntheticSeqNum: block.SyntheticSeqNum(globalSeqNum)}
+					iter, err := NewIter(bytes.Compare, nil, blk, transforms)
 					if err != nil {
 						return err.Error()
 					}
@@ -267,18 +144,18 @@ func TestBlockIter2(t *testing.T) {
 }
 
 func TestBlockIterKeyStability(t *testing.T) {
-	w := &blockWriter{restartInterval: 1}
+	w := &Writer{RestartInterval: 1}
 	expected := [][]byte{
 		[]byte("apple"),
 		[]byte("apricot"),
 		[]byte("banana"),
 	}
 	for i := range expected {
-		w.add(InternalKey{UserKey: expected[i]}, nil)
+		w.Add(base.InternalKey{UserKey: expected[i]}, nil)
 	}
-	block := w.finish()
+	blk := w.Finish()
 
-	i, err := newBlockIter(bytes.Compare, nil, block, NoTransforms)
+	i, err := NewIter(bytes.Compare, nil, blk, block.NoTransforms)
 	require.NoError(t, err)
 
 	// Check that the supplied slice resides within the bounds of the block.
@@ -286,8 +163,8 @@ func TestBlockIterKeyStability(t *testing.T) {
 		t.Helper()
 		begin := unsafe.Pointer(&v[0])
 		end := unsafe.Pointer(uintptr(begin) + uintptr(len(v)))
-		blockBegin := unsafe.Pointer(&block[0])
-		blockEnd := unsafe.Pointer(uintptr(blockBegin) + uintptr(len(block)))
+		blockBegin := unsafe.Pointer(&blk[0])
+		blockEnd := unsafe.Pointer(uintptr(blockBegin) + uintptr(len(blk)))
 		if uintptr(begin) < uintptr(blockBegin) || uintptr(end) > uintptr(blockEnd) {
 			t.Fatalf("key %p-%p resides outside of block %p-%p", begin, end, blockBegin, blockEnd)
 		}
@@ -323,7 +200,7 @@ func TestBlockIterKeyStability(t *testing.T) {
 // switch occurs we need to populate blockIter.fullKey so that prefix
 // decompression works properly.
 func TestBlockIterReverseDirections(t *testing.T) {
-	w := &blockWriter{restartInterval: 4}
+	w := &Writer{RestartInterval: 4}
 	keys := [][]byte{
 		[]byte("apple0"),
 		[]byte("apple1"),
@@ -332,13 +209,13 @@ func TestBlockIterReverseDirections(t *testing.T) {
 		[]byte("carrot"),
 	}
 	for i := range keys {
-		w.add(InternalKey{UserKey: keys[i]}, nil)
+		w.Add(base.InternalKey{UserKey: keys[i]}, nil)
 	}
-	block := w.finish()
+	blk := w.Finish()
 
-	for targetPos := 0; targetPos < w.restartInterval; targetPos++ {
+	for targetPos := 0; targetPos < w.RestartInterval; targetPos++ {
 		t.Run("", func(t *testing.T) {
-			i, err := newBlockIter(bytes.Compare, nil, block, NoTransforms)
+			i, err := NewIter(bytes.Compare, nil, blk, block.NoTransforms)
 			require.NoError(t, err)
 
 			pos := 3
@@ -396,29 +273,29 @@ func TestBlockSyntheticPrefix(t *testing.T) {
 		for _, restarts := range []int{1, 2, 3, 4, 10} {
 			t.Run(fmt.Sprintf("prefix=%s/restarts=%d", prefix, restarts), func(t *testing.T) {
 
-				elidedPrefixWriter, includedPrefixWriter := &blockWriter{restartInterval: restarts}, &blockWriter{restartInterval: restarts}
+				elidedPrefixWriter, includedPrefixWriter := &Writer{RestartInterval: restarts}, &Writer{RestartInterval: restarts}
 				keys := []string{
 					"apple", "apricot", "banana",
 					"grape", "orange", "peach",
 					"pear", "persimmon",
 				}
 				for _, k := range keys {
-					elidedPrefixWriter.add(ikey(k), nil)
-					includedPrefixWriter.add(ikey(prefix+k), nil)
+					elidedPrefixWriter.Add(ikey(k), nil)
+					includedPrefixWriter.Add(ikey(prefix+k), nil)
 				}
 
-				elidedPrefixBlock, includedPrefixBlock := elidedPrefixWriter.finish(), includedPrefixWriter.finish()
+				elidedPrefixBlock, includedPrefixBlock := elidedPrefixWriter.Finish(), includedPrefixWriter.Finish()
 
-				expect, err := newBlockIter(bytes.Compare, nil, includedPrefixBlock, IterTransforms{})
+				expect, err := NewIter(bytes.Compare, nil, includedPrefixBlock, block.IterTransforms{})
 				require.NoError(t, err)
 
-				got, err := newBlockIter(bytes.Compare, nil, elidedPrefixBlock, IterTransforms{SyntheticPrefix: []byte(prefix)})
+				got, err := NewIter(bytes.Compare, nil, elidedPrefixBlock, block.IterTransforms{SyntheticPrefix: []byte(prefix)})
 				require.NoError(t, err)
 
 				c := checker{
 					t: t,
 					alsoCheck: func() {
-						require.Equal(t, expect.valid(), got.valid())
+						require.Equal(t, expect.Valid(), got.Valid())
 						require.Equal(t, expect.Error(), got.Error())
 					},
 				}
@@ -472,7 +349,7 @@ func TestBlockSyntheticSuffix(t *testing.T) {
 
 			t.Run(fmt.Sprintf("restarts=%d;replacePrefix=%t", restarts, replacePrefix), func(t *testing.T) {
 
-				suffixWriter, expectedSuffixWriter := &blockWriter{restartInterval: restarts}, &blockWriter{restartInterval: restarts}
+				suffixWriter, expectedSuffixWriter := &Writer{RestartInterval: restarts}, &Writer{RestartInterval: restarts}
 				keys := []string{
 					"apple@2", "apricot@2", "banana@13", "cantaloupe",
 					"grape@2", "orange@14", "peach@4",
@@ -486,23 +363,23 @@ func TestBlockSyntheticSuffix(t *testing.T) {
 					synthPrefix = []byte(prefixStr)
 				}
 				for _, key := range keys {
-					suffixWriter.add(ikey(key), nil)
+					suffixWriter.Add(ikey(key), nil)
 					replacedKey := strings.Split(key, "@")[0] + "@" + expectedSuffix
-					expectedSuffixWriter.add(ikey(prefixStr+replacedKey), nil)
+					expectedSuffixWriter.Add(ikey(prefixStr+replacedKey), nil)
 				}
 
-				suffixReplacedBlock := suffixWriter.finish()
-				expectedBlock := expectedSuffixWriter.finish()
+				suffixReplacedBlock := suffixWriter.Finish()
+				expectedBlock := expectedSuffixWriter.Finish()
 
-				expect, err := newBlockIter(cmp, split, expectedBlock, NoTransforms)
+				expect, err := NewIter(cmp, split, expectedBlock, block.NoTransforms)
 				require.NoError(t, err)
 
-				got, err := newBlockIter(cmp, split, suffixReplacedBlock, IterTransforms{SyntheticSuffix: synthSuffix, SyntheticPrefix: synthPrefix})
+				got, err := NewIter(cmp, split, suffixReplacedBlock, block.IterTransforms{SyntheticSuffix: synthSuffix, SyntheticPrefix: synthPrefix})
 				require.NoError(t, err)
 
 				c := checker{t: t,
 					alsoCheck: func() {
-						require.Equal(t, expect.valid(), got.valid())
+						require.Equal(t, expect.Valid(), got.Valid())
 						require.Equal(t, expect.Error(), got.Error())
 					}}
 
@@ -580,208 +457,6 @@ func TestBlockSyntheticSuffix(t *testing.T) {
 	}
 }
 
-var (
-	benchSynthSuffix = []byte("@15")
-	benchPrefix      = []byte("2_")
-
-	// Use testkeys.Comparer.Compare which approximates EngineCompare by ordering
-	// multiple keys with same prefix in descending suffix order.
-	benchCmp   = testkeys.Comparer.Compare
-	benchSplit = testkeys.Comparer.Split
-)
-
-// choosOrigSuffix randomly chooses a suffix that is either 1 or 2 bytes large.
-// This ensures we benchmark when suffix replacement adds a larger suffix.
-func chooseOrigSuffix(rng *rand.Rand) []byte {
-	origSuffix := []byte("@10")
-	if rng.Intn(10)%2 == 0 {
-		origSuffix = []byte("@9")
-	}
-	return origSuffix
-}
-
-// createBenchBlock writes a block of keys and outputs a list of keys that will
-// be surfaced from the block, and the expected synthetic suffix and prefix the
-// block should be read with.
-func createBenchBlock(
-	blockSize int, w *blockWriter, rng *rand.Rand, withSyntheticPrefix, withSyntheticSuffix bool,
-) ([][]byte, []byte, []byte) {
-
-	origSuffix := chooseOrigSuffix(rng)
-	var ikey InternalKey
-	var readKeys [][]byte
-
-	var writtenPrefix []byte
-	if !withSyntheticPrefix {
-		// If the keys will not be read with a synthetic prefix, write the prefix to
-		// the block for a more comparable benchmark comparison between a block iter
-		// with and without prefix synthesis.
-		writtenPrefix = benchPrefix
-	}
-	for i := 0; w.estimatedSize() < blockSize; i++ {
-		key := []byte(fmt.Sprintf("%s%05d%s", string(writtenPrefix), i, origSuffix))
-		ikey.UserKey = key
-		w.add(ikey, nil)
-		var readKey []byte
-		if withSyntheticPrefix {
-			readKey = append(readKey, benchPrefix...)
-		}
-		readKey = append(readKey, key...)
-		readKeys = append(readKeys, readKey)
-	}
-
-	var syntheticSuffix []byte
-	var syntheticPrefix []byte
-	if withSyntheticSuffix {
-		syntheticSuffix = benchSynthSuffix
-	}
-	if withSyntheticPrefix {
-		syntheticPrefix = []byte(benchPrefix)
-	}
-	return readKeys, syntheticPrefix, syntheticSuffix
-}
-
-func BenchmarkBlockIterSeekGE(b *testing.B) {
-	const blockSize = 32 << 10
-	for _, withSyntheticPrefix := range []bool{false, true} {
-		for _, withSyntheticSuffix := range []bool{false, true} {
-			for _, restartInterval := range []int{16} {
-				b.Run(fmt.Sprintf("syntheticPrefix=%t;syntheticSuffix=%t;restart=%d", withSyntheticPrefix, withSyntheticSuffix, restartInterval),
-					func(b *testing.B) {
-						w := &blockWriter{
-							restartInterval: restartInterval,
-						}
-						rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-
-						keys, syntheticPrefix, syntheticSuffix := createBenchBlock(blockSize, w, rng, withSyntheticPrefix, withSyntheticSuffix)
-
-						it, err := newBlockIter(benchCmp, benchSplit, w.finish(), IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix})
-						if err != nil {
-							b.Fatal(err)
-						}
-						b.ResetTimer()
-						for i := 0; i < b.N; i++ {
-							k := keys[rng.Intn(len(keys))]
-							it.SeekGE(k, base.SeekGEFlagsNone)
-							if testing.Verbose() {
-								if !it.valid() && !withSyntheticSuffix {
-									b.Fatal("expected to find key")
-								}
-								if !bytes.Equal(k, it.Key().UserKey) && !withSyntheticSuffix {
-									b.Fatalf("expected %s, but found %s", k, it.Key().UserKey)
-								}
-							}
-						}
-					})
-			}
-		}
-	}
-}
-
-func BenchmarkBlockIterSeekLT(b *testing.B) {
-	const blockSize = 32 << 10
-	for _, withSyntheticPrefix := range []bool{false, true} {
-		for _, withSyntheticSuffix := range []bool{false, true} {
-			for _, restartInterval := range []int{16} {
-				b.Run(fmt.Sprintf("syntheticPrefix=%t;syntheticSuffix=%t;restart=%d", withSyntheticPrefix, withSyntheticSuffix, restartInterval),
-					func(b *testing.B) {
-						w := &blockWriter{
-							restartInterval: restartInterval,
-						}
-						rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-
-						keys, syntheticPrefix, syntheticSuffix := createBenchBlock(blockSize, w, rng, withSyntheticPrefix, withSyntheticSuffix)
-
-						it, err := newBlockIter(benchCmp, benchSplit, w.finish(), IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix})
-						if err != nil {
-							b.Fatal(err)
-						}
-						b.ResetTimer()
-						for i := 0; i < b.N; i++ {
-							j := rng.Intn(len(keys))
-							it.SeekLT(keys[j], base.SeekLTFlagsNone)
-							if testing.Verbose() {
-								if j == 0 {
-									if it.valid() && !withSyntheticSuffix {
-										b.Fatal("unexpected key")
-									}
-								} else {
-									if !it.valid() && !withSyntheticSuffix {
-										b.Fatal("expected to find key")
-									}
-									k := keys[j-1]
-									if !bytes.Equal(k, it.Key().UserKey) && !withSyntheticSuffix {
-										b.Fatalf("expected %s, but found %s", k, it.Key().UserKey)
-									}
-								}
-							}
-						}
-					})
-			}
-		}
-	}
-}
-
-func BenchmarkBlockIterNext(b *testing.B) {
-	const blockSize = 32 << 10
-	for _, withSyntheticPrefix := range []bool{false, true} {
-		for _, withSyntheticSuffix := range []bool{false, true} {
-			for _, restartInterval := range []int{16} {
-				b.Run(fmt.Sprintf("syntheticPrefix=%t;syntheticSuffix=%t;restart=%d", withSyntheticPrefix, withSyntheticSuffix, restartInterval),
-					func(b *testing.B) {
-						w := &blockWriter{
-							restartInterval: restartInterval,
-						}
-						rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-
-						_, syntheticPrefix, syntheticSuffix := createBenchBlock(blockSize, w, rng, withSyntheticPrefix, withSyntheticSuffix)
-
-						it, err := newBlockIter(benchCmp, benchSplit, w.finish(), IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix})
-						if err != nil {
-							b.Fatal(err)
-						}
-
-						b.ResetTimer()
-						for i := 0; i < b.N; i++ {
-							if !it.valid() {
-								it.First()
-							}
-							it.Next()
-						}
-					})
-			}
-		}
-	}
-}
-
-func BenchmarkBlockIterPrev(b *testing.B) {
-	const blockSize = 32 << 10
-	for _, withSyntheticPrefix := range []bool{false, true} {
-		for _, withSyntheticSuffix := range []bool{false, true} {
-			for _, restartInterval := range []int{16} {
-				b.Run(fmt.Sprintf("syntheticPrefix=%t;syntheticSuffix=%t;restart=%d", withSyntheticPrefix, withSyntheticSuffix, restartInterval),
-					func(b *testing.B) {
-						w := &blockWriter{
-							restartInterval: restartInterval,
-						}
-						rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-
-						_, syntheticPrefix, syntheticSuffix := createBenchBlock(blockSize, w, rng, withSyntheticPrefix, withSyntheticSuffix)
-
-						it, err := newBlockIter(benchCmp, benchSplit, w.finish(), IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix})
-						if err != nil {
-							b.Fatal(err)
-						}
-
-						b.ResetTimer()
-						for i := 0; i < b.N; i++ {
-							if !it.valid() {
-								it.Last()
-							}
-							it.Prev()
-						}
-					})
-			}
-		}
-	}
+func ikey(s string) base.InternalKey {
+	return base.InternalKey{UserKey: []byte(s)}
 }

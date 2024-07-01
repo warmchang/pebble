@@ -29,6 +29,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/stretchr/testify/require"
@@ -209,11 +211,11 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 	// Set during the latest build command.
 	var r *Reader
 	var wMeta *WriterMetadata
-	var bp BufferPool
+	var bp block.BufferPool
 
 	// Set during the latest virtualize command.
 	var v *VirtualReader
-	var transforms IterTransforms
+	var syntheticSuffix SyntheticSuffix
 
 	defer func() {
 		if r != nil {
@@ -298,11 +300,11 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 
 			showProps := td.HasArg("show-props")
 
-			transforms = IterTransforms{}
+			syntheticSuffix = nil
 			if td.HasArg("suffix") {
 				var synthSuffixStr string
 				td.ScanArgs(t, "suffix", &synthSuffixStr)
-				transforms.SyntheticSuffix = []byte(synthSuffixStr)
+				syntheticSuffix = []byte(synthSuffixStr)
 			}
 
 			params.FileNum = nextFileNum()
@@ -325,6 +327,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 			}
 
 			var rp ReaderProvider
+			transforms := IterTransforms{SyntheticSuffix: syntheticSuffix}
 			iter, err := v.NewCompactionIter(transforms, CategoryAndQoS{}, nil, rp, &bp)
 			if err != nil {
 				return err.Error()
@@ -364,6 +367,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 			if v == nil {
 				return "virtualize must be called before scan-range-del"
 			}
+			transforms := FragmentIterTransforms{} // TODO(radu): SyntheticSuffix: syntheticSuffix
 			iter, err := v.NewRawRangeDelIter(transforms)
 			if err != nil {
 				return err.Error()
@@ -385,8 +389,9 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 
 		case "scan-range-key":
 			if v == nil {
-				return "virtualize must be called before scan-range-key"
+				return "virtualize mupst be called before scan-range-key"
 			}
+			transforms := FragmentIterTransforms{} // TODO(radu): SyntheticSuffix: syntheticSuffix
 			iter, err := v.NewRawRangeKeyIter(transforms)
 			if err != nil {
 				return err.Error()
@@ -431,7 +436,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 				var err error
 				filterer, err = IntersectsTable(
 					[]BlockPropertyFilter{maskingFilter},
-					nil, wMeta.Properties.UserProperties, transforms.SyntheticSuffix,
+					nil, wMeta.Properties.UserProperties, syntheticSuffix,
 				)
 				if err != nil {
 					td.Fatalf(t, "error creating filterer: %v", err)
@@ -441,6 +446,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 				}
 			}
 
+			transforms := IterTransforms{SyntheticSuffix: syntheticSuffix}
 			iter, err := v.NewIterWithBlockPropertyFiltersAndContextEtc(
 				context.Background(), transforms, lower, upper, filterer, false,
 				&stats, CategoryAndQoS{}, nil, TrivialReaderProvider{Reader: r})
@@ -706,7 +712,7 @@ func indexLayoutString(t *testing.T, r *Reader) string {
 	var buf strings.Builder
 	twoLevelIndex := r.Properties.IndexType == twoLevelIndex
 	buf.WriteString("index entries:\n")
-	iter, err := newBlockIter(r.Compare, r.Split, indexH.Get(), NoTransforms)
+	iter, err := rowblk.NewIter(r.Compare, r.Split, indexH.Get(), NoTransforms)
 	defer func() {
 		require.NoError(t, iter.Close())
 	}()
@@ -716,11 +722,10 @@ func indexLayoutString(t *testing.T, r *Reader) string {
 		require.NoError(t, err)
 		fmt.Fprintf(&buf, " %s: size %d\n", string(kv.K.UserKey), bh.Length)
 		if twoLevelIndex {
-			b, err := r.readBlock(
-				context.Background(), bh.BlockHandle, nil, nil, nil, nil, nil)
+			b, err := r.readBlock(context.Background(), bh.Handle, nil, nil, nil, nil, nil)
 			require.NoError(t, err)
 			defer b.Release()
-			iter2, err := newBlockIter(r.Compare, r.Split, b.Get(), NoTransforms)
+			iter2, err := rowblk.NewIter(r.Compare, r.Split, b.Get(), NoTransforms)
 			defer func() {
 				require.NoError(t, iter2.Close())
 			}()
@@ -769,13 +774,11 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, printVa
 				return ""
 
 			case "iter":
-				seqNum, err := scanGlobalSeqNum(d)
-				if err != nil {
-					return err.Error()
-				}
+				var globalSeqNum uint64
+				d.MaybeScanArgs(t, "globalSeqNum", &globalSeqNum)
 				var stats base.InternalIteratorStats
 				transforms := IterTransforms{
-					SyntheticSeqNum: SyntheticSeqNum(seqNum),
+					SyntheticSeqNum: SyntheticSeqNum(globalSeqNum),
 				}
 				var bpfs []BlockPropertyFilter
 				if d.HasArg("block-property-filter") {
@@ -789,7 +792,7 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, printVa
 					if transforms.HideObsoletePoints {
 						var retHideObsoletePoints bool
 						retHideObsoletePoints, bpfs = r.TryAddBlockPropertyFilterForHideObsoletePoints(
-							InternalKeySeqNumMax, InternalKeySeqNumMax-1, bpfs)
+							base.SeqNumMax, base.SeqNumMax-1, bpfs)
 						require.True(t, retHideObsoletePoints)
 					}
 				}
@@ -949,7 +952,7 @@ func TestCompactionIteratorSetupForCompaction(t *testing.T) {
 		for _, indexBlockSize := range blockSizes {
 			for _, numEntries := range []uint64{0, 1, 1e5} {
 				r := buildTestTableWithProvider(t, provider, numEntries, blockSize, indexBlockSize, DefaultCompression, nil)
-				var pool BufferPool
+				var pool block.BufferPool
 				pool.Init(5)
 				citer, err := r.NewCompactionIter(
 					NoTransforms, CategoryAndQoS{}, nil, TrivialReaderProvider{Reader: r}, &pool)
@@ -1005,7 +1008,7 @@ func TestReadaheadSetupForV3TablesWithMultipleVersions(t *testing.T) {
 	require.NoError(t, err)
 	defer r.Close()
 	{
-		var pool BufferPool
+		var pool block.BufferPool
 		pool.Init(5)
 		citer, err := r.NewCompactionIter(
 			NoTransforms, CategoryAndQoS{}, nil, TrivialReaderProvider{Reader: r}, &pool)
@@ -1300,11 +1303,11 @@ func TestRandomizedPrefixSuffixRewriter(t *testing.T) {
 		require.NoError(t, err)
 		iter, err := eReader.newIterWithBlockPropertyFiltersAndContext(
 			context.Background(),
-			IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix},
+			block.IterTransforms{SyntheticSuffix: syntheticSuffix, SyntheticPrefix: syntheticPrefix},
 			nil, nil, nil,
 			true, nil, CategoryAndQoS{}, nil,
 			TrivialReaderProvider{Reader: eReader}, &virtualState{
-				lower: base.MakeInternalKey([]byte("_"), base.InternalKeySeqNumMax, base.InternalKeyKindSet),
+				lower: base.MakeInternalKey([]byte("_"), base.SeqNumMax, base.InternalKeyKindSet),
 				upper: base.MakeRangeDeleteSentinelKey([]byte("~~~~~~~~~~~~~~~~")),
 			})
 		require.NoError(t, err)
@@ -1409,8 +1412,40 @@ func TestRandomizedPrefixSuffixRewriter(t *testing.T) {
 	}
 }
 
+// checker is a test helper that verifies that two different iterators running
+// the same sequence of operations return the same result. To use correctly, pass
+// the iter call directly as an arg to check(), i.e.:
+//
+// c.check(expect.SeekGE([]byte("apricot@2"), base.SeekGEFlagsNone))(got.SeekGE([]byte("apricot@2"), base.SeekGEFlagsNone))
+// c.check(expect.Next())(got.Next())
+//
+// NB: the signature to check is not simply `check(eKey,eVal,gKey,gVal)` because
+// `check(expect.Next(),got.Next())` does not compile.
+type checker struct {
+	t         *testing.T
+	notValid  bool
+	alsoCheck func()
+}
+
+func (c *checker) check(eKV *base.InternalKV) func(*base.InternalKV) {
+	return func(gKV *base.InternalKV) {
+		c.t.Helper()
+		if eKV != nil {
+			require.NotNil(c.t, gKV, "expected %q", eKV.K.UserKey)
+			c.t.Logf("expected %q, got %q", eKV.K.UserKey, gKV.K.UserKey)
+			require.Equal(c.t, eKV, gKV)
+			c.notValid = false
+		} else {
+			c.t.Logf("expected nil, got %v", gKV)
+			require.Nil(c.t, gKV)
+			c.notValid = true
+		}
+		c.alsoCheck()
+	}
+}
+
 func TestReaderChecksumErrors(t *testing.T) {
-	for _, checksumType := range []ChecksumType{ChecksumTypeCRC32c, ChecksumTypeXXHash64} {
+	for _, checksumType := range []block.ChecksumType{block.ChecksumTypeCRC32c, block.ChecksumTypeXXHash64} {
 		t.Run(fmt.Sprintf("checksum-type=%d", checksumType), func(t *testing.T) {
 			for _, twoLevelIndex := range []bool{false, true} {
 				t.Run(fmt.Sprintf("two-level-index=%t", twoLevelIndex), func(t *testing.T) {
@@ -1629,10 +1664,10 @@ func TestValidateBlockChecksums(t *testing.T) {
 		layout, err := r.Layout()
 		require.NoError(t, err)
 		for _, location := range corruptionLocations {
-			var bh BlockHandle
+			var bh block.Handle
 			switch location {
 			case corruptionLocationData:
-				bh = layout.Data[rng.Intn(len(layout.Data))].BlockHandle
+				bh = layout.Data[rng.Intn(len(layout.Data))].Handle
 			case corruptionLocationIndex:
 				bh = layout.Index[rng.Intn(len(layout.Index))]
 			case corruptionLocationTopIndex:
@@ -1994,7 +2029,7 @@ func BenchmarkSeqSeekGEExhausted(b *testing.B) {
 						require.NoError(b, err)
 						b.ResetTimer()
 						pos := 0
-						var seekGEFlags SeekGEFlags
+						var seekGEFlags base.SeekGEFlags
 						for i := 0; i < b.N; i++ {
 							seekKey := seekKeys[0]
 							var kv *base.InternalKV

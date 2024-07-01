@@ -979,7 +979,7 @@ func (i *InterleavingIter) yieldPointKey() *base.InternalKV {
 
 func (i *InterleavingIter) yieldSyntheticSpanStartMarker(lowerBound []byte) *base.InternalKV {
 	i.spanMarker.K.UserKey = i.startKey()
-	i.spanMarker.K.Trailer = base.MakeTrailer(base.InternalKeySeqNumMax, i.span.Keys[0].Kind())
+	i.spanMarker.K.Trailer = base.MakeTrailer(base.SeqNumMax, i.span.Keys[0].Kind())
 
 	// Truncate the key we return to our lower bound if we have one. Note that
 	// we use the lowerBound function parameter, not i.lower. The lowerBound
@@ -1016,7 +1016,7 @@ func (i *InterleavingIter) yieldSyntheticSpanStartMarker(lowerBound []byte) *bas
 
 func (i *InterleavingIter) yieldSyntheticSpanEndMarker() *base.InternalKV {
 	i.spanMarker.K.UserKey = i.endKey()
-	i.spanMarker.K.Trailer = base.MakeTrailer(base.InternalKeySeqNumMax, i.span.Keys[0].Kind())
+	i.spanMarker.K.Trailer = base.MakeTrailer(base.SeqNumMax, i.span.Keys[0].Kind())
 	return i.verify(&i.spanMarker)
 }
 
@@ -1117,9 +1117,13 @@ func (i *InterleavingIter) savePoint(kv *base.InternalKV) {
 //
 // Span will never return an invalid or empty span.
 func (i *InterleavingIter) Span() *Span {
+	if invariants.Enabled && i.pointIter == nil {
+		panic("Span() called after close")
+	}
 	if !i.withinSpan || len(i.span.Keys) == 0 {
 		return nil
-	} else if i.truncated {
+	}
+	if i.truncated {
 		return &i.truncatedSpan
 	}
 	return i.span
@@ -1153,7 +1157,9 @@ func (i *InterleavingIter) Error() error {
 // Close implements (base.InternalIterator).Close.
 func (i *InterleavingIter) Close() error {
 	err := i.pointIter.Close()
+	i.pointIter = nil
 	i.keyspanIter.Close()
+	i.keyspanIter = nil
 	return err
 }
 

@@ -166,7 +166,7 @@ func TestIterator(t *testing.T) {
 	var merge Merge
 	var kvs []base.InternalKV
 
-	newIter := func(seqNum uint64, opts IterOptions) *Iterator {
+	newIter := func(seqNum base.SeqNum, opts IterOptions) *Iterator {
 		if merge == nil {
 			merge = DefaultMerger.Merge
 		}
@@ -218,7 +218,7 @@ func TestIterator(t *testing.T) {
 				opts.UpperBound = []byte(upper)
 			}
 
-			iter := newIter(seqNum, opts)
+			iter := newIter(base.SeqNum(seqNum), opts)
 			iterOutput := runIterCmd(d, iter, true)
 			stats := iter.Stats()
 			return fmt.Sprintf("%sstats: %s\n", iterOutput, stats.String())
@@ -230,7 +230,7 @@ func TestIterator(t *testing.T) {
 }
 
 type minSeqNumPropertyCollector struct {
-	minSeqNum uint64
+	minSeqNum base.SeqNum
 }
 
 var _ BlockPropertyCollector = (*minSeqNumPropertyCollector)(nil)
@@ -257,7 +257,7 @@ func (c *minSeqNumPropertyCollector) FinishIndexBlock(buf []byte) ([]byte, error
 }
 
 func (c *minSeqNumPropertyCollector) FinishTable(buf []byte) ([]byte, error) {
-	return binary.AppendUvarint(buf, c.minSeqNum), nil
+	return binary.AppendUvarint(buf, uint64(c.minSeqNum)), nil
 }
 
 func (c *minSeqNumPropertyCollector) AddCollectedWithSuffixReplacement(
@@ -407,7 +407,7 @@ func TestReadSampling(t *testing.T) {
 				// sequence number, otherwise the DB appears empty.
 				snap := Snapshot{
 					db:     d,
-					seqNum: InternalKeySeqNumMax,
+					seqNum: base.SeqNumMax,
 				}
 				iter, _ = snap.NewIter(nil)
 				iter.readSampling.forceReadSampling = true
@@ -512,7 +512,7 @@ func TestIteratorTableFilter(t *testing.T) {
 			// sequence number, otherwise the DB appears empty.
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
 			iter, _ := snap.NewIter(iterOpts)
 			return runIterCmd(td, iter, true)
@@ -568,9 +568,13 @@ func TestIteratorNextPrev(t *testing.T) {
 		case "iter":
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
-			td.MaybeScanArgs(t, "seq", &snap.seqNum)
+			if td.HasArg("seq") {
+				var n uint64
+				td.ScanArgs(t, "seq", &n)
+				snap.seqNum = base.SeqNum(n)
+			}
 			iter, _ := snap.NewIter(nil)
 			return runIterCmd(td, iter, true)
 
@@ -624,7 +628,7 @@ func TestIteratorStats(t *testing.T) {
 		case "iter":
 			snap := Snapshot{
 				db:     d,
-				seqNum: InternalKeySeqNumMax,
+				seqNum: base.SeqNumMax,
 			}
 			td.MaybeScanArgs(t, "seq", &snap.seqNum)
 			iter, _ := snap.NewIter(nil)
@@ -724,7 +728,7 @@ func TestIteratorSeekOpt(t *testing.T) {
 				// sequence number, otherwise the DB appears empty.
 				snap := Snapshot{
 					db:     d,
-					seqNum: InternalKeySeqNumMax,
+					seqNum: base.SeqNumMax,
 				}
 				iter, _ = snap.NewIter(nil)
 				iter.readSampling.forceReadSampling = true

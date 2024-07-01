@@ -247,12 +247,12 @@ type Iterator struct {
 	newIters         tableNewIters
 	newIterRangeKey  keyspanimpl.TableNewSpanIter
 	lazyCombinedIter lazyCombinedIter
-	seqNum           uint64
+	seqNum           base.SeqNum
 	// batchSeqNum is used by Iterators over indexed batches to detect when the
 	// underlying batch has been mutated. The batch beneath an indexed batch may
 	// be mutated while the Iterator is open, but new keys are not surfaced
 	// until the next call to SetOptions.
-	batchSeqNum uint64
+	batchSeqNum base.SeqNum
 	// batch{PointIter,RangeDelIter,RangeKeyIter} are used when the Iterator is
 	// configured to read through an indexed batch. If a batch is set, these
 	// iterators will be included within the iterator stack regardless of
@@ -766,7 +766,7 @@ func (i *Iterator) nextUserKey() {
 		// NB: We're guaranteed to be on the next user key if the previous key
 		// had a zero sequence number (`done`), or the new key has a trailer
 		// greater or equal to the previous key's trailer. This is true because
-		// internal keys with the same user key are sorted by Trailer in
+		// internal keys with the same user key are sorted by InternalKeyTrailer in
 		// strictly monotonically descending order. We expect the trailer
 		// optimization to trigger around 50% of the time with randomly
 		// distributed writes. We expect it to trigger very frequently when
@@ -1306,7 +1306,7 @@ func (i *Iterator) SeekGEWithLimit(key []byte, limit []byte) IterValidityState {
 					(i.iterValidityState == IterValid && i.cmp(key, i.key) <= 0 &&
 						(limit == nil || i.cmp(i.key, limit) < 0))) {
 				// Noop
-				if !invariants.Enabled || !disableSeekOpt(key, uintptr(unsafe.Pointer(i))) || i.forceEnableSeekOpt {
+				if i.forceEnableSeekOpt || !testingDisableSeekOpt(key, uintptr(unsafe.Pointer(i))) {
 					i.lastPositioningOp = seekGELastPositioningOp
 					return i.iterValidityState
 				}
@@ -1327,7 +1327,7 @@ func (i *Iterator) SeekGEWithLimit(key []byte, limit []byte) IterValidityState {
 			if cmp < 0 && i.iterValidityState != IterAtLimit && limit == nil {
 				flags = flags.EnableTrySeekUsingNext()
 			}
-			if invariants.Enabled && flags.TrySeekUsingNext() && !i.forceEnableSeekOpt && disableSeekOpt(key, uintptr(unsafe.Pointer(i))) {
+			if testingDisableSeekOpt(key, uintptr(unsafe.Pointer(i))) && !i.forceEnableSeekOpt {
 				flags = flags.DisableTrySeekUsingNext()
 			}
 			if !flags.BatchJustRefreshed() && i.pos == iterPosCurForwardPaused && i.cmp(key, i.iterKV.K.UserKey) <= 0 {
@@ -1466,7 +1466,7 @@ func (i *Iterator) SeekPrefixGE(key []byte) bool {
 		if cmp < 0 {
 			flags = flags.EnableTrySeekUsingNext()
 		}
-		if invariants.Enabled && flags.TrySeekUsingNext() && !i.forceEnableSeekOpt && disableSeekOpt(key, uintptr(unsafe.Pointer(i))) {
+		if testingDisableSeekOpt(key, uintptr(unsafe.Pointer(i))) && !i.forceEnableSeekOpt {
 			flags = flags.DisableTrySeekUsingNext()
 		}
 	}
@@ -1505,10 +1505,13 @@ func (i *Iterator) SeekPrefixGE(key []byte) bool {
 	return i.iterValidityState == IterValid
 }
 
-// Deterministic disabling of the seek optimizations. It uses the iterator
-// pointer, since we want diversity in iterator behavior for the same key.  Used
-// for tests.
-func disableSeekOpt(key []byte, ptr uintptr) bool {
+// Deterministic disabling (in testing mode) of the seek optimizations. It uses
+// the iterator pointer, since we want diversity in iterator behavior for the
+// same key.  Used for tests.
+func testingDisableSeekOpt(key []byte, ptr uintptr) bool {
+	if !invariants.Enabled {
+		return false
+	}
 	// Fibonacci hash https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
 	simpleHash := (11400714819323198485 * uint64(ptr)) >> 63
 	return key != nil && key[0]&byte(1) == 0 && simpleHash == 0
@@ -1581,7 +1584,7 @@ func (i *Iterator) SeekLTWithLimit(key []byte, limit []byte) IterValidityState {
 			if i.iterValidityState == IterExhausted ||
 				(i.iterValidityState == IterValid && i.cmp(i.key, key) < 0 &&
 					(limit == nil || i.cmp(limit, i.key) <= 0)) {
-				if !invariants.Enabled || !disableSeekOpt(key, uintptr(unsafe.Pointer(i))) {
+				if !testingDisableSeekOpt(key, uintptr(unsafe.Pointer(i))) {
 					i.lastPositioningOp = seekLTLastPositioningOp
 					return i.iterValidityState
 				}
@@ -2608,7 +2611,7 @@ func (i *Iterator) SetOptions(o *IterOptions) {
 	// iterator or range-key iterator but we require one, it'll be created in
 	// the slow path that reconstructs the iterator in finishInitializingIter.
 	if i.batch != nil {
-		nextBatchSeqNum := (uint64(len(i.batch.data)) | base.InternalKeySeqNumBatch)
+		nextBatchSeqNum := (base.SeqNum(len(i.batch.data)) | base.SeqNumBatchBit)
 		if nextBatchSeqNum != i.batchSeqNum {
 			i.batchSeqNum = nextBatchSeqNum
 			if i.merging != nil {
@@ -2867,7 +2870,7 @@ func (i *Iterator) CloneWithContext(ctx context.Context, opts CloneOptions) (*It
 	// If the caller requested the clone have a current view of the indexed
 	// batch, set the clone's batch sequence number appropriately.
 	if i.batch != nil && opts.RefreshBatchView {
-		dbi.batchSeqNum = (uint64(len(i.batch.data)) | base.InternalKeySeqNumBatch)
+		dbi.batchSeqNum = (base.SeqNum(len(i.batch.data)) | base.SeqNumBatchBit)
 	}
 
 	return finishInitializingIter(ctx, buf), nil

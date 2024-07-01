@@ -2,23 +2,85 @@
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
-package sstable
+package block
 
 import (
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 )
 
-// A bufferHandle is a handle to manually-managed memory. The handle may point
+// Alloc allocates a new Value for a block of length n (excluding the block
+// trailer). If bufferPool is non-nil, Alloc allocates the buffer from the pool.
+// Otherwise it allocates it from the block cache.
+func Alloc(n int, p *BufferPool) Value {
+	if p != nil {
+		return Value{buf: p.Alloc(int(n))}
+	}
+	return Value{v: cache.Alloc(int(n))}
+}
+
+// Value is a block buffer, either backed by the block cache or a BufferPool.
+type Value struct {
+	// buf.Valid() returns true if backed by a BufferPool.
+	buf Buf
+	// v is non-nil if backed by the block cache.
+	v *cache.Value
+}
+
+// Get returns the underlying block's byte slice.
+func (b Value) Get() []byte {
+	if b.buf.Valid() {
+		return b.buf.p.pool[b.buf.i].b
+	}
+	return b.v.Buf()
+}
+
+// MakeHandle constructs a BufferHandle from the Value. If the Value is not
+// backed by a buffer pool, MakeHandle inserts the value into the block cache,
+// returning a handle to the now resident value.
+func (b Value) MakeHandle(
+	c *cache.Cache, cacheID uint64, fileNum base.DiskFileNum, offset uint64,
+) BufferHandle {
+	if b.buf.Valid() {
+		return BufferHandle{b: b.buf}
+	}
+	return BufferHandle{h: c.Set(cacheID, fileNum, offset, b.v)}
+}
+
+// Release releases the handle.
+func (b Value) Release() {
+	if b.buf.Valid() {
+		b.buf.Release()
+	} else {
+		cache.Free(b.v)
+	}
+}
+
+// Truncate truncates the block to n bytes.
+func (b Value) Truncate(n int) {
+	if b.buf.Valid() {
+		b.buf.p.pool[b.buf.i].b = b.buf.p.pool[b.buf.i].b[:n]
+	} else {
+		b.v.Truncate(n)
+	}
+}
+
+// A BufferHandle is a handle to manually-managed memory. The handle may point
 // to a block in the block cache (h.Get() != nil), or a buffer that exists
 // outside the block cache allocated from a BufferPool (b.Valid()).
-type bufferHandle struct {
+type BufferHandle struct {
 	h cache.Handle
 	b Buf
 }
 
+// CacheBufferHandle constructs a BufferHandle from a block cache Handle.
+func CacheBufferHandle(h cache.Handle) BufferHandle {
+	return BufferHandle{h: h}
+}
+
 // Get retrieves the underlying buffer referenced by the handle.
-func (bh bufferHandle) Get() []byte {
+func (bh BufferHandle) Get() []byte {
 	if v := bh.h.Get(); v != nil {
 		return v
 	} else if bh.b.p != nil {
@@ -28,7 +90,7 @@ func (bh bufferHandle) Get() []byte {
 }
 
 // Release releases the buffer, either back to the block cache or BufferPool.
-func (bh bufferHandle) Release() {
+func (bh BufferHandle) Release() {
 	bh.h.Release()
 	bh.b.Release()
 }
@@ -45,10 +107,11 @@ func (bh bufferHandle) Release() {
 type BufferPool struct {
 	// pool contains all the buffers held by the pool, including buffers that
 	// are in-use. For every i < len(pool): pool[i].v is non-nil.
-	pool []allocedBuffer
+	pool []AllocedBuffer
 }
 
-type allocedBuffer struct {
+// AllocedBuffer is an allocated memory buffer.
+type AllocedBuffer struct {
 	v *cache.Value
 	// b holds the current byte slice. It's backed by v, but may be a subslice
 	// of v's memory while the buffer is in-use [ len(b) ≤ len(v.Buf()) ].
@@ -62,14 +125,14 @@ type allocedBuffer struct {
 // `initialSize`.
 func (p *BufferPool) Init(initialSize int) {
 	*p = BufferPool{
-		pool: make([]allocedBuffer, 0, initialSize),
+		pool: make([]AllocedBuffer, 0, initialSize),
 	}
 }
 
-// initPreallocated is like Init but for internal sstable package use in
+// InitPreallocated is like Init but for internal sstable package use in
 // instances where a pre-allocated slice of []allocedBuffer already exists. It's
 // used to avoid an extra allocation initializing BufferPool.pool.
-func (p *BufferPool) initPreallocated(pool []allocedBuffer) {
+func (p *BufferPool) InitPreallocated(pool []AllocedBuffer) {
 	*p = BufferPool{
 		pool: pool[:0],
 	}
@@ -117,7 +180,7 @@ func (p *BufferPool) Alloc(n int) Buf {
 
 	// Allocate a new buffer.
 	v := cache.Alloc(n)
-	p.pool = append(p.pool, allocedBuffer{v: v, b: v.Buf()[:n]})
+	p.pool = append(p.pool, AllocedBuffer{v: v, b: v.Buf()[:n]})
 	return Buf{p: p, i: len(p.pool) - 1}
 }
 

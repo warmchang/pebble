@@ -12,6 +12,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/bytealloc"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
 // CopySpan produces a copy of a approximate subset of an input sstable.
@@ -155,15 +157,17 @@ func CopySpan(
 	// The block lengths don't include their trailers, which just sit after the
 	// block length, before the next offset; We get the ones between the blocks
 	// we copy implicitly but need to explicitly add the last trailer to length.
-	length := blocks[len(blocks)-1].bh.Offset + blocks[len(blocks)-1].bh.Length + blockTrailerLen - offset
+	length := blocks[len(blocks)-1].bh.Offset + blocks[len(blocks)-1].bh.Length + block.TrailerLen - offset
 
 	if spanEnd := length + offset; spanEnd < offset {
 		return 0, base.AssertionFailedf("invalid intersecting span for CopySpan [%d, %d)", offset, spanEnd)
 	}
 
-	if err := objstorage.Copy(ctx, r.readable, w.writable, offset, length); err != nil {
+	if err := objstorage.Copy(ctx, r.readable, w.layout.writable, offset, length); err != nil {
 		return 0, err
 	}
+	w.layout.offset += length
+
 	// Update w.meta.Size so subsequently flushed metadata has correct offsets.
 	w.meta.Size += length
 
@@ -211,10 +215,10 @@ func intersectingIndexEntries(
 	ctx context.Context,
 	r *Reader,
 	rh objstorage.ReadHandle,
-	indexH bufferHandle,
+	indexH block.BufferHandle,
 	start, end InternalKey,
 ) ([]indexEntry, error) {
-	top, err := newBlockIter(r.Compare, r.Split, indexH.Get(), NoTransforms)
+	top, err := rowblk.NewIter(r.Compare, r.Split, indexH.Get(), NoTransforms)
 	if err != nil {
 		return nil, err
 	}
@@ -233,13 +237,13 @@ func intersectingIndexEntries(
 			alloc, entry.sep.UserKey = alloc.Copy(entry.sep.UserKey)
 			res = append(res, entry)
 		} else {
-			subBlk, err := r.readBlock(ctx, bh.BlockHandle, nil, rh, nil, nil, nil)
+			subBlk, err := r.readBlock(ctx, bh.Handle, nil, rh, nil, nil, nil)
 			if err != nil {
 				return nil, err
 			}
 			defer subBlk.Release() // in-loop, but it is a short loop.
 
-			sub, err := newBlockIter(r.Compare, r.Split, subBlk.Get(), NoTransforms)
+			sub, err := rowblk.NewIter(r.Compare, r.Split, subBlk.Get(), NoTransforms)
 			if err != nil {
 				return nil, err
 			}

@@ -37,9 +37,9 @@ type TableInfo struct {
 	// Largest is the largest internal key in the table.
 	Largest InternalKey
 	// SmallestSeqNum is the smallest sequence number in the table.
-	SmallestSeqNum uint64
+	SmallestSeqNum base.SeqNum
 	// LargestSeqNum is the largest sequence number in the table.
-	LargestSeqNum uint64
+	LargestSeqNum base.SeqNum
 }
 
 // TableStats contains statistics on a table used for compaction heuristics,
@@ -196,14 +196,14 @@ type FileMetadata struct {
 	// LargestSeqNumAbsolute will be at least as high as the pre-zeroing
 	// sequence number. LargestSeqNumAbsolute is NOT durably persisted, so after
 	// a database restart it takes on the value of LargestSeqNum.
-	LargestSeqNumAbsolute uint64
+	LargestSeqNumAbsolute base.SeqNum
 	// Lower and upper bounds for the smallest and largest sequence numbers in
 	// the table, across both point and range keys. For physical sstables, these
 	// values are tight bounds. For virtual sstables, there is no guarantee that
 	// there will be keys with SmallestSeqNum or LargestSeqNum within virtual
 	// sstable bounds.
-	SmallestSeqNum uint64
-	LargestSeqNum  uint64
+	SmallestSeqNum base.SeqNum
+	LargestSeqNum  base.SeqNum
 	// SmallestPointKey and LargestPointKey are the inclusive bounds for the
 	// internal point keys stored in the table. This includes RANGEDELs, which
 	// alter point keys.
@@ -325,12 +325,24 @@ func (m *FileMetadata) SyntheticSeqNum() sstable.SyntheticSeqNum {
 	return sstable.NoSyntheticSeqNum
 }
 
-// IterTransforms returns an sstable.IterTransforms that has SyntheticSeqNum set as needed.
+// IterTransforms returns an sstable.IterTransforms populated according to the
+// file.
 func (m *FileMetadata) IterTransforms() sstable.IterTransforms {
 	return sstable.IterTransforms{
 		SyntheticSeqNum: m.SyntheticSeqNum(),
 		SyntheticSuffix: m.SyntheticSuffix,
 		SyntheticPrefix: m.SyntheticPrefix,
+	}
+}
+
+// FragmentIterTransforms returns an sstable.FragmentIterTransforms populated
+// according to the file.
+func (m *FileMetadata) FragmentIterTransforms() sstable.FragmentIterTransforms {
+	return sstable.FragmentIterTransforms{
+		SyntheticSeqNum: m.SyntheticSeqNum(),
+		// TODO(radu): support these.
+		//SyntheticSuffix: m.SyntheticSuffix,
+		//SyntheticPrefix: m.SyntheticPrefix,
 	}
 }
 
@@ -787,9 +799,9 @@ func ParseFileMetadataDebug(s string) (_ *FileMetadata, err error) {
 		switch field {
 		case "seqnums":
 			p.Expect("[")
-			m.SmallestSeqNum = p.Uint64()
+			m.SmallestSeqNum = p.SeqNum()
 			p.Expect("-")
-			m.LargestSeqNum = p.Uint64()
+			m.LargestSeqNum = p.SeqNum()
 			p.Expect("]")
 			m.LargestSeqNumAbsolute = m.LargestSeqNum
 
@@ -1311,11 +1323,11 @@ func (v *Version) CalculateInuseKeyRanges(
 		level++
 	}
 
+	// NB: We always treat `largest` as inclusive for simplicity, because
+	// there's little consequence to calculating slightly broader in-use key
+	// ranges.
 	bounds := base.UserKeyBoundsInclusive(smallest, largest)
 	for ; level <= maxLevel; level++ {
-		// NB: We always treat `largest` as inclusive for simplicity, because
-		// there's little consequence to calculating slightly broader in-use key
-		// ranges.
 		overlaps := v.Overlaps(level, bounds)
 		iter := overlaps.Iter()
 
@@ -1331,67 +1343,72 @@ func (v *Version) CalculateInuseKeyRanges(
 		input, output = output, input
 		output = output[:0]
 
-		var currFile *FileMetadata
-		var currAccum *base.UserKeyBounds
-		if len(input) > 0 {
-			currAccum, input = &input[0], input[1:]
-		}
 		cmp := v.cmp.Compare
-
+		inputIdx := 0
+		var currFile *FileMetadata
 		// If we have an accumulated key range and its start is ≤ smallest,
 		// we can seek to the accumulated range's end. Otherwise, we need to
 		// start at the first overlapping file within the level.
-		if currAccum != nil && v.cmp.Compare(currAccum.Start, smallest) <= 0 {
-			currFile = seekGT(&iter, cmp, currAccum.End)
+		if len(input) > 0 && cmp(input[0].Start, smallest) <= 0 {
+			currFile = seekGT(&iter, cmp, input[0].End)
 		} else {
 			currFile = iter.First()
 		}
 
-		for currFile != nil || currAccum != nil {
-			// If we've exhausted either the files in the level or the
-			// accumulated key ranges, we just need to append the one we have.
-			// If we have both a currFile and a currAccum, they either overlap
-			// or they're disjoint. If they're disjoint, we append whichever
-			// one sorts first and move on to the next file or range. If they
-			// overlap, we merge them into currAccum and proceed to the next
-			// file.
+		for currFile != nil && inputIdx < len(input) {
+			// Invariant: Neither currFile nor input[inputIdx] overlaps any earlier
+			// ranges.
 			switch {
-			case currAccum == nil || (currFile != nil && cmp(currFile.Largest.UserKey, currAccum.Start) < 0):
-				// This file is strictly before the current accumulated range,
-				// or there are no more accumulated ranges.
+			case cmp(currFile.Largest.UserKey, input[inputIdx].Start) < 0:
+				// File is completely before input range.
 				output = append(output, currFile.UserKeyBounds())
 				currFile = iter.Next()
-			case currFile == nil || (currAccum != nil && cmp(currAccum.End.Key, currFile.Smallest.UserKey) < 0):
-				// The current accumulated key range is strictly before the
-				// current file, or there are no more files.
-				output = append(output, *currAccum)
-				currAccum = nil
-				if len(input) > 0 {
-					currAccum, input = &input[0], input[1:]
-				}
-			default:
-				// The current accumulated range and the current file overlap.
-				// Adjust the accumulated range to be the union.
-				fileBounds := currFile.UserKeyBounds()
-				if cmp(fileBounds.Start, currAccum.Start) < 0 {
-					currAccum.Start = fileBounds.Start
-				}
-				if fileBounds.End.IsUpperBoundFor(cmp, currAccum.End.Key) {
-					currAccum.End = fileBounds.End
-				}
 
-				// Extending `currAccum`'s end boundary may have caused it to
-				// overlap with `input` key ranges that we haven't processed
-				// yet. Merge any such key ranges.
-				for len(input) > 0 && cmp(input[0].Start, currAccum.End.Key) <= 0 {
-					if input[0].End.IsUpperBoundFor(cmp, currAccum.End.Key) {
-						currAccum.End = input[0].End
-					}
-					input = input[1:]
+			case cmp(input[inputIdx].End.Key, currFile.Smallest.UserKey) < 0:
+				// Input range is completely before the next file.
+				output = append(output, input[inputIdx])
+				inputIdx++
+
+			default:
+				// Input range and file range overlap or touch. We will maximally extend
+				// the range with more overlapping inputs and files.
+				currAccum := currFile.UserKeyBounds()
+				if cmp(input[inputIdx].Start, currAccum.Start) < 0 {
+					currAccum.Start = input[inputIdx].Start
 				}
-				// Seek the level iterator past our current accumulated end.
-				currFile = seekGT(&iter, cmp, currAccum.End)
+				currFile = iter.Next()
+
+				// Extend curAccum with any overlapping (or touching) input intervals or
+				// files. Note that we will always consume at least input[inputIdx].
+				for {
+					if inputIdx < len(input) && cmp(input[inputIdx].Start, currAccum.End.Key) <= 0 {
+						if currAccum.End.CompareUpperBounds(cmp, input[inputIdx].End) < 0 {
+							currAccum.End = input[inputIdx].End
+							// Skip over files that are entirely inside this newly extended
+							// accumulated range; we expect ranges to be wider in levels that
+							// are higher up so this might skip over a non-trivial number of
+							// files.
+							currFile = seekGT(&iter, cmp, currAccum.End)
+						}
+						inputIdx++
+					} else if currFile != nil && cmp(currFile.Smallest.UserKey, currAccum.End.Key) <= 0 {
+						if b := currFile.UserKeyBounds(); currAccum.End.CompareUpperBounds(cmp, b.End) < 0 {
+							currAccum.End = b.End
+						}
+						currFile = iter.Next()
+					} else {
+						// No overlaps remaining.
+						break
+					}
+				}
+				output = append(output, currAccum)
 			}
+		}
+		// If we have either files or input ranges left over, add them to the
+		// output.
+		output = append(output, input[inputIdx:]...)
+		for ; currFile != nil; currFile = iter.Next() {
+			output = append(output, currFile.UserKeyBounds())
 		}
 	}
 	return output
@@ -1685,7 +1702,7 @@ func CheckOrdering(cmp Compare, format base.FormatKey, level Level, files LevelI
 				// In all supported format major version, split user keys are
 				// prohibited, so both files cannot contain keys with the same user
 				// keys. If the bounds have the same user key, the previous file's
-				// boundary must have a Trailer indicating that it's exclusive.
+				// boundary must have a InternalKeyTrailer indicating that it's exclusive.
 				if v := cmp(prev.Largest.UserKey, f.Smallest.UserKey); v > 0 || (v == 0 && !prev.Largest.IsExclusiveSentinel()) {
 					return base.CorruptionErrorf("%s files %s and %s have overlapping ranges: [%s-%s] vs [%s-%s]",
 						errors.Safe(level), errors.Safe(prev.FileNum), errors.Safe(f.FileNum),

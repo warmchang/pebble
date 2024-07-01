@@ -46,14 +46,12 @@ func TestMergingIter(t *testing.T) {
 			return fmt.Sprintf("%d levels", len(definedIters))
 		case "iter":
 			buf.Reset()
-			snapshot := base.InternalKeySeqNumMax
+			snapshot := base.SeqNumMax
 			iters := slices.Clone(definedIters)
 			for _, cmdArg := range td.CmdArgs {
 				switch cmdArg.Key {
 				case "snapshot":
-					var err error
-					snapshot, err = strconv.ParseUint(cmdArg.Vals[0], 10, 64)
-					require.NoError(t, err)
+					snapshot = base.ParseSeqNum(cmdArg.Vals[0])
 				case "probes":
 					// The first value indicates which of the merging iterator's
 					// child iterators is the target.
@@ -134,7 +132,7 @@ func testFragmenterEquivalenceOnce(t *testing.T, seed int64) {
 					Keys:  make([]keyspan.Key, 0, keyCount),
 				}
 				for k := keyCount; k > 0; k-- {
-					seqNum := uint64((len(levels)-l)*3) + k
+					seqNum := base.SeqNum((len(levels)-l)*3) + base.SeqNum(k)
 					s.Keys = append(s.Keys, keyspan.Key{
 						Trailer: base.MakeTrailer(seqNum, base.InternalKeyKindRangeKeySet),
 					})
@@ -181,7 +179,7 @@ func testFragmenterEquivalenceOnce(t *testing.T, seed int64) {
 
 	fragmenterIter := keyspan.NewIter(f.Cmp, allFragmented)
 	mergingIter := &MergingIter{}
-	mergingIter.Init(testkeys.Comparer, keyspan.VisibleTransform(base.InternalKeySeqNumMax), new(MergingBuffers), iters...)
+	mergingIter.Init(testkeys.Comparer, keyspan.VisibleTransform(base.SeqNumMax), new(MergingBuffers), iters...)
 
 	// Position both so that it's okay to perform relative positioning
 	// operations immediately.

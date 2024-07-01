@@ -9,15 +9,16 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 // CommonReader abstracts functionality over a Reader or a VirtualReader. This
 // can be used by code which doesn't care to distinguish between a reader and a
 // virtual reader.
 type CommonReader interface {
-	NewRawRangeKeyIter(transforms IterTransforms) (keyspan.FragmentIterator, error)
+	NewRawRangeKeyIter(transforms FragmentIterTransforms) (keyspan.FragmentIterator, error)
 
-	NewRawRangeDelIter(transforms IterTransforms) (keyspan.FragmentIterator, error)
+	NewRawRangeDelIter(transforms FragmentIterTransforms) (keyspan.FragmentIterator, error)
 
 	NewIterWithBlockPropertyFiltersAndContextEtc(
 		ctx context.Context,
@@ -36,7 +37,7 @@ type CommonReader interface {
 		categoryAndQoS CategoryAndQoS,
 		statsCollector *CategoryStatsCollector,
 		rp ReaderProvider,
-		bufferPool *BufferPool,
+		bufferPool *block.BufferPool,
 	) (Iterator, error)
 
 	EstimateDiskUsage(start, end []byte) (uint64, error)
@@ -44,26 +45,27 @@ type CommonReader interface {
 	CommonProperties() *CommonProperties
 }
 
-// IterTransforms allow on-the-fly transformation of data at iteration time.
-//
-// These transformations could in principle be implemented as block transforms
-// (at least for non-virtual sstables), but applying them during iteration is
-// preferable.
-type IterTransforms struct {
-	SyntheticSeqNum    SyntheticSeqNum
-	HideObsoletePoints bool
-	SyntheticPrefix    SyntheticPrefix
-	SyntheticSuffix    SyntheticSuffix
-}
+type (
+	// BufferPool re-exports block.BufferPool.
+	BufferPool = block.BufferPool
+	// IterTransforms re-exports block.IterTransforms.
+	IterTransforms = block.IterTransforms
+	// FragmentIterTransforms re-exports block.FragmentIterTransforms.
+	FragmentIterTransforms = block.FragmentIterTransforms
+	// SyntheticSeqNum re-exports block.SyntheticSeqNum.
+	SyntheticSeqNum = block.SyntheticSeqNum
+	// SyntheticSuffix re-exports block.SyntheticSuffix.
+	SyntheticSuffix = block.SyntheticSuffix
+	// SyntheticPrefix re-exports block.SyntheticPrefix.
+	SyntheticPrefix = block.SyntheticPrefix
+)
 
 // NoTransforms is the default value for IterTransforms.
-var NoTransforms = IterTransforms{}
+var NoTransforms = block.NoTransforms
 
-// SyntheticSeqNum is used to override all sequence numbers in a table. It is
-// set to a non-zero value when the table was created externally and ingested
-// whole.
-type SyntheticSeqNum uint64
+// NoFragmentTransforms is the default value for FragmentIterTransforms.
+var NoFragmentTransforms = block.NoFragmentTransforms
 
 // NoSyntheticSeqNum is the default zero value for SyntheticSeqNum, which
 // disables overriding the sequence number.
-const NoSyntheticSeqNum SyntheticSeqNum = 0
+const NoSyntheticSeqNum = block.NoSyntheticSeqNum

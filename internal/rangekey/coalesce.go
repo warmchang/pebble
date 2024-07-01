@@ -48,7 +48,7 @@ import (
 // consistent with respect to the set/unset suffixes: A given suffix should be
 // set or unset but not both.
 //
-// The resulting dst Keys slice is sorted by Trailer.
+// The resulting dst Keys slice is sorted by InternalKeyTrailer.
 func Coalesce(cmp base.Compare, eq base.Equal, keys []keyspan.Key, dst *[]keyspan.Key) {
 	// TODO(jackson): Currently, Coalesce doesn't actually perform the sequence
 	// number promotion described in the comment above.
@@ -66,7 +66,7 @@ func Coalesce(cmp base.Compare, eq base.Equal, keys []keyspan.Key, dst *[]keyspa
 // CoalesceIntoKeysBySuffix is a variant of Coalesce which outputs the results into
 // keyspan.KeysBySuffix without sorting them.
 func CoalesceIntoKeysBySuffix(
-	equal base.Equal, keysBySuffix *keyspan.KeysBySuffix, snapshot uint64, keys []keyspan.Key,
+	equal base.Equal, keysBySuffix *keyspan.KeysBySuffix, snapshot base.SeqNum, keys []keyspan.Key,
 ) {
 	// First, enforce visibility and RangeKeyDelete mechanics. We only need to
 	// consider the prefix of keys before and including the first
@@ -101,7 +101,7 @@ func CoalesceIntoKeysBySuffix(
 	// suffix, in which case the one with a larger trailer survives.
 	//
 	// We use a stable sort so that the first key with a given suffix is the one
-	// that with the highest Trailer (because the input `keys` was sorted by
+	// that with the highest InternalKeyTrailer (because the input `keys` was sorted by
 	// trailer descending).
 	sort.Stable(keysBySuffix)
 
@@ -125,7 +125,7 @@ func CoalesceIntoKeysBySuffix(
 	for i := range sorted {
 		if i > 0 && equal(prevSuffix, sorted[i].Suffix) {
 			// Skip; this key is shadowed by the predecessor that had a larger
-			// Trailer. If this is the first shadowed key, set shadowing=true
+			// InternalKeyTrailer. If this is the first shadowed key, set shadowing=true
 			// and reslice keysBySuffix.keys to hold the entire unshadowed
 			// prefix.
 			if !shadowing {
@@ -160,7 +160,7 @@ func CoalesceIntoKeysBySuffix(
 // rest of the iterator stack expects.
 type ForeignSSTTransformer struct {
 	Equal   base.Equal
-	SeqNum  uint64
+	SeqNum  base.SeqNum
 	sortBuf keyspan.KeysBySuffix
 }
 

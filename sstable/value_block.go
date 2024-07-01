@@ -7,7 +7,6 @@ package sstable
 import (
 	"context"
 	"encoding/binary"
-	"io"
 	"sync"
 	"unsafe"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"golang.org/x/exp/rand"
 )
 
@@ -104,7 +104,7 @@ import (
 //
 // Data blocks contain two kinds of SET keys: those with in-place values and
 // those with a value handle. To distinguish these two cases we use a single
-// byte prefix (valuePrefix). This single byte prefix is split into multiple
+// byte prefix (ValuePrefix). This single byte prefix is split into multiple
 // parts, where nb represents information that is encoded in n bits.
 //
 // +---------------+--------------------+-----------+--------------------+
@@ -188,31 +188,6 @@ type valueHandle struct {
 	offsetInBlock uint32
 }
 
-// valuePrefix is the single byte prefix for either the in-place value or the
-// encoded valueHandle. It encoded multiple kinds of information.
-type valuePrefix byte
-
-const (
-	// 2 most-significant bits of valuePrefix encodes the value-kind.
-	valueKindMask           valuePrefix = '\xC0'
-	valueKindIsValueHandle  valuePrefix = '\x80'
-	valueKindIsInPlaceValue valuePrefix = '\x00'
-
-	// 1 bit indicates SET has same key prefix as immediately preceding key that
-	// is also a SET. If the immediately preceding key in the same block is a
-	// SET, AND this bit is 0, the prefix must have changed.
-	//
-	// Note that the current policy of only storing older MVCC versions in value
-	// blocks means that valueKindIsValueHandle => SET has same prefix. But no
-	// code should rely on this behavior. Also, SET has same prefix does *not*
-	// imply valueKindIsValueHandle.
-	setHasSameKeyPrefixMask valuePrefix = '\x20'
-
-	// 3 least-significant bits for the user-defined base.ShortAttribute.
-	// Undefined for valueKindIsInPlaceValue.
-	userDefinedShortAttributeMask valuePrefix = '\x07'
-)
-
 // valueHandle fields are varint encoded, so maximum 5 bytes each, plus 1 byte
 // for the valuePrefix. This could alternatively be group varint encoded, but
 // experiments were inconclusive
@@ -228,35 +203,6 @@ func encodeValueHandle(dst []byte, v valueHandle) int {
 	n += binary.PutUvarint(dst[n:], uint64(v.blockNum))
 	n += binary.PutUvarint(dst[n:], uint64(v.offsetInBlock))
 	return n
-}
-
-func makePrefixForValueHandle(setHasSameKeyPrefix bool, attribute base.ShortAttribute) valuePrefix {
-	prefix := valueKindIsValueHandle | valuePrefix(attribute)
-	if setHasSameKeyPrefix {
-		prefix = prefix | setHasSameKeyPrefixMask
-	}
-	return prefix
-}
-
-func makePrefixForInPlaceValue(setHasSameKeyPrefix bool) valuePrefix {
-	prefix := valueKindIsInPlaceValue
-	if setHasSameKeyPrefix {
-		prefix = prefix | setHasSameKeyPrefixMask
-	}
-	return prefix
-}
-
-func isValueHandle(b valuePrefix) bool {
-	return b&valueKindMask == valueKindIsValueHandle
-}
-
-// REQUIRES: isValueHandle(b)
-func getShortAttribute(b valuePrefix) base.ShortAttribute {
-	return base.ShortAttribute(b & userDefinedShortAttributeMask)
-}
-
-func setHasSamePrefix(b valuePrefix) bool {
-	return b&setHasSameKeyPrefixMask == setHasSameKeyPrefixMask
 }
 
 func decodeLenFromValueHandle(src []byte) (uint32, []byte) {
@@ -338,7 +284,7 @@ func decodeValueHandle(src []byte) valueHandle {
 // former is an emergent property of the data that was written and not known
 // until all the key-value pairs in the sstable are written.
 type valueBlocksIndexHandle struct {
-	h                     BlockHandle
+	h                     block.Handle
 	blockNumByteLength    uint8
 	blockOffsetByteLength uint8
 	blockLengthByteLength uint8
@@ -391,7 +337,7 @@ type valueBlockWriter struct {
 	// Configured compression.
 	compression Compression
 	// checksummer with configured checksum type.
-	checksummer checksummer
+	checksummer block.Checksummer
 	// Block finished callback.
 	blockFinishedFunc func(compressedSize int)
 
@@ -408,7 +354,7 @@ type valueBlockWriter struct {
 
 type blockAndHandle struct {
 	block      *blockBuffer
-	handle     BlockHandle
+	handle     block.Handle
 	compressed bool
 }
 
@@ -460,7 +406,7 @@ func newValueBlockWriter(
 	blockSize int,
 	blockSizeThreshold int,
 	compression Compression,
-	checksumType ChecksumType,
+	checksumType block.ChecksumType,
 	// compressedSize should exclude the block trailer.
 	blockFinishedFunc func(compressedSize int),
 ) *valueBlockWriter {
@@ -469,8 +415,8 @@ func newValueBlockWriter(
 		blockSize:          blockSize,
 		blockSizeThreshold: blockSizeThreshold,
 		compression:        compression,
-		checksummer: checksummer{
-			checksumType: checksumType,
+		checksummer: block.Checksummer{
+			Type: checksumType,
 		},
 		blockFinishedFunc: blockFinishedFunc,
 		buf:               uncompressedValueBlockBufPool.Get().(*blockBuffer),
@@ -563,16 +509,16 @@ func (w *valueBlockWriter) compressAndFlush() {
 		}
 	}
 	n := len(b.b)
-	if n+blockTrailerLen > cap(b.b) {
-		block := make([]byte, n+blockTrailerLen)
+	if n+block.TrailerLen > cap(b.b) {
+		block := make([]byte, n+block.TrailerLen)
 		copy(block, b.b)
 		b.b = block
 	} else {
-		b.b = b.b[:n+blockTrailerLen]
+		b.b = b.b[:n+block.TrailerLen]
 	}
 	b.b[n] = byte(blockType)
 	w.computeChecksum(b.b)
-	bh := BlockHandle{Offset: w.totalBlockBytes, Length: uint64(n)}
+	bh := block.Handle{Offset: w.totalBlockBytes, Length: uint64(n)}
 	w.totalBlockBytes += uint64(len(b.b))
 	// blockFinishedFunc length excludes the block trailer.
 	w.blockFinishedFunc(n)
@@ -591,14 +537,14 @@ func (w *valueBlockWriter) compressAndFlush() {
 	w.buf.b = w.buf.b[:0]
 }
 
-func (w *valueBlockWriter) computeChecksum(block []byte) {
-	n := len(block) - blockTrailerLen
-	checksum := w.checksummer.checksum(block[:n], block[n:n+1])
-	binary.LittleEndian.PutUint32(block[n+1:], checksum)
+func (w *valueBlockWriter) computeChecksum(blk []byte) {
+	n := len(blk) - block.TrailerLen
+	checksum := w.checksummer.Checksum(blk[:n], blk[n:n+1])
+	binary.LittleEndian.PutUint32(blk[n+1:], checksum)
 }
 
 func (w *valueBlockWriter) finish(
-	writer io.Writer, fileOffset uint64,
+	layout *layoutWriter, fileOffset uint64,
 ) (valueBlocksIndexHandle, valueBlocksAndIndexStats, error) {
 	if len(w.buf.b) > 0 {
 		w.compressAndFlush()
@@ -610,7 +556,7 @@ func (w *valueBlockWriter) finish(
 	largestOffset := uint64(0)
 	largestLength := uint64(0)
 	for i := range w.blocks {
-		_, err := writer.Write(w.blocks[i].block.b)
+		_, err := layout.WriteValueBlock(w.blocks[i].block.b)
 		if err != nil {
 			return valueBlocksIndexHandle{}, valueBlocksAndIndexStats{}, err
 		}
@@ -623,7 +569,7 @@ func (w *valueBlockWriter) finish(
 	vbihOffset := fileOffset + w.totalBlockBytes
 
 	vbih := valueBlocksIndexHandle{
-		h: BlockHandle{
+		h: block.Handle{
 			Offset: vbihOffset,
 		},
 		blockNumByteLength:    uint8(lenLittleEndian(uint64(n - 1))),
@@ -631,24 +577,26 @@ func (w *valueBlockWriter) finish(
 		blockLengthByteLength: uint8(lenLittleEndian(largestLength)),
 	}
 	var err error
-	if vbih, err = w.writeValueBlocksIndex(writer, vbih); err != nil {
-		return valueBlocksIndexHandle{}, valueBlocksAndIndexStats{}, err
+	if n > 0 {
+		if vbih, err = w.writeValueBlocksIndex(layout, vbih); err != nil {
+			return valueBlocksIndexHandle{}, valueBlocksAndIndexStats{}, err
+		}
 	}
 	stats := valueBlocksAndIndexStats{
 		numValueBlocks:          uint64(n),
 		numValuesInValueBlocks:  w.numValues,
-		valueBlocksAndIndexSize: w.totalBlockBytes + vbih.h.Length + blockTrailerLen,
+		valueBlocksAndIndexSize: w.totalBlockBytes + vbih.h.Length + block.TrailerLen,
 	}
 	return vbih, stats, err
 }
 
 func (w *valueBlockWriter) writeValueBlocksIndex(
-	writer io.Writer, h valueBlocksIndexHandle,
+	layout *layoutWriter, h valueBlocksIndexHandle,
 ) (valueBlocksIndexHandle, error) {
 	blockLen :=
 		int(h.blockNumByteLength+h.blockOffsetByteLength+h.blockLengthByteLength) * len(w.blocks)
 	h.h.Length = uint64(blockLen)
-	blockLen += blockTrailerLen
+	blockLen += block.TrailerLen
 	var buf []byte
 	if cap(w.buf.b) < blockLen {
 		buf = make([]byte, blockLen)
@@ -665,12 +613,12 @@ func (w *valueBlockWriter) writeValueBlocksIndex(
 		littleEndianPut(w.blocks[i].handle.Length, b, int(h.blockLengthByteLength))
 		b = b[int(h.blockLengthByteLength):]
 	}
-	if len(b) != blockTrailerLen {
+	if len(b) != block.TrailerLen {
 		panic("incorrect length calculation")
 	}
 	b[0] = byte(noCompressionBlockType)
 	w.computeChecksum(buf)
-	if _, err := writer.Write(buf); err != nil {
+	if _, err := layout.WriteValueIndexBlock(buf, h); err != nil {
 		return valueBlocksIndexHandle{}, err
 	}
 	return h, nil
@@ -726,8 +674,8 @@ func (ukb *UserKeyPrefixBound) IsEmpty() bool {
 
 type blockProviderWhenOpen interface {
 	readBlockForVBR(
-		h BlockHandle, stats *base.InternalIteratorStats,
-	) (bufferHandle, error)
+		h block.Handle, stats *base.InternalIteratorStats,
+	) (block.BufferHandle, error)
 }
 
 type blockProviderWhenClosed struct {
@@ -747,8 +695,8 @@ func (bpwc *blockProviderWhenClosed) close() {
 }
 
 func (bpwc blockProviderWhenClosed) readBlockForVBR(
-	h BlockHandle, stats *base.InternalIteratorStats,
-) (bufferHandle, error) {
+	h block.Handle, stats *base.InternalIteratorStats,
+) (block.BufferHandle, error) {
 	// This is rare, since most block reads happen when the corresponding
 	// sstable iterator is open. So we are willing to sacrifice a proper context
 	// for tracing.
@@ -799,7 +747,7 @@ type valueBlockReader struct {
 	// The value blocks index is lazily retrieved the first time the reader
 	// needs to read a value that resides in a value block.
 	vbiBlock []byte
-	vbiCache bufferHandle
+	vbiCache block.BufferHandle
 	// When sequentially iterating through all key-value pairs, the cost of
 	// repeatedly getting a block that is already in the cache and releasing the
 	// bufferHandle can be ~40% of the cpu overhead. So the reader remembers the
@@ -808,7 +756,7 @@ type valueBlockReader struct {
 	valueBlockNum uint32
 	valueBlock    []byte
 	valueBlockPtr unsafe.Pointer
-	valueCache    bufferHandle
+	valueCache    block.BufferHandle
 	lazyFetcher   base.LazyFetcher
 	closed        bool
 	bufToMangle   []byte
@@ -821,7 +769,7 @@ func (r *valueBlockReader) getLazyValueForPrefixAndValueHandle(handle []byte) ba
 		Fetcher: r,
 		Attribute: base.AttributeAndLen{
 			ValueLen:       int32(valLen),
-			ShortAttribute: getShortAttribute(valuePrefix(handle[0])),
+			ShortAttribute: block.ValuePrefix(handle[0]).ShortAttribute(),
 		},
 	}
 	if r.stats != nil {
@@ -842,12 +790,12 @@ func (r *valueBlockReader) close() {
 	// we were to reopen this valueBlockReader and retrieve the same
 	// Handle.value from the cache, we don't want to accidentally unref it when
 	// attempting to unref the old handle.
-	r.vbiCache = bufferHandle{}
+	r.vbiCache = block.BufferHandle{}
 	r.valueBlock = nil
 	r.valueBlockPtr = nil
 	r.valueCache.Release()
 	// See comment above.
-	r.valueCache = bufferHandle{}
+	r.valueCache = block.BufferHandle{}
 	r.closed = true
 	// rp, vbih, stats remain valid, so that LazyFetcher.ValueFetcher can be
 	// implemented.
@@ -929,12 +877,12 @@ func (r *valueBlockReader) getValueInternal(handle []byte, valLen int32) (val []
 	return r.valueBlock[vh.offsetInBlock : vh.offsetInBlock+vh.valueLen], nil
 }
 
-func (r *valueBlockReader) getBlockHandle(blockNum uint32) (BlockHandle, error) {
+func (r *valueBlockReader) getBlockHandle(blockNum uint32) (block.Handle, error) {
 	indexEntryLen :=
 		int(r.vbih.blockNumByteLength + r.vbih.blockOffsetByteLength + r.vbih.blockLengthByteLength)
 	offsetInIndex := indexEntryLen * int(blockNum)
 	if len(r.vbiBlock) < offsetInIndex+indexEntryLen {
-		return BlockHandle{}, base.AssertionFailedf(
+		return block.Handle{}, base.AssertionFailedf(
 			"index entry out of bounds: offset %d length %d block length %d",
 			offsetInIndex, indexEntryLen, len(r.vbiBlock))
 	}
@@ -942,7 +890,7 @@ func (r *valueBlockReader) getBlockHandle(blockNum uint32) (BlockHandle, error) 
 	n := int(r.vbih.blockNumByteLength)
 	bn := littleEndianGet(b, n)
 	if uint32(bn) != blockNum {
-		return BlockHandle{},
+		return block.Handle{},
 			errors.Errorf("expected block num %d but found %d", blockNum, bn)
 	}
 	b = b[n:]
@@ -951,5 +899,5 @@ func (r *valueBlockReader) getBlockHandle(blockNum uint32) (BlockHandle, error) 
 	b = b[n:]
 	n = int(r.vbih.blockLengthByteLength)
 	blockLen := littleEndianGet(b, n)
-	return BlockHandle{Offset: blockOffset, Length: blockLen}, nil
+	return block.Handle{Offset: blockOffset, Length: blockLen}, nil
 }

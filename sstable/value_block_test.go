@@ -10,7 +10,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,52 +29,10 @@ func TestValueHandleEncodeDecode(t *testing.T) {
 	}
 }
 
-func TestValuePrefix(t *testing.T) {
-	testCases := []struct {
-		isHandle         bool
-		setHasSamePrefix bool
-		attr             base.ShortAttribute
-	}{
-		{
-			isHandle:         false,
-			setHasSamePrefix: false,
-		},
-		{
-			isHandle:         false,
-			setHasSamePrefix: true,
-		},
-		{
-			isHandle:         true,
-			setHasSamePrefix: false,
-			attr:             5,
-		},
-		{
-			isHandle:         true,
-			setHasSamePrefix: true,
-			attr:             2,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("%+v", tc), func(t *testing.T) {
-			var prefix valuePrefix
-			if tc.isHandle {
-				prefix = makePrefixForValueHandle(tc.setHasSamePrefix, tc.attr)
-			} else {
-				prefix = makePrefixForInPlaceValue(tc.setHasSamePrefix)
-			}
-			require.Equal(t, tc.isHandle, isValueHandle(prefix))
-			require.Equal(t, tc.setHasSamePrefix, setHasSamePrefix(prefix))
-			if tc.isHandle {
-				require.Equal(t, tc.attr, getShortAttribute(prefix))
-			}
-		})
-	}
-}
-
 func TestValueBlocksIndexHandleEncodeDecode(t *testing.T) {
 	testCases := []valueBlocksIndexHandle{
 		{
-			h: BlockHandle{
+			h: block.Handle{
 				Offset: math.MaxUint64 / 2,
 				Length: math.MaxUint64 / 4,
 			},

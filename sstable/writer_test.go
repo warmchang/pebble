@@ -24,6 +24,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -167,7 +169,7 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			return buf.String()
 
 		case "scan-range-del":
-			iter, err := r.NewRawRangeDelIter(NoTransforms)
+			iter, err := r.NewRawRangeDelIter(NoFragmentTransforms)
 			if err != nil {
 				return err.Error()
 			}
@@ -187,7 +189,7 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			return buf.String()
 
 		case "scan-range-key":
-			iter, err := r.NewRawRangeKeyIter(NoTransforms)
+			iter, err := r.NewRawRangeKeyIter(NoFragmentTransforms)
 			if err != nil {
 				return err.Error()
 			}
@@ -229,9 +231,6 @@ func runDataDriven(t *testing.T, file string, tableFormat TableFormat, paralleli
 			meta, r, err = runRewriteCmd(td, r, WriterOptions{
 				TableFormat: tableFormat,
 			})
-			if err != nil {
-				return err.Error()
-			}
 			if err != nil {
 				return err.Error()
 			}
@@ -327,8 +326,8 @@ func TestWriterWithValueBlocks(t *testing.T) {
 			}
 			forceIgnoreValueBlocks := func(i *singleLevelIterator) {
 				i.vbReader = nil
-				i.data.lazyValueHandling.vbr = nil
-				i.data.lazyValueHandling.hasValuePrefix = false
+				i.data.SetGetLazyValue(nil)
+				i.data.SetHasValuePrefix(false)
 			}
 			switch i := origIter.(type) {
 			case *twoLevelIterator:
@@ -343,10 +342,10 @@ func TestWriterWithValueBlocks(t *testing.T) {
 			for valid := iter.First(); valid; valid = iter.Next() {
 				v := iter.Value()
 				if iter.Key().Kind() == InternalKeyKindSet {
-					prefix := valuePrefix(v[0])
-					setWithSamePrefix := setHasSamePrefix(prefix)
-					if isValueHandle(prefix) {
-						attribute := getShortAttribute(prefix)
+					prefix := block.ValuePrefix(v[0])
+					setWithSamePrefix := prefix.SetHasSamePrefix()
+					if prefix.IsValueHandle() {
+						attribute := prefix.ShortAttribute()
 						vh := decodeValueHandle(v[1:])
 						fmt.Fprintf(&buf, "%s:value-handle len %d block %d offset %d, att %d, same-pre %t\n",
 							iter.Key(), vh.valueLen, vh.blockNum, vh.offsetInBlock, attribute, setWithSamePrefix)
@@ -434,13 +433,12 @@ func TestBlockBufClear(t *testing.T) {
 }
 
 func TestClearDataBlockBuf(t *testing.T) {
-	d := newDataBlockBuf(1, ChecksumTypeCRC32c)
+	d := newDataBlockBuf(1, block.ChecksumTypeCRC32c)
 	d.blockBuf.compressedBuf = make([]byte, 1)
-	d.dataBlock.add(ikey("apple"), nil)
-	d.dataBlock.add(ikey("banana"), nil)
+	d.dataBlock.Add(ikey("apple"), nil)
+	d.dataBlock.Add(ikey("banana"), nil)
 
 	d.clear()
-	testBlockCleared(t, &d.dataBlock, &blockWriter{})
 	testBlockBufClear(t, &d.blockBuf, &blockBuf{})
 
 	dataBlockBufPool.Put(d)
@@ -448,15 +446,18 @@ func TestClearDataBlockBuf(t *testing.T) {
 
 func TestClearIndexBlockBuf(t *testing.T) {
 	i := newIndexBlockBuf(false)
-	i.block.add(ikey("apple"), nil)
-	i.block.add(ikey("banana"), nil)
+	i.block.Add(ikey("apple"), nil)
+	i.block.Add(ikey("banana"), nil)
 	i.clear()
 
-	testBlockCleared(t, &i.block, &blockWriter{})
 	require.Equal(
-		t, i.size.estimate, sizeEstimate{emptySize: emptyBlockSize},
+		t, i.size.estimate, sizeEstimate{emptySize: rowblk.EmptySize},
 	)
 	indexBlockBufPool.Put(i)
+}
+
+func ikey(s string) base.InternalKey {
+	return base.InternalKey{UserKey: []byte(s)}
 }
 
 func TestClearWriteTask(t *testing.T) {
@@ -623,9 +624,9 @@ func TestWriterClearCache(t *testing.T) {
 	layout, err := r.Layout()
 	require.NoError(t, err)
 
-	foreachBH := func(layout *Layout, f func(bh BlockHandle)) {
+	foreachBH := func(layout *Layout, f func(bh block.Handle)) {
 		for _, bh := range layout.Data {
-			f(bh.BlockHandle)
+			f(bh.Handle)
 		}
 		for _, bh := range layout.Index {
 			f(bh)
@@ -644,7 +645,7 @@ func TestWriterClearCache(t *testing.T) {
 	}
 
 	// Poison the cache for each of the blocks.
-	poison := func(bh BlockHandle) {
+	poison := func(bh block.Handle) {
 		opts.Cache.Set(cacheOpts.cacheID, cacheOpts.fileNum, bh.Offset, invalidData()).Release()
 	}
 	foreachBH(layout, poison)
@@ -654,7 +655,7 @@ func TestWriterClearCache(t *testing.T) {
 	build("test")
 
 	// Verify that the written blocks have been cleared from the cache.
-	check := func(bh BlockHandle) {
+	check := func(bh block.Handle) {
 		h := opts.Cache.Get(cacheOpts.cacheID, cacheOpts.fileNum, bh.Offset)
 		if h.Get() != nil {
 			t.Fatalf("%d: expected cache to be cleared, but found %q", bh.Offset, h.Get())
@@ -951,10 +952,10 @@ func TestWriterRace(t *testing.T) {
 			for ki := 0; ki < len(keys); ki++ {
 				require.NoError(
 					t,
-					w.Add(base.MakeInternalKey(keys[ki], uint64(ki), InternalKeyKindSet), val),
+					w.Add(base.MakeInternalKey(keys[ki], base.SeqNum(ki), InternalKeyKindSet), val),
 				)
 				require.Equal(
-					t, w.dataBlockBuf.dataBlock.getCurKey().UserKey, keys[ki],
+					t, w.dataBlockBuf.dataBlock.CurKey().UserKey, keys[ki],
 				)
 			}
 			require.NoError(t, w.Close())
