@@ -20,7 +20,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -72,6 +74,7 @@ func runTestFixtureOutput(fixture TestFixtureInfo) error {
 }
 
 func TestFixtureOutput(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, fixture := range TestFixtures {
 		// Note: we disabled the zstd fixture test when CGO_ENABLED=0, because the
 		// implementation between DataDog/zstd and klauspost/compress are
@@ -79,7 +82,7 @@ func TestFixtureOutput(t *testing.T) {
 		// <https://github.com/klauspost/compress/issues/109#issuecomment-498763233>.
 		// Since the fixture test requires bit-to-bit reproducibility, we cannot
 		// run the zstd test when the implementation is not based on facebook/zstd.
-		if !useStandardZstdLib && fixture.Compression == ZstdCompression {
+		if !block.UseStandardZstdLib && fixture.Compression == block.ZstdCompression {
 			continue
 		}
 		t.Run(fixture.Filename, func(t *testing.T) {

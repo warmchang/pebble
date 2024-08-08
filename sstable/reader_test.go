@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/bloom"
@@ -185,6 +186,7 @@ func (i *iterAdapter) SetContext(ctx context.Context) {
 }
 
 func TestVirtualReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	t.Run("props", func(t *testing.T) {
 		runVirtualReaderTest(t, "testdata/virtual_reader_props", 0 /* blockSize */, 0 /* indexBlockSize */)
 	})
@@ -225,21 +227,6 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 		}
 	}()
 
-	formatWMeta := func(m *WriterMetadata) string {
-		var b bytes.Buffer
-		if m.HasPointKeys {
-			fmt.Fprintf(&b, "point:    [%s-%s]\n", m.SmallestPoint, m.LargestPoint)
-		}
-		if m.HasRangeDelKeys {
-			fmt.Fprintf(&b, "rangedel: [%s-%s]\n", m.SmallestRangeDel, m.LargestRangeDel)
-		}
-		if m.HasRangeKeys {
-			fmt.Fprintf(&b, "rangekey: [%s-%s]\n", m.SmallestRangeKey, m.LargestRangeKey)
-		}
-		fmt.Fprintf(&b, "seqnums:  [%d-%d]\n", m.SmallestSeqNum, m.LargestSeqNum)
-		return b.String()
-	}
-
 	formatVirtualReader := func(v *VirtualReader, showProps bool) string {
 		var b bytes.Buffer
 		fmt.Fprintf(&b, "bounds:  [%s-%s]\n", v.vState.lower, v.vState.upper)
@@ -277,7 +264,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 				return err.Error()
 			}
 			bp.Init(5)
-			return formatWMeta(wMeta)
+			return formatWriterMetadata(td, wMeta)
 
 		case "virtualize":
 			// virtualize will split the previously built physical sstable into
@@ -368,7 +355,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 			if v == nil {
 				return "virtualize must be called before scan-range-del"
 			}
-			transforms := FragmentIterTransforms{} // TODO(radu): SyntheticSuffix: syntheticSuffix
+			transforms := FragmentIterTransforms{SyntheticSuffix: syntheticSuffix}
 			iter, err := v.NewRawRangeDelIter(context.Background(), transforms)
 			if err != nil {
 				return err.Error()
@@ -392,7 +379,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 			if v == nil {
 				return "virtualize must be called before scan-range-key"
 			}
-			transforms := FragmentIterTransforms{} // TODO(radu): SyntheticSuffix: syntheticSuffix
+			transforms := FragmentIterTransforms{SyntheticSuffix: syntheticSuffix}
 			iter, err := v.NewRawRangeKeyIter(context.Background(), transforms)
 			if err != nil {
 				return err.Error()
@@ -463,6 +450,7 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 }
 
 func TestReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	writerOpts := map[string]WriterOptions{
 		// No bloom filters.
 		"default": {},
@@ -526,6 +514,7 @@ func TestReader(t *testing.T) {
 }
 
 func TestReaderHideObsolete(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	blockSizes := map[string]int{
 		"1bytes":   1,
 		"5bytes":   5,
@@ -560,6 +549,7 @@ func TestReaderHideObsolete(t *testing.T) {
 }
 
 func TestHamletReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, fixture := range TestFixtures {
 		f, err := os.Open(filepath.Join("testdata", fixture.Filename))
 		require.NoError(t, err)
@@ -588,6 +578,7 @@ func forEveryTableFormat[I any](
 }
 
 func TestReaderStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	forEveryTableFormat[string](t,
 		[NumTableFormats]string{
 			TableFormatUnspecified: "",
@@ -612,6 +603,7 @@ func TestReaderStats(t *testing.T) {
 }
 
 func TestReaderWithBlockPropertyFilter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	// Some of these tests examine internal iterator state, so they require
 	// determinism. When the invariants tag is set, disableBoundsOpt may disable
 	// the bounds optimization depending on the iterator pointer address. This
@@ -643,6 +635,7 @@ func TestReaderWithBlockPropertyFilter(t *testing.T) {
 }
 
 func TestInjectedErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, fixture := range TestFixtures {
 		run := func(i int) (reterr error) {
 			f, err := vfs.Default.Open(filepath.Join("testdata", fixture.Filename))
@@ -695,6 +688,7 @@ func TestInjectedErrors(t *testing.T) {
 }
 
 func TestInvalidReader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	invalid, err := NewSimpleReadable(vfs.NewMemFile([]byte("invalid sst bytes")))
 	if err != nil {
 		t.Fatal(err)
@@ -863,6 +857,7 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, printVa
 }
 
 func TestReaderCheckComparerMerger(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	const testTable = "test"
 
 	testComparer := &base.Comparer{
@@ -965,6 +960,7 @@ func checkValidPrefix(prefix, key []byte) bool {
 }
 
 func TestCompactionIteratorSetupForCompaction(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tmpDir := path.Join(t.TempDir())
 	provider, err := objstorageprovider.Open(objstorageprovider.DefaultSettings(vfs.Default, tmpDir))
 	require.NoError(t, err)
@@ -973,7 +969,7 @@ func TestCompactionIteratorSetupForCompaction(t *testing.T) {
 	for _, blockSize := range blockSizes {
 		for _, indexBlockSize := range blockSizes {
 			for _, numEntries := range []uint64{0, 1, 1e5} {
-				r := buildTestTableWithProvider(t, provider, numEntries, blockSize, indexBlockSize, DefaultCompression, nil)
+				r := buildTestTableWithProvider(t, provider, numEntries, blockSize, indexBlockSize, block.DefaultCompression, nil)
 				var pool block.BufferPool
 				pool.Init(5)
 				citer, err := r.NewCompactionIter(
@@ -1002,6 +998,7 @@ func TestCompactionIteratorSetupForCompaction(t *testing.T) {
 }
 
 func TestReadaheadSetupForV3TablesWithMultipleVersions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	tmpDir := path.Join(t.TempDir())
 	provider, err := objstorageprovider.Open(objstorageprovider.DefaultSettings(vfs.Default, tmpDir))
 	require.NoError(t, err)
@@ -1286,6 +1283,7 @@ func createReadWorkload(
 // will contain all keys with that prefix. In other words, this is a randomized
 // version of TestBlockSyntheticSuffix and TestBlockSyntheticPrefix.
 func TestRandomizedPrefixSuffixRewriter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	ks := testkeys.Alpha(3)
 
 	callCount := 500
@@ -1467,6 +1465,7 @@ func (c *checker) check(eKV *base.InternalKV) func(*base.InternalKV) {
 }
 
 func TestReaderChecksumErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	for _, checksumType := range []block.ChecksumType{block.ChecksumTypeCRC32c, block.ChecksumTypeXXHash64} {
 		t.Run(fmt.Sprintf("checksum-type=%d", checksumType), func(t *testing.T) {
 			for _, twoLevelIndex := range []bool{false, true} {
@@ -1558,6 +1557,7 @@ func TestReaderChecksumErrors(t *testing.T) {
 }
 
 func TestValidateBlockChecksums(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	seed := uint64(time.Now().UnixNano())
 	rng := rand.New(rand.NewSource(seed))
 	t.Logf("using seed = %d", seed)
@@ -1750,6 +1750,7 @@ func TestValidateBlockChecksums(t *testing.T) {
 }
 
 func TestReader_TableFormat(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	test := func(t *testing.T, want TableFormat) {
 		fs := vfs.NewMem()
 		f, err := fs.Create("test", vfs.WriteCategoryUnspecified)
@@ -1783,7 +1784,7 @@ func buildTestTableWithProvider(
 	provider objstorage.Provider,
 	numEntries uint64,
 	blockSize, indexBlockSize int,
-	compression Compression,
+	compression block.Compression,
 	prefix []byte,
 ) *Reader {
 	f0, _, err := provider.Create(context.Background(), base.FileTypeTable, base.DiskFileNum(0), objstorage.CreateOptions{})
@@ -1883,7 +1884,7 @@ var basicBenchmarks = []struct {
 			BlockSize:            32 << 10,
 			BlockRestartInterval: 16,
 			FilterPolicy:         nil,
-			Compression:          SnappyCompression,
+			Compression:          block.SnappyCompression,
 			TableFormat:          TableFormatPebblev2,
 		},
 	},
@@ -1893,7 +1894,7 @@ var basicBenchmarks = []struct {
 			BlockSize:            32 << 10,
 			BlockRestartInterval: 16,
 			FilterPolicy:         nil,
-			Compression:          ZstdCompression,
+			Compression:          block.ZstdCompression,
 			TableFormat:          TableFormatPebblev2,
 		},
 	},
@@ -2096,7 +2097,7 @@ func BenchmarkIteratorScanManyVersions(b *testing.B) {
 		BlockSize:            32 << 10,
 		BlockRestartInterval: 16,
 		FilterPolicy:         nil,
-		Compression:          SnappyCompression,
+		Compression:          block.SnappyCompression,
 		Comparer:             testkeys.Comparer,
 	}
 	// 10,000 key prefixes, each with 100 versions.
@@ -2201,7 +2202,7 @@ func BenchmarkIteratorScanNextPrefix(b *testing.B) {
 		BlockSize:            32 << 10,
 		BlockRestartInterval: 16,
 		FilterPolicy:         nil,
-		Compression:          SnappyCompression,
+		Compression:          block.SnappyCompression,
 		TableFormat:          TableFormatPebblev3,
 		Comparer:             testkeys.Comparer,
 	}
@@ -2370,7 +2371,7 @@ func BenchmarkIteratorScanObsolete(b *testing.B) {
 		BlockSize:            32 << 10,
 		BlockRestartInterval: 16,
 		FilterPolicy:         nil,
-		Compression:          SnappyCompression,
+		Compression:          block.SnappyCompression,
 		Comparer:             testkeys.Comparer,
 	}
 	const keyCount = 1 << 20

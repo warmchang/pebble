@@ -238,10 +238,125 @@ func (b PrefixBytes) At(i int) []byte {
 	return slices.Concat(b.SharedPrefix(), b.RowBundlePrefix(i), b.RowSuffix(i))
 }
 
+// PrefixBytesIter is an iterator and associated buffers for PrefixBytes. It
+// provides a means for efficiently iterating over the []byte slices contained
+// within a PrefixBytes, avoiding unnecessary copying when portions of slices
+// are shared.
+type PrefixBytesIter struct {
+	UnsafeBuf
+	bundlePrefixLen       uint32
+	offsetIndex           int
+	nextBundleOffsetIndex int
+}
+
+// SetAt updates the provided PrefixBytesIter to hold the i'th []byte slice in
+// the PrefixBytes.
+func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
+	// Determine the offset and length of the bundle prefix.
+	bundleOffsetIndex := b.bundleOffsetIndexForRow(i)
+	bundleOffsetStart := b.rawBytes.offsets.At(bundleOffsetIndex)
+	it.bundlePrefixLen = b.rawBytes.offsets.At(bundleOffsetIndex+1) - bundleOffsetStart
+
+	// Determine the offset and length of the row's individual suffix.
+	it.offsetIndex = b.rowSuffixIndex(i)
+	// TODO(jackson): rowSuffixOffsets will recompute bundleOffsetIndexForRow in
+	// the case that the row is a duplicate key. Is it worth optimizing to avoid
+	// this recomputation? The expected case is non-duplicate keys, so it may
+	// not be worthwhile.
+	rowSuffixStart, rowSuffixEnd := b.rowSuffixOffsets(i, it.offsetIndex)
+
+	// Grow the size of the iterator's buffer if necessary.
+	it.len = b.sharedPrefixLen + int(it.bundlePrefixLen) + int(rowSuffixEnd-rowSuffixStart)
+	if it.len > it.cap {
+		it.cap = it.len << 1
+		it.ptr = mallocgc(uintptr(it.cap), nil, false)
+	}
+
+	// Copy the shared key prefix.
+	memmove(it.ptr, b.rawBytes.data, uintptr(b.sharedPrefixLen))
+	// Copy the bundle prefix.
+	memmove(
+		unsafe.Pointer(uintptr(it.ptr)+uintptr(b.sharedPrefixLen)),
+		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundleOffsetStart)),
+		uintptr(it.bundlePrefixLen))
+	// Copy the per-row suffix.
+	memmove(
+		unsafe.Pointer(uintptr(it.ptr)+uintptr(b.sharedPrefixLen)+uintptr(it.bundlePrefixLen)),
+		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart)),
+		uintptr(rowSuffixEnd-rowSuffixStart))
+	// Set nextBundleOffsetIndex so that a call to SetNext can cheaply determine
+	// whether the next row is in the same bundle.
+	it.nextBundleOffsetIndex = bundleOffsetIndex + (1 << b.bundleShift) + 1
+}
+
+// SetNext updates the provided PrefixBytesIter to hold the next []byte slice in
+// the PrefixBytes. SetNext requires the provided iter to currently hold a slice
+// and for a subsequent slice to exist within the PrefixBytes.
+func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
+	it.offsetIndex++
+	// If the next row is in the same bundle, we can take a fast path of only
+	// updating the per-row suffix.
+	if it.offsetIndex < it.nextBundleOffsetIndex {
+		rowSuffixStart := b.rawBytes.offsets.At(it.offsetIndex)
+		rowSuffixEnd := b.rawBytes.offsets.At(it.offsetIndex + 1)
+		if rowSuffixStart == rowSuffixEnd {
+			// The start and end offsets are equal, indicating that the key is a
+			// duplicate. Since it's identical to the previous key, there's
+			// nothing left to do, we can leave buf as-is.
+			return
+		}
+		// Grow the buffer if necessary.
+		it.len = b.sharedPrefixLen + int(it.bundlePrefixLen) + int(rowSuffixEnd-rowSuffixStart)
+		if it.len > it.cap {
+			it.cap = it.len << 1
+			prevPtr := it.ptr
+			it.ptr = mallocgc(uintptr(it.cap), nil, false)
+			memmove(it.ptr, prevPtr, uintptr(b.sharedPrefixLen)+uintptr(it.bundlePrefixLen))
+		}
+		// Copy in the per-row suffix.
+		memmove(
+			unsafe.Pointer(uintptr(it.ptr)+uintptr(b.sharedPrefixLen)+uintptr(it.bundlePrefixLen)),
+			unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart)),
+			uintptr(rowSuffixEnd-rowSuffixStart))
+		return
+	}
+
+	// We've reached the end of the bundle. We need to update the bundle prefix.
+	// The offsetIndex is currently pointing to the start of the new bundle
+	// prefix. Increment it to point at the start of the new row suffix.
+	it.offsetIndex++
+	rowSuffixStart := b.rawBytes.offsets.At(it.offsetIndex)
+	rowSuffixEnd := b.rawBytes.offsets.At(it.offsetIndex + 1)
+
+	// Read the offsets of the new bundle prefix and update the index of the
+	// next bundle.
+	bundlePrefixStart := b.rawBytes.offsets.At(it.nextBundleOffsetIndex)
+	it.bundlePrefixLen = rowSuffixStart - bundlePrefixStart
+	it.nextBundleOffsetIndex = it.offsetIndex + (1 << b.bundleShift)
+
+	// Grow the buffer if necessary.
+	it.len = b.sharedPrefixLen + int(it.bundlePrefixLen) + int(rowSuffixEnd-rowSuffixStart)
+	if it.len > it.cap {
+		it.cap = it.len << 1
+		it.ptr = mallocgc(uintptr(it.cap), nil, false)
+		memmove(it.ptr, b.rawBytes.data, uintptr(b.sharedPrefixLen))
+	}
+	// Copy in the new bundle suffix.
+	memmove(
+		unsafe.Pointer(uintptr(it.ptr)+uintptr(b.sharedPrefixLen)),
+		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundlePrefixStart)),
+		uintptr(it.bundlePrefixLen))
+	// Copy in the per-row suffix.
+	memmove(
+		unsafe.Pointer(uintptr(it.ptr)+uintptr(b.sharedPrefixLen)+uintptr(it.bundlePrefixLen)),
+		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart)),
+		uintptr(rowSuffixEnd-rowSuffixStart))
+}
+
 // SharedPrefix return a []byte of the shared prefix that was extracted from
 // all of the values in the Bytes vector. The returned slice should not be
 // mutated.
-func (b PrefixBytes) SharedPrefix() []byte {
+func (b *PrefixBytes) SharedPrefix() []byte {
 	// The very first slice is the prefix for the entire column.
 	return b.rawBytes.slice(0, b.rawBytes.offsets.At(0))
 }
@@ -249,7 +364,7 @@ func (b PrefixBytes) SharedPrefix() []byte {
 // RowBundlePrefix takes a row index and returns a []byte of the prefix shared
 // among all the keys in the row's bundle, but without the block-level shared
 // prefix for the column. The returned slice should not be mutated.
-func (b PrefixBytes) RowBundlePrefix(row int) []byte {
+func (b *PrefixBytes) RowBundlePrefix(row int) []byte {
 	i := b.bundleOffsetIndexForRow(row)
 	return b.rawBytes.slice(b.rawBytes.offsets.At(i), b.rawBytes.offsets.At(i+1))
 }
@@ -257,7 +372,7 @@ func (b PrefixBytes) RowBundlePrefix(row int) []byte {
 // BundlePrefix returns the prefix of the i-th bundle in the column. The
 // provided i must be in the range [0, BundleCount()). The returned slice should
 // not be mutated.
-func (b PrefixBytes) BundlePrefix(i int) []byte {
+func (b *PrefixBytes) BundlePrefix(i int) []byte {
 	j := b.offsetIndexByBundleIndex(i)
 	return b.rawBytes.slice(b.rawBytes.offsets.At(j), b.rawBytes.offsets.At(j+1))
 }
@@ -267,43 +382,49 @@ func (b PrefixBytes) BundlePrefix(i int) []byte {
 // RowSuffix().
 //
 // The returned slice should not be mutated.
-func (b PrefixBytes) RowSuffix(row int) []byte {
-	i := b.rowSuffixIndex(row)
+func (b *PrefixBytes) RowSuffix(row int) []byte {
+	return b.rawBytes.slice(b.rowSuffixOffsets(row, b.rowSuffixIndex(row)))
+}
+
+// rowSuffixOffsets finds the start and end offsets of the row's suffix slice,
+// accounting for duplicate keys. It takes the index of the row, and the value
+// of rowSuffixIndex(row).
+func (b *PrefixBytes) rowSuffixOffsets(row, i int) (low uint32, high uint32) {
 	// Retrieve the low and high offsets indicating the start and end of the
 	// row's suffix slice.
-	lowOff := b.rawBytes.offsets.At(i)
-	highOff := b.rawBytes.offsets.At(i + 1)
+	low = b.rawBytes.offsets.At(i)
+	high = b.rawBytes.offsets.At(i + 1)
 	// If there's a non-empty slice for the row, this row is different than its
 	// predecessor.
-	if lowOff != highOff {
-		return b.rawBytes.slice(lowOff, highOff)
+	if low != high {
+		return low, high
 	}
 	// Otherwise, an empty slice indicates a duplicate key. We need to find the
 	// first non-empty predecessor within the bundle, or if all the rows are
-	// empty, return nil.
+	// empty, return arbitrary equal low and high.
 	//
 	// Compute the index of the first row in the bundle so we know when to stop.
 	firstIndex := 1 + b.bundleOffsetIndexForRow(row)
 	for i > firstIndex {
 		// Step back a row, and check if the slice is non-empty.
 		i--
-		highOff = lowOff
-		lowOff = b.rawBytes.offsets.At(i)
-		if lowOff != highOff {
-			return b.rawBytes.slice(lowOff, highOff)
+		high = low
+		low = b.rawBytes.offsets.At(i)
+		if low != high {
+			return low, high
 		}
 	}
 	// All the rows in the bundle are empty.
-	return nil
+	return low, high
 }
 
 // Rows returns the count of rows whose keys are encoded within the PrefixBytes.
-func (b PrefixBytes) Rows() int {
+func (b *PrefixBytes) Rows() int {
 	return b.rows
 }
 
 // BundleCount returns the count of bundles within the PrefixBytes.
-func (b PrefixBytes) BundleCount() int {
+func (b *PrefixBytes) BundleCount() int {
 	return b.bundleCount(b.rows)
 }
 
@@ -311,7 +432,7 @@ func (b PrefixBytes) BundleCount() int {
 // equal to k, returning the index of the key and whether an equal key was
 // found. If multiple keys are equal, the index of the first such key is
 // returned. If all keys are < k, Search returns Rows() for the row index.
-func (b PrefixBytes) Search(k []byte) (rowIndex int, isEqual bool) {
+func (b *PrefixBytes) Search(k []byte) (rowIndex int, isEqual bool) {
 	// First compare to the block-level shared prefix.
 	n := min(len(k), b.sharedPrefixLen)
 	c := bytes.Compare(k[:n], unsafe.Slice((*byte)(b.rawBytes.data), b.sharedPrefixLen))

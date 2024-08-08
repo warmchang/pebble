@@ -11,7 +11,6 @@ import (
 	"math"
 	"runtime"
 	"slices"
-	"sort"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -132,9 +131,10 @@ type RawWriter struct {
 	indexBlockOptions flushDecisionOptions
 	// The following fields are copied from Options.
 	compare              Compare
+	suffixCmp            CompareSuffixes
 	split                Split
 	formatKey            base.FormatKey
-	compression          Compression
+	compression          block.Compression
 	separator            Separator
 	successor            Successor
 	tableFormat          TableFormat
@@ -183,9 +183,8 @@ type RawWriter struct {
 	// in indexPartitions. These live until the index finishes.
 	indexSepAlloc bytealloc.A
 
-	rangeKeyEncoder   rangekey.Encoder
-	rangeKeysBySuffix keyspan.KeysBySuffix
-	rangeKeySpan      keyspan.Span
+	rangeKeyEncoder rangekey.Encoder
+	rangeKeySpan    keyspan.Span
 	// dataBlockBuf consists of the state which is currently owned by and used by
 	// the Writer client goroutine. This state can be handed off to other goroutines.
 	dataBlockBuf *dataBlockBuf
@@ -575,13 +574,12 @@ type dataBlockBuf struct {
 	// next byte slice to be compressed. The uncompressed byte slice will be backed by the
 	// dataBlock.buf.
 	uncompressed []byte
-	// compressed is a reference to a byte slice which is owned by the dataBlockBuf. It is the
-	// compressed byte slice which must be written to disk. The compressed byte slice may be
-	// backed by the dataBlock.buf, or the dataBlockBuf.compressedBuf, depending on whether
-	// we use the result of the compression.
-	compressed []byte
-	// trailer is the block trailer encoding the compression type and checksum.
-	trailer block.Trailer
+
+	// physical holds the (possibly) compressed block and its trailer. The
+	// underlying block data's byte slice is owned by the dataBlockBuf. It  may
+	// be backed by the dataBlock.buf, or the dataBlockBuf.compressedBuf,
+	// depending on whether we use the result of the compression.
+	physical block.PhysicalBlock
 
 	// We're making calls to BlockPropertyCollectors from the Writer client goroutine. We need to
 	// pass the encoded block properties over to the write queue. To prevent copies, and allocations,
@@ -600,7 +598,7 @@ func (d *dataBlockBuf) clear() {
 	d.dataBlock.Reset()
 
 	d.uncompressed = nil
-	d.compressed = nil
+	d.physical = block.PhysicalBlock{}
 	d.dataBlockProps = nil
 	d.sepScratch = d.sepScratch[:0]
 }
@@ -622,8 +620,8 @@ func (d *dataBlockBuf) finish() {
 	d.uncompressed = d.dataBlock.Finish()
 }
 
-func (d *dataBlockBuf) compressAndChecksum(c Compression) {
-	d.compressed, d.trailer = compressAndChecksum(d.uncompressed, c, &d.blockBuf)
+func (d *dataBlockBuf) compressAndChecksum(c block.Compression) {
+	d.physical = block.CompressAndChecksum(&d.compressedBuf, d.uncompressed, c, &d.checksummer)
 }
 
 func (d *dataBlockBuf) shouldFlush(
@@ -752,7 +750,7 @@ func (w *RawWriter) makeAddPointDecisionV3(
 		cmpUser = cmpPrefix
 		if cmpPrefix == 0 {
 			// Need to compare suffixes to compute cmpUser.
-			cmpUser = w.compare(prevPointUserKey[prevPointKeyInfo.prefixLen:],
+			cmpUser = w.suffixCmp(prevPointUserKey[prevPointKeyInfo.prefixLen:],
 				key.UserKey[w.lastPointKeyInfo.prefixLen:])
 		}
 	} else {
@@ -1026,18 +1024,15 @@ func (w *RawWriter) encodeFragmentedRangeKeySpan(span keyspan.Span) {
 	// NB: The span should only contain range keys and be internally consistent
 	// (eg, no duplicate suffixes, no additional keys after a RANGEKEYDEL).
 	//
-	// We use w.rangeKeysBySuffix and w.rangeKeySpan to avoid allocations.
+	// We use w.rangeKeySpan to avoid allocations.
 
 	// Sort the keys by suffix. Iteration doesn't *currently* depend on it, but
 	// we may want to in the future.
-	w.rangeKeysBySuffix.Cmp = w.compare
-	w.rangeKeysBySuffix.Keys = span.Keys
-	sort.Sort(&w.rangeKeysBySuffix)
-
 	w.rangeKeySpan = span
-	w.rangeKeySpan.Keys = w.rangeKeysBySuffix.Keys
+	keyspan.SortKeysBySuffix(w.suffixCmp, w.rangeKeySpan.Keys)
+
 	if w.err == nil {
-		w.err = w.EncodeSpan(&w.rangeKeySpan)
+		w.err = w.EncodeSpan(w.rangeKeySpan)
 	}
 }
 
@@ -1149,7 +1144,7 @@ func (w *RawWriter) flush(key InternalKey) error {
 	w.dataBlockBuf.compressAndChecksum(w.compression)
 	// Since dataBlockEstimates.addInflightDataBlock was never called, the
 	// inflightSize is set to 0.
-	w.coordination.sizeEstimate.dataBlockCompressed(len(w.dataBlockBuf.compressed), 0)
+	w.coordination.sizeEstimate.dataBlockCompressed(w.dataBlockBuf.physical.LengthWithoutTrailer(), 0)
 
 	// Determine if the index block should be flushed. Since we're accessing the
 	// dataBlockBuf.dataBlock.curKey here, we have to make sure that once we start
@@ -1583,27 +1578,6 @@ func (w *RawWriter) writeTwoLevelIndex() (block.Handle, error) {
 	return w.layout.WriteIndexBlock(w.topLevelIndexBlock.Finish())
 }
 
-func compressAndChecksum(
-	b []byte, compression Compression, blockBuf *blockBuf,
-) (compressed []byte, trailer block.Trailer) {
-	// Compress the buffer, discarding the result if the improvement isn't at
-	// least 12.5%.
-	blockType, compressed := compressBlock(compression, b, blockBuf.compressedBuf)
-	if blockType != noCompressionBlockType && cap(compressed) > cap(blockBuf.compressedBuf) {
-		blockBuf.compressedBuf = compressed[:cap(compressed)]
-	}
-	if len(compressed) < len(b)-len(b)/8 {
-		b = compressed
-	} else {
-		blockType = noCompressionBlockType
-	}
-
-	// Calculate the checksum.
-	trailer[0] = byte(blockType)
-	checksum := blockBuf.checksummer.Checksum(b, trailer[:1])
-	return b, block.MakeTrailer(byte(blockType), checksum)
-}
-
 // assertFormatCompatibility ensures that the features present on the table are
 // compatible with the table format version.
 func (w *RawWriter) assertFormatCompatibility() error {
@@ -1660,7 +1634,7 @@ func (w *RawWriter) UnsafeLastPointUserKey() []byte {
 //
 // This is a low-level API that bypasses the fragmenter. The spans passed to
 // this function must be fragmented and ordered.
-func (w *RawWriter) EncodeSpan(span *keyspan.Span) error {
+func (w *RawWriter) EncodeSpan(span keyspan.Span) error {
 	if span.Empty() {
 		return nil
 	}
@@ -1668,7 +1642,7 @@ func (w *RawWriter) EncodeSpan(span *keyspan.Span) error {
 		return rangedel.Encode(span, w.Add)
 	}
 	for i := range w.blockPropCollectors {
-		if err := w.blockPropCollectors[i].AddRangeKeys(*span); err != nil {
+		if err := w.blockPropCollectors[i].AddRangeKeys(span); err != nil {
 			return err
 		}
 	}
@@ -1912,6 +1886,7 @@ func NewRawWriter(writable objstorage.Writable, o WriterOptions) *RawWriter {
 			sizeClassAwareThreshold: (o.IndexBlockSize*o.SizeClassAwareThreshold + 99) / 100,
 		},
 		compare:               o.Comparer.Compare,
+		suffixCmp:             o.Comparer.CompareSuffixes,
 		split:                 o.Comparer.Split,
 		formatKey:             o.Comparer.FormatKey,
 		compression:           o.Compression,
@@ -1947,6 +1922,13 @@ func NewRawWriter(writable objstorage.Writable, o WriterOptions) *RawWriter {
 	}
 
 	w.coordination.init(o.Parallelism, w)
+	defer func() {
+		if r := recover(); r != nil {
+			// Don't leak a goroutine if we hit a panic.
+			_ = w.coordination.writeQueue.finish()
+			panic(r)
+		}
+	}()
 
 	if writable == nil {
 		w.err = errors.New("pebble: nil writable")

@@ -6,9 +6,9 @@ package keyspan // import "github.com/cockroachdb/pebble/internal/keyspan"
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"unicode"
 
@@ -26,6 +26,13 @@ import (
 // Currently the only supported key kinds are:
 //
 //	RANGEDEL, RANGEKEYSET, RANGEKEYUNSET, RANGEKEYDEL.
+//
+// Spans either have only RANGEDEL keys (range del spans), or a mix of
+// RANGEKESET/RANGEKEYUNSET/RANGEKEYDEL keys (range key spans).
+//
+// Note that at the user level, range key span start and end keys never have
+// suffixes. Internally, range key spans get fragmented along sstable
+// boundaries; however, this is transparent to the user.
 type Span struct {
 	// Start and End encode the user key range of all the contained items, with
 	// an inclusive start key and exclusive end key. Both Start and End must be
@@ -93,9 +100,9 @@ func (k Key) Kind() base.InternalKeyKind {
 // Equal returns true if this Key is equal to the given key. Two keys are said
 // to be equal if the two Keys have equal trailers, suffix and value. Suffix
 // comparison uses the provided base.Compare func. Value comparison is bytewise.
-func (k Key) Equal(equal base.Equal, b Key) bool {
+func (k Key) Equal(suffixCmp base.CompareSuffixes, b Key) bool {
 	return k.Trailer == b.Trailer &&
-		equal(k.Suffix, b.Suffix) &&
+		suffixCmp(k.Suffix, b.Suffix) == 0 &&
 		bytes.Equal(k.Value, b.Value)
 }
 
@@ -455,24 +462,38 @@ func (s prettySpan) Format(fs fmt.State, c rune) {
 	fmt.Fprintf(fs, "}")
 }
 
-// SortKeysByTrailer sorts a keys slice by trailer.
-func SortKeysByTrailer(keys *[]Key) {
-	// NB: keys is a pointer to a slice instead of a slice to avoid `sorted`
-	// escaping to the heap.
-	sorted := (*keysBySeqNumKind)(keys)
-	sort.Sort(sorted)
+// SortKeysByTrailer sorts a Keys slice by trailer.
+func SortKeysByTrailer(keys []Key) {
+	slices.SortFunc(keys, func(a, b Key) int {
+		// Trailer are ordered in decreasing number order.
+		return -cmp.Compare(a.Trailer, b.Trailer)
+	})
 }
 
-// KeysBySuffix implements sort.Interface, sorting its member Keys slice to by
-// Suffix in the order dictated by Cmp.
-type KeysBySuffix struct {
-	Cmp  base.Compare
-	Keys []Key
+// SortKeysBySuffix sorts a Keys slice by suffix.
+func SortKeysBySuffix(suffixCmp base.CompareSuffixes, keys []Key) {
+	slices.SortFunc(keys, func(a, b Key) int {
+		return suffixCmp(a.Suffix, b.Suffix)
+	})
 }
 
-func (s *KeysBySuffix) Len() int           { return len(s.Keys) }
-func (s *KeysBySuffix) Less(i, j int) bool { return s.Cmp(s.Keys[i].Suffix, s.Keys[j].Suffix) < 0 }
-func (s *KeysBySuffix) Swap(i, j int)      { s.Keys[i], s.Keys[j] = s.Keys[j], s.Keys[i] }
+// SortSpansByStartKey sorts the spans by start key.
+//
+// This is the ordering required by the Fragmenter. Usually spans are naturally
+// sorted by their start key, but that isn't true for range deletion tombstones
+// in the legacy range-del-v1 block format.
+func SortSpansByStartKey(cmp base.Compare, spans []Span) {
+	slices.SortFunc(spans, func(a, b Span) int {
+		return cmp(a.Start, b.Start)
+	})
+}
+
+// SortSpansByEndKey sorts the spans by the end key.
+func SortSpansByEndKey(cmp base.Compare, spans []Span) {
+	slices.SortFunc(spans, func(a, b Span) int {
+		return cmp(a.End, b.End)
+	})
+}
 
 // ParseSpan parses the string representation of a Span. It's intended for
 // tests. ParseSpan panics if passed a malformed span representation.

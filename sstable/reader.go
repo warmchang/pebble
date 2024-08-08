@@ -100,9 +100,10 @@ type Reader struct {
 	filterMetricsTracker *FilterMetricsTracker
 	logger               base.LoggerAndTracer
 
+	Comparer  *base.Comparer
 	Compare   Compare
+	SuffixCmp CompareSuffixes
 	Equal     Equal
-	FormatKey base.FormatKey
 	Split     Split
 
 	tableFilter *tableFilterReader
@@ -296,7 +297,7 @@ func (r *Reader) NewRawRangeDelIter(
 		return nil, err
 	}
 	transforms.ElideSameSeqNum = true
-	i, err := rowblk.NewFragmentIter(r.cacheOpts.FileNum, r.Compare, r.Split, h, transforms)
+	i, err := rowblk.NewFragmentIter(r.cacheOpts.FileNum, r.Compare, r.Comparer.CompareSuffixes, r.Split, h, transforms)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +317,7 @@ func (r *Reader) NewRawRangeKeyIter(
 	if err != nil {
 		return nil, err
 	}
-	i, err := rowblk.NewFragmentIter(r.cacheOpts.FileNum, r.Compare, r.Split, h, transforms)
+	i, err := rowblk.NewFragmentIter(r.cacheOpts.FileNum, r.Compare, r.Comparer.CompareSuffixes, r.Split, h, transforms)
 	if err != nil {
 		return nil, err
 	}
@@ -461,22 +462,22 @@ func (r *Reader) readBlock(
 		return block.BufferHandle{}, err
 	}
 
-	typ := blockType(compressed.Get()[bh.Length])
+	typ := block.CompressionIndicator(compressed.Get()[bh.Length])
 	compressed.Truncate(int(bh.Length))
 
 	var decompressed block.Value
-	if typ == noCompressionBlockType {
+	if typ == block.NoCompressionIndicator {
 		decompressed = compressed
 	} else {
 		// Decode the length of the decompressed value.
-		decodedLen, prefixLen, err := decompressedLen(typ, compressed.Get())
+		decodedLen, prefixLen, err := block.DecompressedLen(typ, compressed.Get())
 		if err != nil {
 			compressed.Release()
 			return block.BufferHandle{}, err
 		}
 
 		decompressed = block.Alloc(decodedLen, bufferPool)
-		if err := decompressInto(typ, compressed.Get()[prefixLen:], decompressed.Get()); err != nil {
+		if err := block.DecompressInto(typ, compressed.Get()[prefixLen:], decompressed.Get()); err != nil {
 			compressed.Release()
 			return block.BufferHandle{}, err
 		}
@@ -978,14 +979,16 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 	r.footerBH = footer.footerBH
 
 	if r.Properties.ComparerName == "" || o.Comparer.Name == r.Properties.ComparerName {
+		r.Comparer = o.Comparer
 		r.Compare = o.Comparer.Compare
+		r.SuffixCmp = o.Comparer.CompareSuffixes
 		r.Equal = o.Comparer.Equal
-		r.FormatKey = o.Comparer.FormatKey
 		r.Split = o.Comparer.Split
 	} else if comparer, ok := o.Comparers[r.Properties.ComparerName]; ok {
+		r.Comparer = o.Comparer
 		r.Compare = comparer.Compare
+		r.SuffixCmp = comparer.CompareSuffixes
 		r.Equal = comparer.Equal
-		r.FormatKey = comparer.FormatKey
 		r.Split = comparer.Split
 	} else {
 		r.err = errors.Errorf("pebble/table: %d: unknown comparer %s",

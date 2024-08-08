@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 // In-memory statistics about tables help inform compaction picking, but may
@@ -324,7 +325,7 @@ func (d *DB) loadTableStats(
 			// picking.
 			stats.NumRangeKeySets = props.NumRangeKeySets
 			stats.ValueBlocksSize = props.ValueBlocksSize
-			stats.CompressionType = sstable.CompressionFromString(props.CompressionName)
+			stats.CompressionType = block.CompressionFromString(props.CompressionName)
 			return
 		})
 	if err != nil {
@@ -679,7 +680,7 @@ func maybeSetStatsFromProperties(meta physicalMeta, props *sstable.Properties) b
 	meta.Stats.PointDeletionsBytesEstimate = pointEstimate
 	meta.Stats.RangeDeletionsBytesEstimate = 0
 	meta.Stats.ValueBlocksSize = props.ValueBlocksSize
-	meta.Stats.CompressionType = sstable.CompressionFromString(props.CompressionName)
+	meta.Stats.CompressionType = block.CompressionFromString(props.CompressionName)
 	meta.StatsMarkValid()
 	return true
 }
@@ -849,7 +850,7 @@ func newCombinedDeletionKeyspanIter(
 ) (keyspan.FragmentIterator, error) {
 	// The range del iter and range key iter are each wrapped in their own
 	// defragmenting iter. For each iter, abutting spans can always be merged.
-	var equal = keyspan.DefragmentMethodFunc(func(_ base.Equal, a, b *keyspan.Span) bool { return true })
+	var equal = keyspan.DefragmentMethodFunc(func(_ base.CompareSuffixes, a, b *keyspan.Span) bool { return true })
 	// Reduce keys by maintaining a slice of at most length two, corresponding to
 	// the largest and smallest keys in the defragmented span. This maintains the
 	// contract that the emitted slice is sorted by (SeqNum, Kind) descending.
@@ -878,7 +879,7 @@ func newCombinedDeletionKeyspanIter(
 				smallest = last
 			}
 		}
-		if largest.Equal(comparer.Equal, smallest) {
+		if largest.Equal(comparer.CompareSuffixes, smallest) {
 			current = append(current[:0], largest)
 		} else {
 			current = append(current[:0], largest, smallest)
@@ -890,7 +891,7 @@ func newCombinedDeletionKeyspanIter(
 	// merging iter to join the keyspaces into a single keyspace. The separate
 	// iters are only added if the particular key kind is present.
 	mIter := &keyspanimpl.MergingIter{}
-	var transform = keyspan.TransformerFunc(func(cmp base.Compare, in keyspan.Span, out *keyspan.Span) error {
+	var transform = keyspan.TransformerFunc(func(_ base.CompareSuffixes, in keyspan.Span, out *keyspan.Span) error {
 		if in.KeysOrder != keyspan.ByTrailerDesc {
 			panic("pebble: combined deletion iter encountered keys in non-trailer descending order")
 		}
@@ -902,7 +903,7 @@ func newCombinedDeletionKeyspanIter(
 		// sstable into the same keyspanimpl.MergingIter. The MergingIter will
 		// return the keys in the order that the child iterators were provided.
 		// Sort the keys to ensure they're sorted by trailer descending.
-		keyspan.SortKeysByTrailer(&out.Keys)
+		keyspan.SortKeysByTrailer(out.Keys)
 		return nil
 	})
 	mIter.Init(comparer, transform, new(keyspanimpl.MergingBuffers))
@@ -1042,11 +1043,11 @@ func (a compressionTypeAggregator) Accumulate(
 	f *fileMetadata, dst *compressionTypes,
 ) (v *compressionTypes, cacheOK bool) {
 	switch f.Stats.CompressionType {
-	case sstable.SnappyCompression:
+	case SnappyCompression:
 		dst.snappy++
-	case sstable.ZstdCompression:
+	case ZstdCompression:
 		dst.zstd++
-	case sstable.NoCompression:
+	case NoCompression:
 		dst.none++
 	default:
 		dst.unknown++

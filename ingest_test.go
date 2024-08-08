@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/kr/pretty"
@@ -103,8 +104,7 @@ func TestIngestLoad(t *testing.T) {
 			for _, data := range strings.Split(td.Input, "\n") {
 				if strings.HasPrefix(data, "rangekey: ") {
 					data = strings.TrimPrefix(data, "rangekey: ")
-					s := keyspan.ParseSpan(data)
-					err := w.EncodeSpan(&s)
+					err := w.EncodeSpan(keyspan.ParseSpan(data))
 					if err != nil {
 						return err.Error()
 					}
@@ -173,7 +173,7 @@ func TestIngestLoadRand(t *testing.T) {
 			},
 			path: paths[i],
 		}
-		expected[i].fileMetadata.Stats.CompressionType = sstable.SnappyCompression
+		expected[i].fileMetadata.Stats.CompressionType = block.SnappyCompression
 		expected[i].StatsMarkValid()
 
 		func() {
@@ -1104,7 +1104,7 @@ func testIngestSharedImpl(
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
-					require.NoError(t, w.EncodeSpan(&keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start: start,
 						End:   end,
 						Keys:  []keyspan.Key{{Trailer: base.MakeTrailer(0, base.InternalKeyKindRangeDelete)}},
@@ -1112,13 +1112,12 @@ func testIngestSharedImpl(
 					return nil
 				},
 				func(start, end []byte, keys []keyspan.Key) error {
-					s := keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start:     start,
 						End:       end,
 						Keys:      keys,
 						KeysOrder: 0,
-					}
-					require.NoError(t, w.EncodeSpan(&s))
+					}))
 					return nil
 				},
 				func(sst *SharedSSTMeta) error {
@@ -1604,7 +1603,7 @@ func TestConcurrentExcise(t *testing.T) {
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
-					require.NoError(t, w.EncodeSpan(&keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start: start,
 						End:   end,
 						Keys:  []keyspan.Key{{Trailer: base.MakeTrailer(0, base.InternalKeyKindRangeDelete)}},
@@ -1612,13 +1611,12 @@ func TestConcurrentExcise(t *testing.T) {
 					return nil
 				},
 				func(start, end []byte, keys []keyspan.Key) error {
-					s := keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start:     start,
 						End:       end,
 						Keys:      keys,
 						KeysOrder: 0,
-					}
-					require.NoError(t, w.EncodeSpan(&s))
+					}))
 					return nil
 				},
 				func(sst *SharedSSTMeta) error {
@@ -2041,7 +2039,7 @@ func TestIngestExternal(t *testing.T) {
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
-					require.NoError(t, w.EncodeSpan(&keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start: start,
 						End:   end,
 						Keys:  []keyspan.Key{{Trailer: base.MakeTrailer(0, base.InternalKeyKindRangeDelete)}},
@@ -2049,13 +2047,12 @@ func TestIngestExternal(t *testing.T) {
 					return nil
 				},
 				func(start, end []byte, keys []keyspan.Key) error {
-					s := keyspan.Span{
+					require.NoError(t, w.EncodeSpan(keyspan.Span{
 						Start:     start,
 						End:       end,
 						Keys:      keys,
 						KeysOrder: 0,
-					}
-					require.NoError(t, w.EncodeSpan(&s))
+					}))
 					return nil
 				},
 				nil,
@@ -3236,8 +3233,7 @@ func TestIngest_UpdateSequenceNumber(t *testing.T) {
 		for _, data := range strings.Split(input, "\n") {
 			if strings.HasPrefix(data, "rangekey: ") {
 				data = strings.TrimPrefix(data, "rangekey: ")
-				s := keyspan.ParseSpan(data)
-				err := w.EncodeSpan(&s)
+				err := w.EncodeSpan(keyspan.ParseSpan(data))
 				if err != nil {
 					return nil, err
 				}

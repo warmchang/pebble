@@ -7,13 +7,16 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/stretchr/testify/require"
 )
 
 func TestRewriteSuffixProps(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	from, to := []byte("_212"), []byte("_646")
 	for format := TableFormatPebblev2; format <= TableFormatMax; format++ {
 		t.Run(format.String(), func(t *testing.T) {
@@ -187,7 +190,7 @@ func BenchmarkRewriteSST(b *testing.B) {
 	}
 
 	sizes := []int{100, 10000, 1e6}
-	compressions := []Compression{NoCompression, SnappyCompression}
+	compressions := []block.Compression{block.NoCompression, block.SnappyCompression}
 
 	files := make([][]*Reader, len(compressions))
 

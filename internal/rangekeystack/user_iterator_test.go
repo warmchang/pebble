@@ -25,7 +25,6 @@ import (
 )
 
 func TestIter(t *testing.T) {
-	eq := testkeys.Comparer.Equal
 	cmp := testkeys.Comparer.Compare
 	var iter keyspanimpl.MergingIter
 	var buf bytes.Buffer
@@ -46,16 +45,12 @@ func TestIter(t *testing.T) {
 			for _, line := range lines {
 				spans = append(spans, keyspan.ParseSpan(line))
 			}
-			transform := keyspan.TransformerFunc(func(cmp base.Compare, s keyspan.Span, dst *keyspan.Span) error {
-				keysBySuffix := keyspan.KeysBySuffix{
-					Cmp:  cmp,
-					Keys: dst.Keys[:0],
-				}
-				rangekey.CoalesceIntoKeysBySuffix(eq, &keysBySuffix, visibleSeqNum, s.Keys)
-				// Update the span with the (potentially reduced) keys slice.  coalesce left
-				// the keys in *dst sorted by suffix. Re-sort them by trailer.
-				dst.Keys = keysBySuffix.Keys
-				keyspan.SortKeysByTrailer(&dst.Keys)
+			transform := keyspan.TransformerFunc(func(suffixCmp base.CompareSuffixes, s keyspan.Span, dst *keyspan.Span) error {
+				dst.Keys = rangekey.CoalesceInto(suffixCmp, dst.Keys[:0], visibleSeqNum, s.Keys)
+				// Update the span with the (potentially reduced) keys slice.
+				// CoalesceInto() left the keys sorted by suffix. Re-sort them by
+				// trailer.
+				keyspan.SortKeysByTrailer(dst.Keys)
 				dst.Start = s.Start
 				dst.End = s.End
 				return nil
@@ -263,7 +258,7 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 }
 
 func fragment(cmp base.Compare, formatKey base.FormatKey, spans []keyspan.Span) []keyspan.Span {
-	keyspan.Sort(cmp, spans)
+	keyspan.SortSpansByStartKey(cmp, spans)
 	var fragments []keyspan.Span
 	f := keyspan.Fragmenter{
 		Cmp:    cmp,
@@ -380,7 +375,7 @@ func BenchmarkTransform(b *testing.B) {
 					b.ResetTimer()
 
 					for i := 0; i < b.N; i++ {
-						err := ui.Transform(testkeys.Comparer.Compare, keyspan.Span{Keys: keys}, &dst)
+						err := ui.Transform(testkeys.Comparer.CompareSuffixes, keyspan.Span{Keys: keys}, &dst)
 						if err != nil {
 							b.Fatal(err)
 						}

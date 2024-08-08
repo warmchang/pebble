@@ -2,7 +2,7 @@
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
-package sstable
+package block
 
 import (
 	"encoding/binary"
@@ -10,11 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCompressionRoundtrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	seed := time.Now().UnixNano()
 	t.Logf("seed %d", seed)
 	rng := rand.New(rand.NewSource(seed))
@@ -24,11 +27,11 @@ func TestCompressionRoundtrip(t *testing.T) {
 			payload := make([]byte, rng.Intn(10<<10 /* 10 KiB */))
 			rng.Read(payload)
 			// Create a randomly-sized buffer to house the compressed output. If it's
-			// not sufficient, compressBlock should allocate one that is.
+			// not sufficient, Compress should allocate one that is.
 			compressedBuf := make([]byte, rng.Intn(1<<10 /* 1 KiB */))
 
-			btyp, compressed := compressBlock(compression, payload, compressedBuf)
-			v, err := decompressBlock(btyp, compressed)
+			btyp, compressed := compress(compression, payload, compressedBuf)
+			v, err := decompress(btyp, compressed)
 			require.NoError(t, err)
 			got := payload
 			if v != nil {
@@ -43,6 +46,7 @@ func TestCompressionRoundtrip(t *testing.T) {
 // TestDecompressionError tests that a decompressing a value that does not
 // decompress returns an error.
 func TestDecompressionError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	rng := rand.New(rand.NewSource(1 /* fixed seed */))
 
 	// Create a buffer to represent a faux zstd compressed block. It's prefixed
@@ -53,8 +57,31 @@ func TestDecompressionError(t *testing.T) {
 	fauxCompressed = fauxCompressed[:n+compressedPayloadLen]
 	rng.Read(fauxCompressed[n:])
 
-	v, err := decompressBlock(zstdCompressionBlockType, fauxCompressed)
+	v, err := decompress(ZstdCompressionIndicator, fauxCompressed)
 	t.Log(err)
 	require.Error(t, err)
 	require.Nil(t, v)
+}
+
+// decompress decompresses an sstable block into memory manually allocated with
+// `cache.Alloc`.  NB: If Decompress returns (nil, nil), no decompression was
+// necessary and the caller may use `b` directly.
+func decompress(algo CompressionIndicator, b []byte) (*cache.Value, error) {
+	if algo == NoCompressionIndicator {
+		return nil, nil
+	}
+	// first obtain the decoded length.
+	decodedLen, prefixLen, err := DecompressedLen(algo, b)
+	if err != nil {
+		return nil, err
+	}
+	b = b[prefixLen:]
+	// Allocate sufficient space from the cache.
+	decoded := cache.Alloc(decodedLen)
+	decodedBuf := decoded.Buf()
+	if err := DecompressInto(algo, b, decodedBuf); err != nil {
+		cache.Free(decoded)
+		return nil, err
+	}
+	return decoded, nil
 }

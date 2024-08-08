@@ -165,9 +165,9 @@ func (l *Layout) Describe(
 			trailer := make([]byte, block.TrailerLen)
 			offset := int64(b.Offset + b.Length)
 			_ = r.readable.ReadAt(ctx, trailer, offset)
-			bt := blockType(trailer[0])
+			algo := block.CompressionIndicator(trailer[0])
 			checksum := binary.LittleEndian.Uint32(trailer[1:])
-			fmt.Fprintf(w, "%10d    [trailer compression=%s checksum=0x%04x]\n", offset, bt, checksum)
+			fmt.Fprintf(w, "%10d    [trailer compression=%s checksum=0x%04x]\n", offset, algo, checksum)
 		}
 
 		var lastKey InternalKey
@@ -298,7 +298,7 @@ type layoutWriter struct {
 
 	// options copied from WriterOptions
 	tableFormat  TableFormat
-	compression  Compression
+	compression  block.Compression
 	checksumType block.ChecksumType
 
 	// offset tracks the current write offset within the writable.
@@ -350,20 +350,8 @@ func (w *layoutWriter) WriteDataBlock(b []byte, buf *blockBuf) (block.Handle, er
 
 // WritePrecompressedDataBlock writes a pre-compressed data block and its
 // pre-computed trailer to the writer, returning it's block handle.
-func (w *layoutWriter) WritePrecompressedDataBlock(
-	blk []byte, trailer block.Trailer,
-) (block.Handle, error) {
-	// Write the bytes to the file.
-	if err := w.writable.Write(blk); err != nil {
-		return block.Handle{}, err
-	}
-	bh := block.Handle{Offset: w.offset, Length: uint64(len(blk))}
-	w.offset += uint64(len(blk))
-	if err := w.writable.Write(trailer[:]); err != nil {
-		return block.Handle{}, err
-	}
-	w.offset += block.TrailerLen
-	return bh, nil
+func (w *layoutWriter) WritePrecompressedDataBlock(blk block.PhysicalBlock) (block.Handle, error) {
+	return w.writePrecompressedBlock(blk)
 }
 
 // WriteIndexBlock constructs a trailer for the provided index (first or
@@ -412,7 +400,7 @@ func (w *layoutWriter) WriteRangeDeletionBlock(b []byte) (block.Handle, error) {
 }
 
 func (w *layoutWriter) writeNamedBlock(b []byte, name string) (bh block.Handle, err error) {
-	bh, err = w.writeBlock(b, NoCompression, &w.buf)
+	bh, err = w.writeBlock(b, block.NoCompression, &w.buf)
 	if err == nil {
 		w.recordToMetaindex(name, bh)
 	}
@@ -421,19 +409,8 @@ func (w *layoutWriter) writeNamedBlock(b []byte, name string) (bh block.Handle, 
 
 // WriteValueBlock writes a pre-finished value block (with the trailer) to the
 // writer.
-func (w *layoutWriter) WriteValueBlock(blk []byte) (block.Handle, error) {
-	// NB: value blocks are already finished and contain the block trailer.
-	// TODO(jackson): can this be refactored to make value blocks less of a
-	// snowflake?
-	off := w.offset
-	w.clearFromCache(off)
-	// Write the bytes to the file.
-	if err := w.writable.Write(blk); err != nil {
-		return block.Handle{}, err
-	}
-	l := uint64(len(blk))
-	w.offset += l
-	return block.Handle{Offset: off, Length: l}, nil
+func (w *layoutWriter) WriteValueBlock(blk block.PhysicalBlock) (block.Handle, error) {
+	return w.writePrecompressedBlock(blk)
 }
 
 func (w *layoutWriter) WriteValueIndexBlock(
@@ -459,21 +436,23 @@ func (w *layoutWriter) WriteValueIndexBlock(
 }
 
 func (w *layoutWriter) writeBlock(
-	b []byte, compression Compression, buf *blockBuf,
+	b []byte, compression block.Compression, buf *blockBuf,
 ) (block.Handle, error) {
-	blk, trailer := compressAndChecksum(b, compression, buf)
-	bh := block.Handle{Offset: w.offset, Length: uint64(len(blk))}
-	w.clearFromCache(bh.Offset)
+	return w.writePrecompressedBlock(block.CompressAndChecksum(
+		&buf.compressedBuf, b, compression, &buf.checksummer))
+}
 
+// writePrecompressedBlock writes a pre-compressed block and its
+// pre-computed trailer to the writer, returning it's block handle.
+func (w *layoutWriter) writePrecompressedBlock(blk block.PhysicalBlock) (block.Handle, error) {
+	w.clearFromCache(w.offset)
 	// Write the bytes to the file.
-	if err := w.writable.Write(blk); err != nil {
+	n, err := blk.WriteTo(w.writable)
+	if err != nil {
 		return block.Handle{}, err
 	}
-	w.offset += uint64(len(blk))
-	if err := w.writable.Write(trailer[:]); err != nil {
-		return block.Handle{}, err
-	}
-	w.offset += block.TrailerLen
+	bh := block.Handle{Offset: w.offset, Length: uint64(blk.LengthWithoutTrailer())}
+	w.offset += uint64(n)
 	return bh, nil
 }
 
@@ -526,7 +505,7 @@ func (w *layoutWriter) Finish() (size uint64, err error) {
 	for _, h := range w.handles {
 		bw.AddRaw(unsafe.Slice(unsafe.StringData(h.key), len(h.key)), h.encodedBlockHandle)
 	}
-	metaIndexHandle, err := w.writeBlock(bw.Finish(), NoCompression, &w.buf)
+	metaIndexHandle, err := w.writeBlock(bw.Finish(), block.NoCompression, &w.buf)
 	if err != nil {
 		return 0, err
 	}

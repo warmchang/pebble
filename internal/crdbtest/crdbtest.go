@@ -8,10 +8,15 @@ package crdbtest
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
+	"fmt"
+	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"golang.org/x/exp/rand"
 )
 
 const withWall = 9
@@ -24,8 +29,10 @@ const MaxSuffixLen = max(withLockTableLen, withSynthetic, withLogical, withWall)
 
 // Comparer is a base.Comparer for CockroachDB keys.
 var Comparer = base.Comparer{
-	Compare: Compare,
-	Equal:   Equal,
+	Split:           Split,
+	CompareSuffixes: CompareSuffixes,
+	Compare:         Compare,
+	Equal:           Equal,
 	AbbreviatedKey: func(k []byte) uint64 {
 		key, ok := getKeyPartFromEngineKey(k)
 		if !ok {
@@ -84,16 +91,13 @@ var Comparer = base.Comparer{
 		// zero-length version.
 		return append(append(dst, a...), 0)
 	},
-	Split: Split,
-	Name:  "cockroach_comparator",
+	Name: "cockroach_comparator",
 }
 
 // EncodeMVCCKey encodes a MVCC key into dst, growing dst as necessary.
 func EncodeMVCCKey(dst []byte, key []byte, walltime uint64, logical uint32) []byte {
 	if cap(dst) < len(key)+withSynthetic {
-		newKey := make([]byte, len(key), len(key)+withSynthetic)
-		copy(newKey, key)
-		key = newKey
+		dst = make([]byte, 0, len(key)+withSynthetic)
 	}
 	dst = append(dst[:0], key...)
 	return EncodeTimestamp(dst, walltime, logical)
@@ -150,25 +154,23 @@ func DecodeTimestamp(mvccKey []byte) ([]byte, []byte, uint64, uint32) {
 
 // Split implements base.Split for CockroachDB keys.
 func Split(key []byte) int {
-	keyLen := len(key)
-	if keyLen == 0 {
-		return 0
+	if len(key) == 0 {
+		panic(errors.AssertionFailedf("empty key"))
 	}
 	// Last byte is the version length + 1 when there is a version, else it is
 	// 0.
-	versionLen := int(key[keyLen-1])
-	keyPartEnd := keyLen - 1 - versionLen
-	if keyPartEnd < 0 {
-		return keyLen
+	versionLen := int(key[len(key)-1])
+	if versionLen >= len(key) {
+		panic(errors.AssertionFailedf("empty key"))
 	}
-	return keyPartEnd + 1
+	return len(key) - versionLen
 }
 
 // Compare compares cockroach keys, including the version (which could be MVCC
 // timestamps).
 func Compare(a, b []byte) int {
 	if len(a) == 0 || len(b) == 0 {
-		return bytes.Compare(a, b)
+		panic(errors.AssertionFailedf("malformed key: %x, %x", a, b))
 	}
 
 	// NB: For performance, this routine manually splits the key into the
@@ -189,13 +191,8 @@ func Compare(a, b []byte) int {
 	// comparable with the same ordering as if they had a common user key.
 	aSep := aEnd - int(a[aEnd])
 	bSep := bEnd - int(b[bEnd])
-	if aSep == -1 && bSep == -1 {
-		aSep, bSep = 0, 0 // comparing bare suffixes
-	}
-	if aSep < 0 || bSep < 0 {
-		// This should never happen unless there is some sort of corruption of
-		// the keys.
-		return bytes.Compare(a, b)
+	if aSep < 0 || bSep < 0 || a[aSep] != 0 || b[bSep] != 0 {
+		panic(errors.AssertionFailedf("malformed key: %x, %x", a, b))
 	}
 	// Compare the "user key" part of the key.
 	if c := bytes.Compare(a[:aSep], b[:bSep]); c != 0 {
@@ -205,19 +202,19 @@ func Compare(a, b []byte) int {
 	// Compare the version part of the key. Note that when the version is a
 	// timestamp, the timestamp encoding causes byte comparison to be equivalent
 	// to timestamp comparison.
-	aVer := a[aSep:aEnd]
-	bVer := b[bSep:bEnd]
-	if len(aVer) == 0 {
-		if len(bVer) == 0 {
-			return 0
-		}
-		return -1
-	} else if len(bVer) == 0 {
-		return 1
+	return CompareSuffixes(a[aSep+1:], b[bSep+1:])
+}
+
+// CompareSuffixes compares suffixes (normally timestamps).
+func CompareSuffixes(a, b []byte) int {
+	if len(a) == 0 || len(b) == 0 {
+		// Empty suffixes come before non-empty suffixes.
+		return cmp.Compare(len(a), len(b))
 	}
-	aVer = normalizeEngineKeyVersionForCompare(aVer)
-	bVer = normalizeEngineKeyVersionForCompare(bVer)
-	return bytes.Compare(bVer, aVer)
+	return bytes.Compare(
+		normalizeEngineKeyVersionForCompare(b),
+		normalizeEngineKeyVersionForCompare(a),
+	)
 }
 
 // Equal implements base.Equal for Cockroach keys.
@@ -247,23 +244,17 @@ func Equal(a, b []byte) bool {
 	// comparable with the same ordering as if they had a common user key.
 	aSep := aEnd - aVerLen
 	bSep := bEnd - bVerLen
-	if aSep == -1 && bSep == -1 {
-		aSep, bSep = 0, 0 // comparing bare suffixes
-	}
-	if aSep < 0 || bSep < 0 {
-		// This should never happen unless there is some sort of corruption of
-		// the keys.
-		return bytes.Equal(a, b)
-	}
-
 	// Compare the "user key" part of the key.
 	if !bytes.Equal(a[:aSep], b[:bSep]) {
 		return false
 	}
+	if aVerLen == 0 || bVerLen == 0 {
+		return aVerLen == bVerLen
+	}
 
 	// Compare the version part of the key.
-	aVer := a[aSep:aEnd]
-	bVer := b[bSep:bEnd]
+	aVer := a[aSep+1:]
+	bVer := b[bSep+1:]
 	aVer = normalizeEngineKeyVersionForCompare(aVer)
 	bVer = normalizeEngineKeyVersionForCompare(bVer)
 	return bytes.Equal(aVer, bVer)
@@ -272,24 +263,30 @@ func Equal(a, b []byte) bool {
 var zeroLogical [4]byte
 
 func normalizeEngineKeyVersionForCompare(a []byte) []byte {
+	// Check sentinel byte.
+	if len(a) != int(a[len(a)-1]) {
+		panic(errors.AssertionFailedf("malformed suffix: %x", a))
+	}
+	// Strip off sentinel byte.
+	a = a[:len(a)-1]
 	// In general, the version could also be a non-timestamp version, but we know
 	// that engineKeyVersionLockTableLen+mvccEncodedTimeSentinelLen is a different
 	// constant than the above, so there is no danger here of stripping parts from
 	// a non-timestamp version.
-	if len(a) == withSynthetic {
+	if len(a) == withSynthetic-1 {
 		// Strip the synthetic bit component from the timestamp version. The
 		// presence of the synthetic bit does not affect key ordering or equality.
-		a = a[:withLogical]
+		a = a[:withLogical-1]
 	}
-	if len(a) == withLogical {
+	if len(a) == withLogical-1 {
 		// If the timestamp version contains a logical timestamp component that is
 		// zero, strip the component. encodeMVCCTimestampToBuf will typically omit
 		// the entire logical component in these cases as an optimization, but it
 		// does not guarantee to never include a zero logical component.
 		// Additionally, we can fall into this case after stripping off other
 		// components of the key version earlier on in this function.
-		if bytes.Equal(a[withWall:], zeroLogical[:]) {
-			a = a[:withWall]
+		if bytes.Equal(a[withWall-1:], zeroLogical[:]) {
+			a = a[:withWall-1]
 		}
 	}
 	return a
@@ -309,4 +306,46 @@ func getKeyPartFromEngineKey(engineKey []byte) (key []byte, ok bool) {
 	}
 	// Key excludes the sentinel byte.
 	return engineKey[:keyPartEnd], true
+}
+
+// KeyConfig configures the shape of the random keys generated.
+type KeyConfig struct {
+	PrefixAlphabetLen int    // Number of bytes in the alphabet used for the prefix.
+	PrefixLenShared   int    // Number of bytes shared by all key prefixes.
+	PrefixLen         int    // Number of bytes in the prefix.
+	BaseWallTime      uint64 // Smallest MVCC WallTime.
+	Logical           uint32 // MVCC logical time for all keys.
+}
+
+func (cfg KeyConfig) String() string {
+	return fmt.Sprintf("AlphaLen=%d,Shared=%d,PrefixLen=%d,Logical=%d",
+		cfg.PrefixAlphabetLen, cfg.PrefixLenShared, cfg.PrefixLen, cfg.Logical)
+}
+
+// RandomKVs constructs count random KVs with the provided parameters.
+func RandomKVs(rng *rand.Rand, count int, cfg KeyConfig, valueLen int) (keys, vals [][]byte) {
+	sharedPrefix := make([]byte, cfg.PrefixLenShared)
+	for i := 0; i < len(sharedPrefix); i++ {
+		sharedPrefix[i] = byte(rng.Intn(cfg.PrefixAlphabetLen) + 'a')
+	}
+
+	keys = make([][]byte, count)
+	vals = make([][]byte, count)
+	for i := range keys {
+		keys[i] = randCockroachKey(rng, cfg, sharedPrefix)
+		vals[i] = make([]byte, valueLen)
+		rng.Read(vals[i])
+	}
+	slices.SortFunc(keys, Compare)
+	return keys, vals
+}
+
+func randCockroachKey(rng *rand.Rand, cfg KeyConfig, blockPrefix []byte) []byte {
+	key := make([]byte, 0, cfg.PrefixLen+MaxSuffixLen)
+	key = append(key, blockPrefix...)
+	wallTime := cfg.BaseWallTime + rng.Uint64n(uint64(time.Hour))
+	for len(key) < cfg.PrefixLen {
+		key = append(key, byte(rng.Intn(cfg.PrefixAlphabetLen)+'a'))
+	}
+	return EncodeTimestamp(key, wallTime, cfg.Logical)
 }

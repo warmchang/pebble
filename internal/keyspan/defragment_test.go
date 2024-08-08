@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,11 +22,11 @@ func TestDefragmentingIter(t *testing.T) {
 	comparer := testkeys.Comparer
 	cmp := comparer.Compare
 	internalEqual := DefragmentInternal
-	alwaysEqual := DefragmentMethodFunc(func(_ base.Equal, _, _ *Span) bool { return true })
+	alwaysEqual := DefragmentMethodFunc(func(_ base.CompareSuffixes, _, _ *Span) bool { return true })
 	staticReducer := StaticDefragmentReducer
 	collectReducer := func(cur, next []Key) []Key {
-		c := keysBySeqNumKind(append(cur, next...))
-		sort.Sort(&c)
+		c := append(cur, next...)
+		SortKeysByTrailer(c)
 		return c
 	}
 
@@ -217,7 +216,7 @@ func testDefragmentingIteRandomizedOnce(t *testing.T, seed int64) {
 }
 
 func fragment(cmp base.Compare, formatKey base.FormatKey, spans []Span) []Span {
-	Sort(cmp, spans)
+	SortSpansByStartKey(cmp, spans)
 	var fragments []Span
 	f := Fragmenter{
 		Cmp:    cmp,
