@@ -5,6 +5,8 @@
 package sstable
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/fifo"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
@@ -61,6 +63,22 @@ type Comparers map[string]*base.Comparer
 // mergers.
 type Mergers map[string]*base.Merger
 
+// KeySchemas is a map from key schema name to key schema. A single database may
+// contain sstables with multiple key schemas.
+type KeySchemas map[string]colblk.KeySchema
+
+// MakeKeySchemas constructs a KeySchemas from a slice of key schemas.
+func MakeKeySchemas(keySchemas ...colblk.KeySchema) KeySchemas {
+	m := make(KeySchemas, len(keySchemas))
+	for _, keySchema := range keySchemas {
+		if _, ok := m[keySchema.Name]; ok {
+			panic(fmt.Sprintf("duplicate key schemas with name %q", keySchema.Name))
+		}
+		m[keySchema.Name] = keySchema
+	}
+	return m
+}
+
 // ReaderOptions holds the parameters needed for reading an sstable.
 type ReaderOptions struct {
 	// LoadBlockSema, if set, is used to limit the number of blocks that can be
@@ -83,11 +101,10 @@ type ReaderOptions struct {
 
 	Comparers Comparers
 	Mergers   Mergers
-
-	// KeySchema describes the schema to use when interpreting columnar data
-	// blocks. Only used for sstables encoded in format TableFormatPebblev5 or
-	// higher.
-	KeySchema colblk.KeySchema
+	// KeySchemas contains the set of known key schemas to use when interpreting
+	// columnar data blocks. Only used for sstables encoded in format
+	// TableFormatPebblev5 or higher.
+	KeySchemas KeySchemas
 
 	// Filters is a map from filter policy name to filter policy. Filters with
 	// policies that are not in this map will be ignored.
@@ -130,8 +147,15 @@ func (o ReaderOptions) ensureDefaults() ReaderOptions {
 	if o.DeniedUserProperties == nil {
 		o.DeniedUserProperties = ignoredInternalProperties
 	}
+	if o.KeySchemas == nil {
+		o.KeySchemas = defaultKeySchemas
+	}
 	return o
 }
+
+var defaultKeySchemas = MakeKeySchemas(
+	colblk.DefaultKeySchema(base.DefaultComparer, 16),
+)
 
 // WriterOptions holds the parameters used to control building an sstable.
 type WriterOptions struct {
@@ -276,6 +300,23 @@ type WriterOptions struct {
 	// disableObsoleteCollector is used to disable the obsolete key block property
 	// collector automatically added by sstable block writers.
 	disableObsoleteCollector bool
+}
+
+// JemallocSizeClasses are a subset of available size classes in jemalloc[1],
+// suitable for the AllocatorSizeClasses option.
+//
+// The size classes are used when writing sstables for determining target block
+// sizes for flushes, with the goal of reducing internal memory fragmentation
+// when the blocks are later loaded into the block cache. We only use the size
+// classes between 16KiB - 256KiB as block limits fall in that range.
+//
+// [1] https://jemalloc.net/jemalloc.3.html#size_classes
+var JemallocSizeClasses = []int{
+	16 * 1024,
+	20 * 1024, 24 * 1024, 28 * 1024, 32 * 1024, // 4KiB spacing
+	40 * 1024, 48 * 1024, 56 * 1024, 64 * 1024, // 8KiB spacing
+	80 * 1024, 96 * 1024, 112 * 1024, 128 * 1024, // 16KiB spacing.
+	160 * 1024, 192 * 1024, 224 * 1024, 256 * 1024, // 32KiB spacing.
 }
 
 // SetInternal sets the internal writer options. Note that even though this

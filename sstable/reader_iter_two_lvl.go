@@ -69,10 +69,13 @@ func (i *twoLevelIterator[I, PI, D, PD]) loadSecondLevelIndexBlock(dir int8) loa
 		// blockIntersects
 	}
 	indexBlock, err := i.secondLevel.reader.readIndexBlock(i.secondLevel.ctx, i.secondLevel.readBlockEnv, i.secondLevel.indexFilterRH, bhp.Handle)
-	if err == nil {
-		err = PI(&i.secondLevel.index).InitHandle(i.secondLevel.cmp, i.secondLevel.reader.Split, indexBlock, i.secondLevel.transforms)
-	}
 	if err != nil {
+		i.secondLevel.err = err
+		return loadBlockFailed
+	}
+	err = PI(&i.secondLevel.index).InitHandle(i.secondLevel.cmp, i.secondLevel.reader.Split, indexBlock, i.secondLevel.transforms)
+	if err != nil {
+		PI(&i.secondLevel.index).Invalidate()
 		i.secondLevel.err = err
 		return loadBlockFailed
 	}
@@ -325,7 +328,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) SeekGE(
 
 	var dontSeekWithinSingleLevelIter bool
 	if PI(&i.topLevelIndex).IsDataInvalidated() || !PI(&i.topLevelIndex).Valid() || PI(&i.secondLevel.index).IsDataInvalidated() || err != nil ||
-		(i.secondLevel.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || i.secondLevel.cmp(key, PI(&i.topLevelIndex).Separator()) > 0 {
+		(i.secondLevel.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || PI(&i.topLevelIndex).SeparatorLT(key) {
 		// Slow-path: need to position the topLevelIndex.
 
 		// The previous exhausted state of singleLevelIterator is no longer
@@ -344,17 +347,16 @@ func (i *twoLevelIterator[I, PI, D, PD]) SeekGE(
 			return nil
 		}
 		if result == loadBlockIrrelevant {
-			// Enforce the upper bound here since don't want to bother moving
-			// to the next entry in the top level index if upper bound is
-			// already exceeded. Note that the next entry starts with keys >=
-			// ikey.InternalKey.UserKey since even though this is the block separator, the
-			// same user key can span multiple index blocks. If upper is
-			// exclusive we use >= below, else we use >.
-			if i.secondLevel.upper != nil {
-				cmp := i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.upper)
-				if (!i.secondLevel.endKeyInclusive && cmp >= 0) || cmp > 0 {
-					i.secondLevel.exhaustedBounds = +1
-				}
+			// Enforce the upper bound here since don't want to bother moving to
+			// the next entry in the top level index if upper bound is already
+			// exceeded. Note that the next entry starts with keys >=
+			// topLevelIndex.Separator() since even though this is the block
+			// separator, the same user key can span multiple index blocks. If
+			// upper is exclusive we pass orEqual=true below, else we require
+			// the separator to be strictly greater than upper.
+			if i.secondLevel.upper != nil && PI(&i.topLevelIndex).SeparatorGT(
+				i.secondLevel.upper, !i.secondLevel.endKeyInclusive) {
+				i.secondLevel.exhaustedBounds = +1
 			}
 			// Fall through to skipForward.
 			dontSeekWithinSingleLevelIter = true
@@ -493,7 +495,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) SeekPrefixGE(
 
 	var dontSeekWithinSingleLevelIter bool
 	if PI(&i.topLevelIndex).IsDataInvalidated() || !PI(&i.topLevelIndex).Valid() || PI(&i.secondLevel.index).IsDataInvalidated() || err != nil ||
-		(i.secondLevel.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || i.secondLevel.cmp(key, PI(&i.topLevelIndex).Separator()) > 0 {
+		(i.secondLevel.boundsCmp <= 0 && !flags.TrySeekUsingNext()) || PI(&i.topLevelIndex).SeparatorLT(key) {
 		// Slow-path: need to position the topLevelIndex.
 
 		// The previous exhausted state of singleLevelIterator is no longer
@@ -512,17 +514,16 @@ func (i *twoLevelIterator[I, PI, D, PD]) SeekPrefixGE(
 			return nil
 		}
 		if result == loadBlockIrrelevant {
-			// Enforce the upper bound here since don't want to bother moving
-			// to the next entry in the top level index if upper bound is
-			// already exceeded. Note that the next entry starts with keys >=
-			// ikey.InternalKey.UserKey since even though this is the block separator, the
-			// same user key can span multiple index blocks. If upper is
-			// exclusive we use >= below, else we use >.
-			if i.secondLevel.upper != nil {
-				cmp := i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.upper)
-				if (!i.secondLevel.endKeyInclusive && cmp >= 0) || cmp > 0 {
-					i.secondLevel.exhaustedBounds = +1
-				}
+			// Enforce the upper bound here since don't want to bother moving to
+			// the next entry in the top level index if upper bound is already
+			// exceeded. Note that the next entry starts with keys >=
+			// topLevelIndex.Separator() since even though this is the block
+			// separator, the same user key can span multiple index blocks. If
+			// upper is exclusive we pass orEqual=true below, else we require
+			// the separator to be strictly greater than upper.
+			if i.secondLevel.upper != nil && PI(&i.topLevelIndex).SeparatorGT(
+				i.secondLevel.upper, !i.secondLevel.endKeyInclusive) {
+				i.secondLevel.exhaustedBounds = +1
 			}
 			// Fall through to skipForward.
 			dontSeekWithinSingleLevelIter = true
@@ -719,7 +720,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) SeekLT(
 		// exceeded. Note that the previous entry starts with keys <=
 		// ikey.InternalKey.UserKey since even though this is the current block's
 		// separator, the same user key can span multiple index blocks.
-		if i.secondLevel.lower != nil && i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.lower) < 0 {
+		if i.secondLevel.lower != nil && PI(&i.topLevelIndex).SeparatorLT(i.secondLevel.lower) {
 			i.secondLevel.exhaustedBounds = -1
 		}
 	}
@@ -757,16 +758,15 @@ func (i *twoLevelIterator[I, PI, D, PD]) First() *base.InternalKV {
 		// Else fall through to skipForward.
 	} else {
 		// result == loadBlockIrrelevant. Enforce the upper bound here since
-		// don't want to bother moving to the next entry in the top level
-		// index if upper bound is already exceeded. Note that the next entry
-		// starts with keys >= ikv.InternalKey.UserKey since even though this is the
+		// don't want to bother moving to the next entry in the top level index
+		// if upper bound is already exceeded. Note that the next entry starts
+		// with keys >= topLevelIndex.Separator() since even though this is the
 		// block separator, the same user key can span multiple index blocks.
-		// If upper is exclusive we use >= below, else we use >.
-		if i.secondLevel.upper != nil {
-			cmp := i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.upper)
-			if (!i.secondLevel.endKeyInclusive && cmp >= 0) || cmp > 0 {
-				i.secondLevel.exhaustedBounds = +1
-			}
+		// If upper is exclusive we pass orEqual=true below, else we require the
+		// separator to be strictly greater than upper.
+		if i.secondLevel.upper != nil && PI(&i.topLevelIndex).SeparatorGT(
+			i.secondLevel.upper, !i.secondLevel.endKeyInclusive) {
+			i.secondLevel.exhaustedBounds = +1
 		}
 	}
 	// NB: skipForward checks whether exhaustedBounds is already +1.
@@ -812,7 +812,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) Last() *base.InternalKV {
 		// entry starts with keys <= ikv.InternalKey.UserKey since even though
 		// this is the current block's separator, the same user key can span
 		// multiple index blocks.
-		if i.secondLevel.lower != nil && i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.lower) < 0 {
+		if i.secondLevel.lower != nil && PI(&i.topLevelIndex).SeparatorLT(i.secondLevel.lower) {
 			i.secondLevel.exhaustedBounds = -1
 		}
 	}
@@ -872,15 +872,14 @@ func (i *twoLevelIterator[I, PI, D, PD]) NextPrefix(succKey []byte) *base.Intern
 	if result == loadBlockIrrelevant {
 		// Enforce the upper bound here since don't want to bother moving to the
 		// next entry in the top level index if upper bound is already exceeded.
-		// Note that the next entry starts with keys >= ikv.InternalKey.UserKey
-		// since even though this is the block separator, the same user key can
-		// span multiple index blocks. If upper is exclusive we use >= below,
-		// else we use >.
-		if i.secondLevel.upper != nil {
-			cmp := i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.upper)
-			if (!i.secondLevel.endKeyInclusive && cmp >= 0) || cmp > 0 {
-				i.secondLevel.exhaustedBounds = +1
-			}
+		// Note that the next entry starts with keys >=
+		// topLevelIndex.Separator() since even though this is the block
+		// separator, the same user key can span multiple index blocks. If upper
+		// is exclusive we pass orEqual=true below, else we require the
+		// separator to be strictly greater than upper.
+		if i.secondLevel.upper != nil && PI(&i.topLevelIndex).SeparatorGT(
+			i.secondLevel.upper, !i.secondLevel.endKeyInclusive) {
+			i.secondLevel.exhaustedBounds = +1
 		}
 	} else if kv := i.secondLevel.SeekGE(succKey, base.SeekGEFlagsNone); kv != nil {
 		return i.secondLevel.maybeVerifyKey(kv)
@@ -938,7 +937,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) skipForward() *base.InternalKV {
 		// guarantees wrt an iterator lower bound when we iterate forward. But we
 		// must never return keys that are not inside the virtual table.
 		useSeek := i.secondLevel.vState != nil && (!PI(&i.topLevelIndex).Valid() ||
-			i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.vState.lower.UserKey) < 0)
+			PI(&i.topLevelIndex).SeparatorLT(i.secondLevel.vState.lower.UserKey))
 
 		i.secondLevel.exhaustedBounds = 0
 		if !PI(&i.topLevelIndex).Next() {
@@ -968,14 +967,13 @@ func (i *twoLevelIterator[I, PI, D, PD]) skipForward() *base.InternalKV {
 			// index if upper bound is already exceeded. Note that the next
 			// entry starts with keys >= i.topLevelIndex.Separator() since even
 			// though this is the block separator, the same user key can span
-			// multiple index blocks. If upper is exclusive we use >= below,
-			// else we use >.
-			if i.secondLevel.upper != nil {
-				cmp := i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.upper)
-				if (!i.secondLevel.endKeyInclusive && cmp >= 0) || cmp > 0 {
-					i.secondLevel.exhaustedBounds = +1
-					// Next iteration will return.
-				}
+			// multiple index blocks. If upper is exclusive we pass orEqual=true
+			// below, else we require the separator to be strictly greater than
+			// upper.
+			if i.secondLevel.upper != nil && PI(&i.topLevelIndex).SeparatorGT(
+				i.secondLevel.upper, !i.secondLevel.endKeyInclusive) {
+				i.secondLevel.exhaustedBounds = +1
+				// Next iteration will return.
 			}
 		}
 	}
@@ -1011,7 +1009,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) skipBackward() *base.InternalKV {
 			// previous entry starts with keys <= i.topLevelIndex.Separator() since
 			// even though this is the current block's separator, the same user
 			// key can span multiple index blocks.
-			if i.secondLevel.lower != nil && i.secondLevel.cmp(PI(&i.topLevelIndex).Separator(), i.secondLevel.lower) < 0 {
+			if i.secondLevel.lower != nil && PI(&i.topLevelIndex).SeparatorLT(i.secondLevel.lower) {
 				i.secondLevel.exhaustedBounds = -1
 				// Next iteration will return.
 			}

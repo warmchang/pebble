@@ -831,8 +831,8 @@ func TestMemTableReservation(t *testing.T) {
 		t.Fatalf("expected 2 refs, but found %d", refs)
 	}
 	// Verify the memtable reservation has caused our test block to be evicted.
-	if h := opts.Cache.Get(tmpID, base.DiskFileNum(0), 0); h.Get() != nil {
-		t.Fatalf("expected failure, but found success: %s", h.Get())
+	if h := opts.Cache.Get(tmpID, base.DiskFileNum(0), 0); h.Valid() {
+		t.Fatalf("expected failure, but found success: %#v", h)
 	}
 
 	// Flush the memtable. The memtable reservation should double because old
@@ -1178,7 +1178,7 @@ func TestDBConcurrentCompactClose(t *testing.T) {
 			f, err := mem.Create(path, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
 			w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-				TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+				TableFormat: d.TableFormat(),
 			})
 			require.NoError(t, w.Set([]byte(fmt.Sprint(j)), nil))
 			require.NoError(t, w.Close())
@@ -1638,7 +1638,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("cc"), []byte("foo")))
 		require.NoError(t, w.Close())
@@ -1649,7 +1649,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo2")))
 		require.NoError(t, w.Set([]byte("cc"), []byte("foo2")))
@@ -1661,7 +1661,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo3")))
 		require.NoError(t, w.Close())
@@ -1672,7 +1672,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("bb"), []byte("foo4")))
 		require.NoError(t, w.Close())
@@ -1751,7 +1751,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.DeleteRange([]byte("cc"), []byte("e")))
 		require.NoError(t, w.Close())
@@ -1785,7 +1785,7 @@ func TestMemtableIngestInversion(t *testing.T) {
 		f, err := memFS.Create(path, vfs.WriteCategoryUnspecified)
 		require.NoError(t, err)
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		require.NoError(t, w.Set([]byte("cc"), []byte("doesntmatter")))
 		require.NoError(t, w.Close())

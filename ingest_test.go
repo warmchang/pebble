@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
-	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/kr/pretty"
@@ -218,10 +217,9 @@ func TestIngestLoadRand(t *testing.T) {
 	}
 
 	opts := (&Options{
-		Comparer:  base.DefaultComparer,
-		KeySchema: colblk.DefaultKeySchema(base.DefaultComparer, 16),
-		FS:        mem,
-	}).WithFSDefaults()
+		Comparer: base.DefaultComparer,
+		FS:       mem,
+	}).WithFSDefaults().EnsureDefaults()
 	lr, err := ingestLoad(context.Background(), opts, version, paths, nil, nil, 0, pending)
 	require.NoError(t, err)
 
@@ -470,6 +468,7 @@ func TestOverlappingIngestedSSTs(t *testing.T) {
 			FormatMajorVersion:          internalFormatNewest,
 			Logger:                      testLogger{t},
 		}).WithFSDefaults()
+		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 		if testing.Verbose() {
 			lel := MakeLoggingEventListener(DefaultLogger)
 			opts.EventListener = &lel
@@ -1126,7 +1125,7 @@ func testIngestSharedImpl(
 			startKey := []byte(td.CmdArgs[2].Key)
 			endKey := []byte(td.CmdArgs[3].Key)
 
-			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.opts.FormatMajorVersion.MaxTableFormat())
+			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.TableFormat())
 			sstPath := fmt.Sprintf("ext/replicate%d.sst", replicateCounter)
 			f, err := to.opts.FS.Create(sstPath, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
@@ -1374,7 +1373,7 @@ func TestSimpleIngestShared(t *testing.T) {
 		fn := base.FileNum(2)
 		f, meta, err := provider2.Create(context.TODO(), fileTypeTable, base.PhysicalTableDiskFileNum(fn), objstorage.CreateOptions{PreferSharedStorage: true})
 		require.NoError(t, err)
-		w := sstable.NewWriter(f, d.opts.MakeWriterOptions(0, d.opts.FormatMajorVersion.MaxTableFormat()))
+		w := sstable.NewWriter(f, d.opts.MakeWriterOptions(0, d.TableFormat()))
 		w.Set([]byte("d"), []byte("shared"))
 		w.Set([]byte("e"), []byte("shared"))
 		w.Close()
@@ -1627,7 +1626,7 @@ func TestConcurrentExcise(t *testing.T) {
 			startKey := []byte(td.CmdArgs[2].Key)
 			endKey := []byte(td.CmdArgs[3].Key)
 
-			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.opts.FormatMajorVersion.MaxTableFormat())
+			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.TableFormat())
 			sstPath := fmt.Sprintf("ext/replicate%d.sst", replicateCounter)
 			f, err := to.opts.FS.Create(sstPath, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
@@ -1881,6 +1880,7 @@ func TestIngestExternal(t *testing.T) {
 			FormatMajorVersion: majorVersion,
 			Logger:             testLogger{t},
 		}
+		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 		opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
 			"external-locator": remoteStorage,
 		})
@@ -2063,7 +2063,7 @@ func TestIngestExternal(t *testing.T) {
 			startKey := []byte(td.CmdArgs[2].Key)
 			endKey := []byte(td.CmdArgs[3].Key)
 
-			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.opts.FormatMajorVersion.MaxTableFormat())
+			writeOpts := d.opts.MakeWriterOptions(0 /* level */, to.TableFormat())
 			sstPath := fmt.Sprintf("ext/replicate%d.sst", replicateCounter)
 			f, err := to.opts.FS.Create(sstPath, vfs.WriteCategoryUnspecified)
 			require.NoError(t, err)
@@ -2415,6 +2415,7 @@ func TestIngest(t *testing.T) {
 			}},
 			FormatMajorVersion: internalFormatNewest,
 		}
+		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 		opts.Experimental.IngestSplit = func() bool {
 			return split
 		}
@@ -3671,7 +3672,7 @@ func TestIngestValidation(t *testing.T) {
 					BlockSize:   blockSize, // Create many smaller blocks.
 					Comparer:    opts.Comparer,
 					Compression: NoCompression, // For simpler debugging.
-					KeySchema:   opts.KeySchema,
+					KeySchema:   opts.KeySchemas[opts.KeySchema],
 				})
 				for _, kv := range keyVals {
 					require.NoError(t, w.Set(kv.key, kv.val))

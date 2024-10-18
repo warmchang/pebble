@@ -13,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/wal"
 	"github.com/stretchr/testify/require"
@@ -90,6 +91,7 @@ func TestOptionsString(t *testing.T) {
   flush_delay_range_key=0s
   flush_split_bytes=4194304
   format_major_version=13
+  key_schema=DefaultKeySchema(leveldb.BytewiseComparator,16)
   l0_compaction_concurrency=10
   l0_compaction_file_threshold=500
   l0_compaction_threshold=4
@@ -314,6 +316,16 @@ func TestOptionsParse(t *testing.T) {
 			require.NotEqual(t, newCacheSize, 0)
 		})
 	}
+}
+
+func TestOptionsParseComparerOverwrite(t *testing.T) {
+	// Test that an unrecognized comparer in the OPTIONS file does not nil out
+	// the Comparer field.
+	o := &Options{Comparer: testkeys.Comparer}
+	err := o.Parse(`[Options]
+comparer=unrecognized`, nil)
+	require.NoError(t, err)
+	require.Equal(t, testkeys.Comparer, o.Comparer)
 }
 
 func TestOptionsValidate(t *testing.T) {

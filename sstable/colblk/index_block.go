@@ -240,7 +240,7 @@ func (i *IndexIter) InitHandle(
 	// overhead can be material.)
 	i.h.Release()
 	i.h = blk
-	i.allocDecoder.Init(i.h.Get())
+	i.allocDecoder.Init(i.h.BlockData())
 	i.InitWithDecoder(cmp, split, &i.allocDecoder, transforms)
 	return nil
 }
@@ -293,6 +293,19 @@ func (i *IndexIter) Separator() []byte {
 		return key
 	}
 	return i.applyTransforms(key)
+}
+
+// SeparatorLT returns true if the separator at the iterator's current
+// position is strictly less than the provided key.
+func (i *IndexIter) SeparatorLT(key []byte) bool {
+	return i.compare(i.Separator(), key) < 0
+}
+
+// SeparatorGT returns true if the separator at the iterator's current position
+// is strictly greater than (or equal, if orEqual=true) the provided key.
+func (i *IndexIter) SeparatorGT(key []byte, inclusively bool) bool {
+	cmp := i.compare(i.Separator(), key)
+	return cmp > 0 || (cmp == 0 && inclusively)
 }
 
 func (i *IndexIter) applyTransforms(key []byte) []byte {

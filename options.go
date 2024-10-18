@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
@@ -60,6 +61,9 @@ type FilterWriter = base.FilterWriter
 
 // FilterPolicy exports the base.FilterPolicy type.
 type FilterPolicy = base.FilterPolicy
+
+// KeySchema exports the colblk.KeySchema type.
+type KeySchema = colblk.KeySchema
 
 // BlockPropertyCollector exports the sstable.BlockPropertyCollector type.
 type BlockPropertyCollector = sstable.BlockPropertyCollector
@@ -836,6 +840,12 @@ type Options struct {
 		//   which will later be consumed by SingleDelete#3. The violation will
 		//   not be detected and the DB will be correct.
 		SingleDeleteInvariantViolationCallback func(userKey []byte)
+
+		// EnableDeleteOnlyCompactionExcises enables delete-only compactions to also
+		// apply delete-only compaction hints on sstables that partially overlap
+		// with it. This application happens through an excise, similar to
+		// the excise phase of IngestAndExcise.
+		EnableDeleteOnlyCompactionExcises func() bool
 	}
 
 	// Filters is a map from filter policy name to filter policy. It is used for
@@ -890,11 +900,22 @@ type Options struct {
 	// The default value uses the underlying operating system's file system.
 	FS vfs.FS
 
-	// KeySchema defines the schema of a user key. When columnar blocks are in
-	// use (see FormatColumnarBlocks), the user may specify how a key should be
-	// decomposed into columns. If not set, colblk.DefaultKeySchema is used to
-	// construct a default key schema.
-	KeySchema colblk.KeySchema
+	// KeySchema is the name of the key schema that should be used when writing
+	// new sstables. There must be a key schema with this name defined in
+	// KeySchemas. If not set, colblk.DefaultKeySchema is used to construct a
+	// default key schema.
+	KeySchema string
+
+	// KeySchemas defines the set of known schemas of user keys. When columnar
+	// blocks are in use (see FormatColumnarBlocks), the user may specify how a
+	// key should be decomposed into columns. Each KeySchema must have a unique
+	// name. The schema named by Options.KeySchema is used while writing
+	// sstables during flushes and compactions.
+	//
+	// Multiple KeySchemas may be used over the lifetime of a database. Once a
+	// KeySchema is used, it must be provided in KeySchemas in subsequent calls
+	// to Open for perpetuity.
+	KeySchemas sstable.KeySchemas
 
 	// Lock, if set, must be a database lock acquired through LockDirectory for
 	// the same directory passed to Open. If provided, Open will skip locking
@@ -1173,6 +1194,9 @@ type WALFailoverOptions struct {
 // ReadaheadConfig controls the use of read-ahead.
 type ReadaheadConfig = objstorageprovider.ReadaheadConfig
 
+// JemallocSizeClasses exports sstable.JemallocSizeClasses.
+var JemallocSizeClasses = sstable.JemallocSizeClasses
+
 // DebugCheckLevels calls CheckLevels on the provided database.
 // It may be set in the DebugCheck field of Options to check
 // level invariants whenever a new version is installed.
@@ -1207,8 +1231,10 @@ func (o *Options) EnsureDefaults() *Options {
 	if o.Experimental.KeyValidationFunc == nil {
 		o.Experimental.KeyValidationFunc = func([]byte) error { return nil }
 	}
-	if len(o.KeySchema.ColumnTypes) == 0 {
-		o.KeySchema = colblk.DefaultKeySchema(o.Comparer, 16 /* bundleSize */)
+	if o.KeySchema == "" && len(o.KeySchemas) == 0 {
+		ks := colblk.DefaultKeySchema(o.Comparer, 16 /* bundleSize */)
+		o.KeySchema = ks.Name
+		o.KeySchemas = sstable.MakeKeySchemas(ks)
 	}
 	if o.L0CompactionThreshold <= 0 {
 		o.L0CompactionThreshold = 4
@@ -1429,10 +1455,14 @@ func (o *Options) String() string {
 	if o.Experimental.DisableIngestAsFlushable != nil && o.Experimental.DisableIngestAsFlushable() {
 		fmt.Fprintf(&buf, "  disable_ingest_as_flushable=%t\n", true)
 	}
+	if o.Experimental.EnableColumnarBlocks != nil && o.Experimental.EnableColumnarBlocks() {
+		fmt.Fprintf(&buf, "  enable_columnar_blocks=%t\n", true)
+	}
 	fmt.Fprintf(&buf, "  flush_delay_delete_range=%s\n", o.FlushDelayDeleteRange)
 	fmt.Fprintf(&buf, "  flush_delay_range_key=%s\n", o.FlushDelayRangeKey)
 	fmt.Fprintf(&buf, "  flush_split_bytes=%d\n", o.FlushSplitBytes)
 	fmt.Fprintf(&buf, "  format_major_version=%d\n", o.FormatMajorVersion)
+	fmt.Fprintf(&buf, "  key_schema=%s\n", o.KeySchema)
 	fmt.Fprintf(&buf, "  l0_compaction_concurrency=%d\n", o.Experimental.L0CompactionConcurrency)
 	fmt.Fprintf(&buf, "  l0_compaction_file_threshold=%d\n", o.L0CompactionFileThreshold)
 	fmt.Fprintf(&buf, "  l0_compaction_threshold=%d\n", o.L0CompactionThreshold)
@@ -1576,6 +1606,7 @@ type ParseHooks struct {
 	NewCleaner      func(name string) (Cleaner, error)
 	NewComparer     func(name string) (*Comparer, error)
 	NewFilterPolicy func(name string) (FilterPolicy, error)
+	NewKeySchema    func(name string) (KeySchema, error)
 	NewMerger       func(name string) (*Merger, error)
 	SkipUnknown     func(name, value string) bool
 }
@@ -1589,6 +1620,20 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 		// causes a key previously written to the OPTIONS file to be considered unknown,
 		// a backwards incompatible change. Instead, leave in support for parsing the
 		// key but simply don't parse the value.
+
+		parseComparer := func(name string) (*Comparer, error) {
+			switch name {
+			case DefaultComparer.Name:
+				return DefaultComparer, nil
+			case testkeys.Comparer.Name:
+				return testkeys.Comparer, nil
+			default:
+				if hooks != nil && hooks.NewComparer != nil {
+					return hooks.NewComparer(name)
+				}
+				return nil, nil
+			}
+		}
 
 		switch {
 		case section == "Version":
@@ -1631,13 +1676,10 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 					}
 				}
 			case "comparer":
-				switch value {
-				case "leveldb.BytewiseComparator":
-					o.Comparer = DefaultComparer
-				default:
-					if hooks != nil && hooks.NewComparer != nil {
-						o.Comparer, err = hooks.NewComparer(value)
-					}
+				var comparer *Comparer
+				comparer, err = parseComparer(value)
+				if comparer != nil {
+					o.Comparer = comparer
 				}
 			case "compaction_debt_concurrency":
 				o.Experimental.CompactionDebtConcurrency, err = strconv.ParseUint(value, 10, 64)
@@ -1659,6 +1701,11 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				o.private.disableLazyCombinedIteration, err = strconv.ParseBool(value)
 			case "disable_wal":
 				o.DisableWAL, err = strconv.ParseBool(value)
+			case "enable_columnar_blocks":
+				var v bool
+				if v, err = strconv.ParseBool(value); err == nil {
+					o.Experimental.EnableColumnarBlocks = func() bool { return v }
+				}
 			case "flush_delay_delete_range":
 				o.FlushDelayDeleteRange, err = time.ParseDuration(value)
 			case "flush_delay_range_key":
@@ -1677,6 +1724,32 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				}
 				if err == nil {
 					o.FormatMajorVersion = FormatMajorVersion(v)
+				}
+			case "key_schema":
+				o.KeySchema = value
+				if o.KeySchemas == nil {
+					o.KeySchemas = make(map[string]KeySchema)
+				}
+				if _, ok := o.KeySchemas[o.KeySchema]; !ok {
+					if strings.HasPrefix(value, "DefaultKeySchema(") && strings.HasSuffix(value, ")") {
+						argsStr := strings.TrimSuffix(strings.TrimPrefix(value, "DefaultKeySchema("), ")")
+						args := strings.FieldsFunc(argsStr, func(r rune) bool {
+							return unicode.IsSpace(r) || r == ','
+						})
+						var comparer *base.Comparer
+						var bundleSize int
+						comparer, err = parseComparer(args[0])
+						if err == nil {
+							bundleSize, err = strconv.Atoi(args[1])
+						}
+						if err == nil {
+							schema := colblk.DefaultKeySchema(comparer, bundleSize)
+							o.KeySchema = schema.Name
+							o.KeySchemas[o.KeySchema] = schema
+						}
+					} else if hooks != nil && hooks.NewKeySchema != nil {
+						o.KeySchemas[value], err = hooks.NewKeySchema(value)
+					}
 				}
 			case "l0_compaction_concurrency":
 				o.Experimental.L0CompactionConcurrency, err = strconv.Atoi(value)
@@ -2006,6 +2079,14 @@ func (o *Options) Validate() error {
 	if o.TableCache != nil && o.Cache != o.TableCache.cache {
 		fmt.Fprintf(&buf, "underlying cache in the TableCache and the Cache dont match\n")
 	}
+	if len(o.KeySchemas) > 0 {
+		if o.KeySchema == "" {
+			fmt.Fprintf(&buf, "KeySchemas is set but KeySchema is not\n")
+		}
+		if _, ok := o.KeySchemas[o.KeySchema]; !ok {
+			fmt.Fprintf(&buf, "KeySchema %q not found in KeySchemas\n", o.KeySchema)
+		}
+	}
 	if buf.Len() == 0 {
 		return nil
 	}
@@ -2019,7 +2100,7 @@ func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 	if o != nil {
 		readerOpts.Comparer = o.Comparer
 		readerOpts.Filters = o.Filters
-		readerOpts.KeySchema = o.KeySchema
+		readerOpts.KeySchemas = o.KeySchemas
 		readerOpts.LoadBlockSema = o.LoadBlockSema
 		readerOpts.LoggerAndTracer = o.LoggerAndTracer
 		readerOpts.Merger = o.Merger
@@ -2054,7 +2135,7 @@ func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstab
 	writerOpts.FilterPolicy = levelOpts.FilterPolicy
 	writerOpts.FilterType = levelOpts.FilterType
 	writerOpts.IndexBlockSize = levelOpts.IndexBlockSize
-	writerOpts.KeySchema = o.KeySchema
+	writerOpts.KeySchema = o.KeySchemas[o.KeySchema]
 	writerOpts.AllocatorSizeClasses = o.AllocatorSizeClasses
 	writerOpts.NumDeletionsThreshold = o.Experimental.NumDeletionsThreshold
 	writerOpts.DeletionSizeRatioThreshold = o.Experimental.DeletionSizeRatioThreshold

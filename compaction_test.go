@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/stretchr/testify/require"
@@ -617,7 +616,6 @@ func TestCompaction(t *testing.T) {
 		Comparer:              testkeys.Comparer,
 		DebugCheck:            DebugCheckLevels,
 		FS:                    mem,
-		KeySchema:             colblk.DefaultKeySchema(testkeys.Comparer, 16),
 		L0CompactionThreshold: 8,
 		MemTableSize:          memTableSize,
 	}
@@ -1359,6 +1357,7 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 			},
 			FormatMajorVersion: internalFormatNewest,
 		}).WithFSDefaults()
+		opts.Experimental.EnableDeleteOnlyCompactionExcises = func() bool { return true }
 		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 		return opts, nil
 	}
@@ -1619,6 +1618,7 @@ func TestCompactionTombstones(t *testing.T) {
 					},
 					FormatMajorVersion: internalFormatNewest,
 				}).WithFSDefaults()
+				opts.Experimental.EnableDeleteOnlyCompactionExcises = func() bool { return true }
 				opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 				var err error
 				d, err = runDBDefineCmd(td, opts)
@@ -2104,7 +2104,7 @@ func TestCompactionErrorCleanup(t *testing.T) {
 		require.NoError(t, err)
 
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		for _, k := range keys {
 			require.NoError(t, w.Set([]byte(k), nil))
@@ -2799,7 +2799,7 @@ func TestCompactionErrorStats(t *testing.T) {
 		require.NoError(t, err)
 
 		w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			TableFormat: d.TableFormat(),
 		})
 		for _, k := range keys {
 			require.NoError(t, w.Set([]byte(k), nil))

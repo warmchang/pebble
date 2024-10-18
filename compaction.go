@@ -257,6 +257,10 @@ type compaction struct {
 	// virtual sstables.
 	deletionHints []deleteCompactionHint
 
+	// exciseEnabled is set to true if this is a compactionKindDeleteOnly and
+	// this compaction is allowed to excise files.
+	exciseEnabled bool
+
 	metrics map[int]*LevelMetrics
 
 	pickerMetrics compactionPickerMetrics
@@ -401,6 +405,7 @@ func newDeleteOnlyCompaction(
 	inputs []compactionLevel,
 	beganAt time.Time,
 	hints []deleteCompactionHint,
+	exciseEnabled bool,
 ) *compaction {
 	c := &compaction{
 		kind:          compactionKindDeleteOnly,
@@ -413,6 +418,7 @@ func newDeleteOnlyCompaction(
 		beganAt:       beganAt,
 		inputs:        inputs,
 		deletionHints: hints,
+		exciseEnabled: exciseEnabled,
 	}
 
 	// Set c.smallest, c.largest.
@@ -1773,11 +1779,15 @@ func (d *DB) maybeScheduleCompactionPicker(
 func (d *DB) tryScheduleDeleteOnlyCompaction() {
 	v := d.mu.versions.currentVersion()
 	snapshots := d.mu.snapshots.toSlice()
-	inputs, resolvedHints, unresolvedHints := checkDeleteCompactionHints(d.cmp, v, d.mu.compact.deletionHints, snapshots, d.FormatMajorVersion())
+	// We need to save the value of exciseEnabled in the compaction itself, as
+	// it can change dynamically between now and when the compaction runs.
+	exciseEnabled := d.FormatMajorVersion() >= FormatVirtualSSTables &&
+		d.opts.Experimental.EnableDeleteOnlyCompactionExcises != nil && d.opts.Experimental.EnableDeleteOnlyCompactionExcises()
+	inputs, resolvedHints, unresolvedHints := checkDeleteCompactionHints(d.cmp, v, d.mu.compact.deletionHints, snapshots, exciseEnabled)
 	d.mu.compact.deletionHints = unresolvedHints
 
 	if len(inputs) > 0 {
-		c := newDeleteOnlyCompaction(d.opts, v, inputs, d.timeNow(), resolvedHints)
+		c := newDeleteOnlyCompaction(d.opts, v, inputs, d.timeNow(), resolvedHints, exciseEnabled)
 		d.mu.compact.compactingCount++
 		d.addInProgressCompaction(c)
 		go d.compact(c, nil)
@@ -1941,7 +1951,7 @@ func (h deleteCompactionHint) String() string {
 }
 
 func (h *deleteCompactionHint) canDeleteOrExcise(
-	cmp Compare, m *fileMetadata, snapshots compact.Snapshots, fmv FormatMajorVersion,
+	cmp Compare, m *fileMetadata, snapshots compact.Snapshots, exciseEnabled bool,
 ) deletionHintOverlap {
 	// The file can only be deleted if all of its keys are older than the
 	// earliest tombstone aggregated into the hint. Note that we use
@@ -1990,7 +2000,7 @@ func (h *deleteCompactionHint) canDeleteOrExcise(
 		base.UserKeyExclusive(h.end).CompareUpperBounds(cmp, m.UserKeyBounds().End) >= 0 {
 		return hintDeletesFile
 	}
-	if fmv < FormatVirtualSSTables {
+	if !exciseEnabled {
 		// The file's keys must be completely contained within the hint range; excises
 		// aren't allowed.
 		return hintDoesNotApply
@@ -2015,7 +2025,7 @@ func checkDeleteCompactionHints(
 	v *version,
 	hints []deleteCompactionHint,
 	snapshots compact.Snapshots,
-	fmv FormatMajorVersion,
+	exciseEnabled bool,
 ) (levels []compactionLevel, resolved, unresolved []deleteCompactionHint) {
 	var files map[*fileMetadata]bool
 	var byLevel [numLevels][]*fileMetadata
@@ -2023,7 +2033,8 @@ func checkDeleteCompactionHints(
 	// Delete-only compactions can be quadratic (O(mn)) in terms of runtime
 	// where m = number of files in the delete-only compaction and n = number
 	// of resolved hints. To prevent these from growing unbounded, we cap
-	// the number of hints we resolve for one delete-only compaction.
+	// the number of hints we resolve for one delete-only compaction. This
+	// cap only applies if exciseEnabled == true.
 	const maxHintsPerDeleteOnlyCompaction = 10
 
 	unresolvedHints := hints[:0]
@@ -2071,7 +2082,7 @@ func checkDeleteCompactionHints(
 		//     a b c d e f g h i j k l m n o p q r s t u v w x y z
 
 		if snapshots.Index(h.tombstoneLargestSeqNum) != snapshots.Index(h.fileSmallestSeqNum) ||
-			len(resolvedHints) >= maxHintsPerDeleteOnlyCompaction {
+			(len(resolvedHints) >= maxHintsPerDeleteOnlyCompaction && exciseEnabled) {
 			// Cannot resolve yet.
 			unresolvedHints = append(unresolvedHints, h)
 			continue
@@ -2086,8 +2097,9 @@ func checkDeleteCompactionHints(
 		for l := h.tombstoneLevel + 1; l < numLevels; l++ {
 			overlaps := v.Overlaps(l, base.UserKeyBoundsEndExclusive(h.start, h.end))
 			iter := overlaps.Iter()
+
 			for m := iter.First(); m != nil; m = iter.Next() {
-				doesHintApply := h.canDeleteOrExcise(cmp, m, snapshots, fmv)
+				doesHintApply := h.canDeleteOrExcise(cmp, m, snapshots, exciseEnabled)
 				if m.IsCompacting() || doesHintApply == hintDoesNotApply || files[m] {
 					continue
 				}
@@ -2113,9 +2125,9 @@ func checkDeleteCompactionHints(
 		}
 		if filesDeletedByCurrentHint < 0 {
 			// This hint does not delete a sufficient number of files to warrant
-			// a delete-only compaction at this stage. Add it to unresolvedHints
-			// so it can be re-evaluated later.
-			unresolvedHints = append(unresolvedHints, h)
+			// a delete-only compaction at this stage. Drop it (ie. don't add it
+			// to either resolved or unresolved hints) so it doesn't stick around
+			// forever.
 			continue
 		}
 		// This hint will be resolved and dropped.
@@ -2174,6 +2186,53 @@ func (d *DB) compact(c *compaction, errChannel chan error) {
 	})
 }
 
+// cleanupVersionEdit cleans up any on-disk artifacts that were created
+// for the application of a versionEdit that is no longer going to be applied.
+//
+// d.mu must be held when calling this method.
+func (d *DB) cleanupVersionEdit(ve *versionEdit) {
+	obsoleteFiles := make([]*fileBacking, 0, len(ve.NewFiles))
+	deletedFiles := make(map[base.FileNum]struct{})
+	for key := range ve.DeletedFiles {
+		deletedFiles[key.FileNum] = struct{}{}
+	}
+	for i := range ve.NewFiles {
+		if ve.NewFiles[i].Meta.Virtual {
+			// We handle backing files separately.
+			continue
+		}
+		if _, ok := deletedFiles[ve.NewFiles[i].Meta.FileNum]; ok {
+			// This file is being moved in this ve to a different level.
+			// Don't mark it as obsolete.
+			continue
+		}
+		obsoleteFiles = append(obsoleteFiles, ve.NewFiles[i].Meta.PhysicalMeta().FileBacking)
+	}
+	for i := range ve.CreatedBackingTables {
+		if ve.CreatedBackingTables[i].IsUnused() {
+			obsoleteFiles = append(obsoleteFiles, ve.CreatedBackingTables[i])
+		}
+	}
+	for i := range obsoleteFiles {
+		// Add this file to zombie tables as well, as the versionSet
+		// asserts on whether every obsolete file was at one point
+		// marked zombie.
+		d.mu.versions.zombieTables[obsoleteFiles[i].DiskFileNum] = tableInfo{
+			fileInfo: fileInfo{
+				FileNum:  obsoleteFiles[i].DiskFileNum,
+				FileSize: obsoleteFiles[i].Size,
+			},
+			// TODO(bilal): This is harmless if it's wrong, as it only causes
+			// incorrect accounting for the size of it in metrics. Currently
+			// all compactions only write to local files anyway except with
+			// disaggregated storage; if this becomes the norm, we should do
+			// an objprovider lookup here.
+			isLocal: true,
+		}
+	}
+	d.mu.versions.addObsoleteLocked(obsoleteFiles)
+}
+
 // compact1 runs one compaction.
 //
 // d.mu must be held when calling this, but the mutex may be dropped and
@@ -2204,8 +2263,11 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 			// as only the holder of the manifest lock will ever write to it.
 			if c.cancel.Load() {
 				err = firstError(err, ErrCancelledCompaction)
-			}
-			if err != nil {
+				// This is the first time we've seen a cancellation during the
+				// life of this compaction (or the original condition on err == nil
+				// would not have been true). We should delete any tables already
+				// created, as d.runCompaction did not do that.
+				d.cleanupVersionEdit(ve)
 				// logAndApply calls logUnlock. If we didn't call it, we need to call
 				// logUnlock ourselves.
 				d.mu.versions.logUnlock()
@@ -2390,7 +2452,7 @@ func (d *DB) runCopyCompaction(
 			var err error
 			wrote, err = sstable.CopySpan(ctx,
 				src, r.UnsafeReader(), d.opts.MakeReaderOptions(),
-				w, d.opts.MakeWriterOptions(c.outputLevel.level, d.FormatMajorVersion().MaxTableFormat()),
+				w, d.opts.MakeWriterOptions(c.outputLevel.level, d.TableFormat()),
 				start, end,
 			)
 			return err
@@ -2496,6 +2558,7 @@ func (d *DB) runDeleteOnlyCompactionForLevel(
 	ve *versionEdit,
 	snapshots compact.Snapshots,
 	fragments []deleteCompactionHintFragment,
+	exciseEnabled bool,
 ) error {
 	curFragment := 0
 	iter := cl.files.Iter()
@@ -2532,7 +2595,7 @@ func (d *DB) runDeleteOnlyCompactionForLevel(
 					// above it.
 					continue
 				}
-				hintOverlap := h.canDeleteOrExcise(d.cmp, curFile, snapshots, d.FormatMajorVersion())
+				hintOverlap := h.canDeleteOrExcise(d.cmp, curFile, snapshots, exciseEnabled)
 				if hintOverlap == hintDoesNotApply {
 					continue
 				}
@@ -2619,7 +2682,7 @@ func (d *DB) runDeleteOnlyCompaction(
 	}
 	for _, cl := range c.inputs {
 		levelMetrics := &LevelMetrics{}
-		if err := d.runDeleteOnlyCompactionForLevel(cl, levelMetrics, ve, snapshots, fragments); err != nil {
+		if err := d.runDeleteOnlyCompactionForLevel(cl, levelMetrics, ve, snapshots, fragments, c.exciseEnabled); err != nil {
 			return nil, stats, err
 		}
 		c.metrics[cl.level] = levelMetrics
@@ -2735,7 +2798,7 @@ func (d *DB) runCompaction(
 	// The table is typically written at the maximum allowable format implied by
 	// the current format major version of the DB, but Options may define
 	// additional constraints.
-	tableFormat := d.tableFormat()
+	tableFormat := d.TableFormat()
 
 	// Release the d.mu lock while doing I/O.
 	// Note the unusual order: Unlock and then Lock.
@@ -2748,9 +2811,27 @@ func (d *DB) runCompaction(
 	}
 	if result.Err != nil {
 		// Delete any created tables.
+		obsoleteFiles := make([]*fileBacking, 0, len(result.Tables))
+		d.mu.Lock()
 		for i := range result.Tables {
-			_ = d.objProvider.Remove(fileTypeTable, result.Tables[i].ObjMeta.DiskFileNum)
+			backing := &fileBacking{
+				DiskFileNum: result.Tables[i].ObjMeta.DiskFileNum,
+				Size:        result.Tables[i].WriterMeta.Size,
+			}
+			obsoleteFiles = append(obsoleteFiles, backing)
+			// Add this file to zombie tables as well, as the versionSet
+			// asserts on whether every obsolete file was at one point
+			// marked zombie.
+			d.mu.versions.zombieTables[backing.DiskFileNum] = tableInfo{
+				fileInfo: fileInfo{
+					FileNum:  backing.DiskFileNum,
+					FileSize: backing.Size,
+				},
+				isLocal: true,
+			}
 		}
+		d.mu.versions.addObsoleteLocked(obsoleteFiles)
+		d.mu.Unlock()
 	}
 	// Refresh the disk available statistic whenever a compaction/flush
 	// completes, before re-acquiring the mutex.
