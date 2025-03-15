@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/sstable/valblk"
@@ -565,7 +566,7 @@ type bufferedIndexBlock struct {
 	block []byte
 }
 
-// AddWithForceObsolete must be used when writing a strict-obsolete sstable.
+// Add must be used when writing a strict-obsolete sstable.
 //
 // forceObsolete indicates whether the caller has determined that this key is
 // obsolete even though it may be the latest point key for this userkey. This
@@ -576,9 +577,7 @@ type bufferedIndexBlock struct {
 // that strict-obsolete ssts must satisfy. S2, due to RANGEDELs, is solely the
 // responsibility of the caller. S1 is solely the responsibility of the
 // callee.
-func (w *RawRowWriter) AddWithForceObsolete(
-	key InternalKey, value []byte, forceObsolete bool,
-) error {
+func (w *RawRowWriter) Add(key InternalKey, value []byte, forceObsolete bool) error {
 	if w.err != nil {
 		return w.err
 	}
@@ -594,6 +593,15 @@ func (w *RawRowWriter) AddWithForceObsolete(
 		return w.err
 	}
 	return w.addPoint(key, value, forceObsolete)
+}
+
+// AddWithBlobHandle implements the RawWriter interface. This implementation
+// does not support writing blob value handles.
+func (w *RawRowWriter) AddWithBlobHandle(
+	key InternalKey, h blob.InlineHandle, attr base.ShortAttribute, forceObsolete bool,
+) error {
+	w.err = errors.Newf("pebble: blob value handles are not supported in %s", w.tableFormat.String())
+	return w.err
 }
 
 func (w *RawRowWriter) makeAddPointDecisionV2(key InternalKey) error {
