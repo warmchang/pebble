@@ -587,7 +587,7 @@ func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) e
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
 		tmp := kv.K
 		tmp.SetSeqNum(0)
-		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
+		if err := w.Raw().Add(tmp, kv.InPlaceValue(), false); err != nil {
 			return err
 		}
 	}
@@ -677,7 +677,7 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
 		tmp := kv.K
 		tmp.SetSeqNum(0)
-		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
+		if err := w.Raw().Add(tmp, kv.InPlaceValue(), false); err != nil {
 			return err
 		}
 	}
@@ -795,6 +795,15 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 // runDBDefineCmdReuseFS is like runDBDefineCmd, but does not set opts.FS, expecting
 // the caller to have set an appropriate FS already.
 func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) {
+	// Some tests expect that opts is an in-out parameter in that the changes to
+	// opts made here are used later by the caller. But the
+	// ConcurrencyLimitScheduler cannot be reused after the DB is closed. So we
+	// replace it here.
+	scheduler, ok := opts.Experimental.CompactionScheduler.(*ConcurrencyLimitScheduler)
+	if ok && scheduler.isUnregisteredForTesting() {
+		opts.Experimental.CompactionScheduler =
+			NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
+	}
 	opts.EnsureDefaults()
 	if err := parseDBOptionsArgs(opts, td.CmdArgs); err != nil {
 		return nil, err

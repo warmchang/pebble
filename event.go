@@ -115,7 +115,10 @@ type CompactionInfo struct {
 	// always ≥ Duration.
 	TotalDuration time.Duration
 	Done          bool
-	Err           error
+	// Err is set only if Done is true. If non-nil, indicates that the compaction
+	// failed. Note that err can be ErrCancelledCompaction, which can happen
+	// during normal operation.
+	Err error
 
 	SingleLevelOverlappingRatio float64
 	MultiLevelOverlappingRatio  float64
@@ -809,15 +812,6 @@ type EventListener struct {
 	PossibleAPIMisuse func(PossibleAPIMisuseInfo)
 }
 
-func backgroundError(logger Logger, err error) {
-	if errors.Is(err, ErrCancelledCompaction) {
-		// ErrCancelledCompaction is not an unexpected error, hence severity INFO.
-		logger.Infof("background error: %s", err)
-	} else {
-		logger.Errorf("background error: %s", err)
-	}
-}
-
 // EnsureDefaults ensures that background error events are logged to the
 // specified logger if a handler for those events hasn't been otherwise
 // specified. Ensure all handlers are non-nil so that we don't have to check
@@ -826,7 +820,7 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
 	if l.BackgroundError == nil {
 		if logger != nil {
 			l.BackgroundError = func(err error) {
-				backgroundError(logger, err)
+				logger.Errorf("background error: %s", err)
 			}
 		} else {
 			l.BackgroundError = func(error) {}
@@ -915,7 +909,7 @@ func MakeLoggingEventListener(logger Logger) EventListener {
 
 	return EventListener{
 		BackgroundError: func(err error) {
-			backgroundError(logger, err)
+			logger.Errorf("background error: %s", err)
 		},
 		DataCorruption: func(info DataCorruptionInfo) {
 			logger.Errorf("%s", info)
@@ -1150,17 +1144,32 @@ func (r *lowDiskSpaceReporter) findThreshold(
 	return threshold, ok
 }
 
-func (d *DB) reportSSTableCorruption(meta *manifest.TableMetadata, err error) {
+func (d *DB) reportCorruption(meta any, err error) {
+	switch meta := meta.(type) {
+	case *manifest.TableMetadata:
+		d.reportFileCorruption(base.FileTypeTable, meta.FileBacking.DiskFileNum, meta.UserKeyBounds(), err)
+	case *manifest.BlobFileMetadata:
+		// TODO(jackson): Add bounds for blob files.
+		d.reportFileCorruption(base.FileTypeBlob, meta.FileNum, base.UserKeyBounds{}, err)
+	default:
+		panic(fmt.Sprintf("unknown metadata type: %T", meta))
+	}
+}
+
+func (d *DB) reportFileCorruption(
+	fileType base.FileType, fileNum base.DiskFileNum, userKeyBounds base.UserKeyBounds, err error,
+) {
 	if invariants.Enabled && err == nil {
 		panic("nil error")
 	}
-	objMeta, lookupErr := d.objProvider.Lookup(base.FileTypeTable, meta.FileBacking.DiskFileNum)
+
+	objMeta, lookupErr := d.objProvider.Lookup(fileType, fileNum)
 	if lookupErr != nil {
 		// If the object is not known to the provider, it must be a local object
 		// that was missing when we opened the store. Remote objects have their
 		// metadata in a catalog, so even if the backing object is deleted, the
 		// DiskFileNum would still be known.
-		objMeta = objstorage.ObjectMetadata{DiskFileNum: meta.FileBacking.DiskFileNum, FileType: base.FileTypeTable}
+		objMeta = objstorage.ObjectMetadata{DiskFileNum: fileNum, FileType: fileType}
 	}
 	path := d.objProvider.Path(objMeta)
 	if objMeta.IsRemote() {
@@ -1176,7 +1185,7 @@ func (d *DB) reportSSTableCorruption(meta *manifest.TableMetadata, err error) {
 		Path:     path,
 		IsRemote: objMeta.IsRemote(),
 		Locator:  objMeta.Remote.Locator,
-		Bounds:   meta.UserKeyBounds(),
+		Bounds:   userKeyBounds,
 		Details:  err,
 	}
 	d.opts.EventListener.DataCorruption(info)

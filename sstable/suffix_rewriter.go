@@ -343,7 +343,7 @@ func RewriteKeySuffixesViaWriter(
 		if invariants.Enabled && invariants.Sometimes(10) {
 			r.Comparer.ValidateKey.MustValidate(scratch.UserKey)
 		}
-		if err := w.AddWithForceObsolete(scratch, val, false); err != nil {
+		if err := w.Add(scratch, val, false); err != nil {
 			return nil, err
 		}
 		kv = i.Next()
@@ -387,7 +387,7 @@ func readBlockBuf(
 		}
 	}
 
-	decompressedLen, prefix, err := block.DecompressedLen(algo, raw)
+	decompressedLen, err := block.DecompressedLen(algo, raw)
 	if err != nil {
 		return nil, buf, err
 	}
@@ -399,7 +399,7 @@ func readBlockBuf(
 		}
 	}
 	dst := buf[:decompressedLen]
-	err = block.DecompressInto(algo, raw[prefix:], dst)
+	err = block.DecompressInto(algo, raw, dst)
 	return dst, buf, err
 }
 

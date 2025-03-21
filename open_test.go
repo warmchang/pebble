@@ -133,6 +133,8 @@ func TestErrorIfNotPristine(t *testing.T) {
 		ErrorIfNotPristine: true,
 	})
 	defer ensureFilesClosed(t, opts)()
+	// Ensures each DB will create its own CompactionScheduler in Open.
+	opts.Experimental.CompactionScheduler = nil
 
 	d0, err := Open("", opts)
 	require.NoError(t, err)
@@ -332,7 +334,7 @@ func TestNewDBFilenames(t *testing.T) {
 			"LOCK",
 			"MANIFEST-000001",
 			"OPTIONS-000003",
-			"marker.format-version.000007.020",
+			"marker.format-version.000008.021",
 			"marker.manifest.000001.MANIFEST-000001",
 		},
 	}

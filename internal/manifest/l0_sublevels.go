@@ -261,21 +261,10 @@ type L0Sublevels struct {
 	addL0FilesCalled bool
 }
 
-type sublevelSorter []*TableMetadata
-
-// Len implements sort.Interface.
-func (sl sublevelSorter) Len() int {
-	return len(sl)
-}
-
-// Less implements sort.Interface.
-func (sl sublevelSorter) Less(i, j int) bool {
-	return sl[i].minIntervalIndex < sl[j].minIntervalIndex
-}
-
-// Swap implements sort.Interface.
-func (sl sublevelSorter) Swap(i, j int) {
-	sl[i], sl[j] = sl[j], sl[i]
+func sortByMinIntervalIndex(files []*TableMetadata) {
+	slices.SortFunc(files, func(a, b *TableMetadata) int {
+		return stdcmp.Compare(a.minIntervalIndex, b.minIntervalIndex)
+	})
 }
 
 // NewL0Sublevels creates an L0Sublevels instance for a given set of L0 files.
@@ -331,15 +320,14 @@ func NewL0Sublevels(
 	}
 	// Sort each sublevel in increasing key order.
 	for i := range s.levelFiles {
-		sort.Sort(sublevelSorter(s.levelFiles[i]))
+		sortByMinIntervalIndex(s.levelFiles[i])
 	}
 
 	// Construct a parallel slice of sublevel B-Trees.
 	// TODO(jackson): Consolidate and only use the B-Trees.
 	for _, sublevelFiles := range s.levelFiles {
-		tr, ls := makeBTree(cmp, btreeCmpSmallestKey(cmp), sublevelFiles)
+		ls := makeLevelSlice(cmp, btreeCmpSmallestKey(cmp), sublevelFiles)
 		s.Levels = append(s.Levels, ls)
-		tr.Release(ignoreObsoleteFiles{})
 	}
 
 	s.calculateFlushSplitKeys(flushSplitMaxBytes)
@@ -624,13 +612,13 @@ func (s *L0Sublevels) AddL0Files(
 
 	// Sort each updated sublevel in increasing key order.
 	for _, sublevel := range updatedSublevels {
-		sort.Sort(sublevelSorter(newVal.levelFiles[sublevel]))
+		sortByMinIntervalIndex(newVal.levelFiles[sublevel])
 	}
 
 	// Construct a parallel slice of sublevel B-Trees.
 	// TODO(jackson): Consolidate and only use the B-Trees.
 	for _, sublevel := range updatedSublevels {
-		tr, ls := makeBTree(newVal.cmp, btreeCmpSmallestKey(newVal.cmp), newVal.levelFiles[sublevel])
+		ls := makeLevelSlice(newVal.cmp, btreeCmpSmallestKey(newVal.cmp), newVal.levelFiles[sublevel])
 		if sublevel == len(newVal.Levels) {
 			newVal.Levels = append(newVal.Levels, ls)
 		} else {
@@ -638,7 +626,6 @@ func (s *L0Sublevels) AddL0Files(
 			// populated correctly.
 			newVal.Levels[sublevel] = ls
 		}
-		tr.Release(ignoreObsoleteFiles{})
 	}
 
 	newVal.flushSplitUserKeys = nil
