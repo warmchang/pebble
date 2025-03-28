@@ -54,6 +54,18 @@ func BenchmarkRandSeekInSST(b *testing.B) {
 			valueLen: 128,        // ~200 KVs per data block
 			version:  sstable.TableFormatPebblev5,
 		},
+		{
+			name:     "v6/single-level",
+			numKeys:  200 * 100, // ~100 data blocks.
+			valueLen: 128,       // ~200 KVs per data block
+			version:  sstable.TableFormatPebblev6,
+		},
+		{
+			name:     "v6/two-level",
+			numKeys:  200 * 5000, // ~5000 data blocks
+			valueLen: 128,        // ~200 KVs per data block
+			version:  sstable.TableFormatPebblev6,
+		},
 	}
 	keyCfg := keyGenConfig{
 		PrefixAlphabetLen: 26,
@@ -118,9 +130,11 @@ func benchmarkRandSeekInSST(
 	// Iterate through the entire table to warm up the cache.
 	var stats base.InternalIteratorStats
 	rp := sstable.MakeTrivialReaderProvider(reader)
-	iter, err := reader.NewPointIter(
-		ctx, sstable.NoTransforms, nil, nil, nil, sstable.NeverUseFilterBlock,
-		block.ReadEnv{Stats: &stats, IterStats: nil}, rp)
+	iter, err := reader.NewPointIter(ctx, sstable.IterOptions{
+		FilterBlockSizeLimit: sstable.NeverUseFilterBlock,
+		Env:                  block.ReadEnv{Stats: &stats, IterStats: nil},
+		ReaderProvider:       rp,
+	})
 	require.NoError(b, err)
 	n := 0
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
@@ -134,9 +148,11 @@ func benchmarkRandSeekInSST(
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := queryKeys[i%numQueryKeys]
-		iter, err := reader.NewPointIter(
-			ctx, sstable.NoTransforms, nil, nil, nil, sstable.NeverUseFilterBlock,
-			block.ReadEnv{Stats: &stats, IterStats: nil}, rp)
+		iter, err := reader.NewPointIter(ctx, sstable.IterOptions{
+			FilterBlockSizeLimit: sstable.NeverUseFilterBlock,
+			Env:                  block.ReadEnv{Stats: &stats, IterStats: nil},
+			ReaderProvider:       rp,
+		})
 		if err != nil {
 			b.Fatal(err)
 		}

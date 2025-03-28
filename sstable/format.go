@@ -29,6 +29,7 @@ const (
 	TableFormatPebblev3 // Value blocks.
 	TableFormatPebblev4 // DELSIZED tombstones.
 	TableFormatPebblev5 // Columnar blocks.
+	TableFormatPebblev6 // Checksum footer + blob value handles.
 	NumTableFormats
 
 	TableFormatMax = NumTableFormats - 1
@@ -38,6 +39,17 @@ const (
 	// (CockroachDB uses it to read data from backups that could be old).
 	TableFormatMinSupported = TableFormatPebblev1
 )
+
+var footerSizes [NumTableFormats]int = [NumTableFormats]int{
+	TableFormatLevelDB:   levelDBFooterLen,
+	TableFormatRocksDBv2: rocksDBFooterLen,
+	TableFormatPebblev1:  rocksDBFooterLen,
+	TableFormatPebblev2:  rocksDBFooterLen,
+	TableFormatPebblev3:  rocksDBFooterLen,
+	TableFormatPebblev4:  rocksDBFooterLen,
+	TableFormatPebblev5:  rocksDBFooterLen,
+	TableFormatPebblev6:  checkedPebbleDBFooterLen,
+}
 
 // TableFormatPebblev4, in addition to DELSIZED, introduces the use of
 // InternalKeyKindSSTableInternalObsoleteBit.
@@ -236,6 +248,8 @@ func parseTableFormat(magic []byte, version uint32) (TableFormat, error) {
 			return TableFormatPebblev4, nil
 		case 5:
 			return TableFormatPebblev5, nil
+		case 6:
+			return TableFormatPebblev6, nil
 		default:
 			return TableFormatUnspecified, base.CorruptionErrorf(
 				"(unsupported pebble format version %d)", errors.Safe(version))
@@ -250,6 +264,11 @@ func parseTableFormat(magic []byte, version uint32) (TableFormat, error) {
 // data, index and keyspan blocks.
 func (f TableFormat) BlockColumnar() bool {
 	return f >= TableFormatPebblev5
+}
+
+// FooterSize returns the maximum size of the footer for the table format.
+func (f TableFormat) FooterSize() int {
+	return footerSizes[f]
 }
 
 func (f TableFormat) newIndexIter() block.IndexBlockIterator {
@@ -276,6 +295,8 @@ func (f TableFormat) AsTuple() (string, uint32) {
 		return pebbleDBMagic, 4
 	case TableFormatPebblev5:
 		return pebbleDBMagic, 5
+	case TableFormatPebblev6:
+		return pebbleDBMagic, 6
 	default:
 		panic("sstable: unknown table format version tuple")
 	}
@@ -300,6 +321,8 @@ func (f TableFormat) String() string {
 		return "(Pebble,v4)"
 	case TableFormatPebblev5:
 		return "(Pebble,v5)"
+	case TableFormatPebblev6:
+		return "(Pebble,v6)"
 	default:
 		panic("sstable: unknown table format version tuple")
 	}

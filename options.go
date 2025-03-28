@@ -78,12 +78,6 @@ type ShortAttributeExtractor = base.ShortAttributeExtractor
 // UserKeyPrefixBound exports the sstable.UserKeyPrefixBound type.
 type UserKeyPrefixBound = sstable.UserKeyPrefixBound
 
-// CompactionLimiter exports the base.CompactionLimiter type.
-type CompactionLimiter = base.CompactionLimiter
-
-// CompactionSlot exports the base.CompactionSlot type.
-type CompactionSlot = base.CompactionSlot
-
 // IterKeyType configures which types of keys an iterator should surface.
 type IterKeyType int8
 
@@ -666,24 +660,6 @@ type Options struct {
 		// compaction will never get triggered.
 		MultiLevelCompactionHeuristic MultiLevelHeuristic
 
-		// MaxWriterConcurrency is used to indicate the maximum number of
-		// compression workers the compression queue is allowed to use. If
-		// MaxWriterConcurrency > 0, then the Writer will use parallelism, to
-		// compress and write blocks to disk. Otherwise, the writer will
-		// compress and write blocks to disk synchronously.
-		MaxWriterConcurrency int
-
-		// ForceWriterParallelism is used to force parallelism in the sstable
-		// Writer for the metamorphic tests. Even with the MaxWriterConcurrency
-		// option set, we only enable parallelism in the sstable Writer if there
-		// is enough CPU available, and this option bypasses that.
-		ForceWriterParallelism bool
-
-		// CPUWorkPermissionGranter should be set if Pebble should be given the
-		// ability to optionally schedule additional CPU. See the documentation
-		// for CPUWorkPermissionGranter for more details.
-		CPUWorkPermissionGranter CPUWorkPermissionGranter
-
 		// EnableColumnarBlocks is used to decide whether to enable writing
 		// TableFormatPebblev5 sstables. This setting is only respected by
 		// FormatColumnarBlocks. In lower format major versions, the
@@ -757,11 +733,10 @@ type Options struct {
 		// the excise phase of IngestAndExcise.
 		EnableDeleteOnlyCompactionExcises func() bool
 
-		// CompactionLimiter, if set, is used to limit concurrent compactions as well
-		// as to pace compactions and flushing compactions already chosen. If nil,
-		// no limiting or pacing happens other than that controlled by other options
-		// like L0CompactionConcurrency and CompactionDebtConcurrency.
-		CompactionLimiter CompactionLimiter
+		// CompactionScheduler, if set, is used to limit concurrent compactions as
+		// well as to pace compactions already chosen. If nil, a default scheduler
+		// is created and used.
+		CompactionScheduler CompactionScheduler
 
 		UserKeyCategories UserKeyCategories
 	}
@@ -916,13 +891,36 @@ type Options struct {
 	// The default merger concatenates values.
 	Merger *Merger
 
-	// MaxConcurrentCompactions specifies the maximum number of concurrent
-	// compactions (not including download compactions).
+	// MaxConcurrentCompactions is the upper bound on the value returned by
+	// DB.GetAllowedWithoutPermission (reported to the CompactionScheduler).
+	// More abstractly, it is a rough upper bound on the number of concurrent
+	// compactions, not including download compactions (which have a separate
+	// limit specified by MaxConcurrentDownloads).
 	//
-	// Concurrent compactions are performed:
+	// This is a rough upper bound since delete-only compactions (a) do not use
+	// the CompactionScheduler, and (b) the CompactionScheduler may use other
+	// criteria to decide on how many compactions to permit.
+	//
+	// Elaborating on (b), when the ConcurrencyLimitScheduler is being used, the
+	// value returned by DB.GetAllowedWithoutPermission fully controls how many
+	// compactions get to run. Other CompactionSchedulers may use additional
+	// criteria, like resource availability.
+	//
+	// Elaborating on (a), we don't use the CompactionScheduler to schedule
+	// delete-only compactions since they are expected to be almost free from a
+	// CPU and disk usage perspective. Since the CompactionScheduler does not
+	// know about their existence, the total running count can exceed this
+	// value. For example, consider MaxConcurrentCompactions returns 3, and the
+	// current value returned from DB.GetAllowedWithoutPermission is also 3. Say
+	// 3 delete-only compactions are also running. Then the
+	// ConcurrencyLimitScheduler can also start 3 other compactions, for a total
+	// of 6.
+	//
+	// DB.GetAllowedWithoutPermission returns a value in the interval [1,
+	// MaxConcurrentCompactions]. A value > 1 is returned:
 	//  - when L0 read-amplification passes the L0CompactionConcurrency threshold;
-	//  - for automatic background compactions;
-	//  - when a manual compaction for a level is split and parallelized.
+	//  - when compaction debt passes the CompactionDebtConcurrency threshold;
+	//  - when there are multiple manual compactions waiting to run.
 	//
 	// MaxConcurrentCompactions() must be greater than 0.
 	//
@@ -1146,9 +1144,6 @@ func (o *Options) EnsureDefaults() {
 	if o.Experimental.CompactionDebtConcurrency <= 0 {
 		o.Experimental.CompactionDebtConcurrency = 1 << 30 // 1 GB
 	}
-	if o.Experimental.CompactionLimiter == nil {
-		o.Experimental.CompactionLimiter = &base.DefaultCompactionLimiter{}
-	}
 	if o.KeySchema == "" && len(o.KeySchemas) == 0 {
 		ks := colblk.DefaultKeySchema(o.Comparer, 16 /* bundleSize */)
 		o.KeySchema = ks.Name
@@ -1273,9 +1268,6 @@ func (o *Options) EnsureDefaults() {
 	}
 	if o.Experimental.FileCacheShards <= 0 {
 		o.Experimental.FileCacheShards = runtime.GOMAXPROCS(0)
-	}
-	if o.Experimental.CPUWorkPermissionGranter == nil {
-		o.Experimental.CPUWorkPermissionGranter = defaultCPUWorkGranter{}
 	}
 	if o.Experimental.MultiLevelCompactionHeuristic == nil {
 		o.Experimental.MultiLevelCompactionHeuristic = WriteAmpHeuristic{}
@@ -1417,8 +1409,6 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  validate_on_ingest=%t\n", o.Experimental.ValidateOnIngest)
 	fmt.Fprintf(&buf, "  wal_dir=%s\n", o.WALDir)
 	fmt.Fprintf(&buf, "  wal_bytes_per_sync=%d\n", o.WALBytesPerSync)
-	fmt.Fprintf(&buf, "  max_writer_concurrency=%d\n", o.Experimental.MaxWriterConcurrency)
-	fmt.Fprintf(&buf, "  force_writer_parallelism=%t\n", o.Experimental.ForceWriterParallelism)
 	fmt.Fprintf(&buf, "  secondary_cache_size_bytes=%d\n", o.Experimental.SecondaryCacheSizeBytes)
 	fmt.Fprintf(&buf, "  create_on_shared=%d\n", o.Experimental.CreateOnShared)
 
@@ -1817,9 +1807,9 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "wal_bytes_per_sync":
 				o.WALBytesPerSync, err = strconv.Atoi(value)
 			case "max_writer_concurrency":
-				o.Experimental.MaxWriterConcurrency, err = strconv.Atoi(value)
+				// No longer implemented; ignore.
 			case "force_writer_parallelism":
-				o.Experimental.ForceWriterParallelism, err = strconv.ParseBool(value)
+				// No longer implemented; ignore.
 			case "secondary_cache_size_bytes":
 				o.Experimental.SecondaryCacheSizeBytes, err = strconv.ParseInt(value, 10, 64)
 			case "create_on_shared":

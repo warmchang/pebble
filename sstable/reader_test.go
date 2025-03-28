@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/valblk"
 	"github.com/cockroachdb/pebble/vfs"
@@ -357,12 +359,17 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 				}
 			}
 
-			transforms := IterTransforms{
-				SyntheticPrefixAndSuffix: block.MakeSyntheticPrefixAndSuffix(nil, syntheticSuffix),
-			}
-			iter, err := v.NewPointIter(
-				context.Background(), transforms, lower, upper, filterer, NeverUseFilterBlock,
-				block.ReadEnv{Stats: &stats, IterStats: nil}, MakeTrivialReaderProvider(r))
+			iter, err := v.NewPointIter(context.Background(), IterOptions{
+				Transforms: IterTransforms{
+					SyntheticPrefixAndSuffix: block.MakeSyntheticPrefixAndSuffix(nil, syntheticSuffix),
+				},
+				Lower:                lower,
+				Upper:                upper,
+				Filterer:             filterer,
+				FilterBlockSizeLimit: NeverUseFilterBlock,
+				Env:                  block.ReadEnv{Stats: &stats, IterStats: nil},
+				ReaderProvider:       MakeTrivialReaderProvider(r),
+			})
 			if err != nil {
 				return err.Error()
 			}
@@ -764,16 +771,13 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, printVa
 						return "table does not intersect BlockPropertyFilter"
 					}
 				}
-				iter, err := r.NewPointIter(
-					context.Background(),
-					transforms,
-					nil, /* lower */
-					nil, /* upper */
-					filterer,
-					AlwaysUseFilterBlock,
-					block.ReadEnv{Stats: &stats, IterStats: nil},
-					MakeTrivialReaderProvider(r),
-				)
+				iter, err := r.NewPointIter(context.Background(), IterOptions{
+					Transforms:           transforms,
+					Filterer:             filterer,
+					FilterBlockSizeLimit: AlwaysUseFilterBlock,
+					Env:                  block.ReadEnv{Stats: &stats, IterStats: nil},
+					ReaderProvider:       MakeTrivialReaderProvider(r),
+				})
 				if err != nil {
 					return err.Error()
 				}
@@ -1267,17 +1271,16 @@ func TestRandomizedPrefixSuffixRewriter(t *testing.T) {
 		}
 		eReader, err := newReader(f, opts)
 		require.NoError(t, err)
-		iter, err := eReader.newPointIter(
-			context.Background(),
-			block.IterTransforms{
+		iter, err := eReader.newPointIter(context.Background(), IterOptions{
+			Transforms: block.IterTransforms{
 				SyntheticPrefixAndSuffix: block.MakeSyntheticPrefixAndSuffix(syntheticPrefix, syntheticSuffix),
 			},
-			nil, nil, nil,
-			AlwaysUseFilterBlock, block.NoReadEnv,
-			MakeTrivialReaderProvider(eReader), &virtualState{
-				lower: base.MakeInternalKey([]byte("_"), base.SeqNumMax, base.InternalKeyKindSet),
-				upper: base.MakeRangeDeleteSentinelKey([]byte("~~~~~~~~~~~~~~~~")),
-			})
+			FilterBlockSizeLimit: AlwaysUseFilterBlock,
+			ReaderProvider:       MakeTrivialReaderProvider(eReader),
+		}, &virtualState{
+			lower: base.MakeInternalKey([]byte("_"), base.SeqNumMax, base.InternalKeyKindSet),
+			upper: base.MakeRangeDeleteSentinelKey([]byte("~~~~~~~~~~~~~~~~")),
+		})
 		require.NoError(t, err)
 		return iter, func() {
 			require.NoError(t, iter.Close())
@@ -1418,85 +1421,136 @@ func TestReaderChecksumErrors(t *testing.T) {
 		t.Run(fmt.Sprintf("checksum-type=%d", checksumType), func(t *testing.T) {
 			for _, twoLevelIndex := range []bool{false, true} {
 				t.Run(fmt.Sprintf("two-level-index=%t", twoLevelIndex), func(t *testing.T) {
-					mem := vfs.NewMem()
+					for _, corruptionType := range []string{"first-byte", "random-bit"} {
+						t.Run(fmt.Sprintf("corruption-type=%s", corruptionType), func(t *testing.T) {
+							mem := vfs.NewMem()
 
-					{
-						// Create an sstable with 3 data blocks.
-						f, err := mem.Create("test", vfs.WriteCategoryUnspecified)
-						require.NoError(t, err)
+							{
+								// Create an sstable with 3 data blocks.
+								f, err := mem.Create("test", vfs.WriteCategoryUnspecified)
+								require.NoError(t, err)
 
-						const blockSize = 32
-						indexBlockSize := 4096
-						if twoLevelIndex {
-							indexBlockSize = 1
-						}
+								const blockSize = 32
+								indexBlockSize := 4096
+								if twoLevelIndex {
+									indexBlockSize = 1
+								}
 
-						w := NewWriter(objstorageprovider.NewFileWritable(f), WriterOptions{
-							BlockSize:      blockSize,
-							IndexBlockSize: indexBlockSize,
-							Checksum:       checksumType,
+								w := NewWriter(objstorageprovider.NewFileWritable(f), WriterOptions{
+									BlockSize:      blockSize,
+									IndexBlockSize: indexBlockSize,
+									Checksum:       checksumType,
+								})
+								require.NoError(t, w.Set(bytes.Repeat([]byte("a"), blockSize), nil))
+								require.NoError(t, w.Set(bytes.Repeat([]byte("b"), blockSize), nil))
+								require.NoError(t, w.Set(bytes.Repeat([]byte("c"), blockSize), nil))
+								require.NoError(t, w.Close())
+							}
+
+							// Load the layout so that we know the location of the data blocks.
+							var layout *Layout
+							{
+								f, err := mem.Open("test")
+								require.NoError(t, err)
+
+								r, err := newReader(f, ReaderOptions{})
+								require.NoError(t, err)
+								layout, err = r.Layout()
+								require.NoError(t, err)
+								require.EqualValues(t, len(layout.Data), 3)
+								require.NoError(t, r.Close())
+							}
+
+							for _, bh := range layout.Data {
+
+								// Read the sstable and corrupt the first byte or a random bit in
+								// the target data block.
+								orig, err := mem.Open("test")
+								require.NoError(t, err)
+								data, err := io.ReadAll(orig)
+								require.NoError(t, err)
+								require.NoError(t, orig.Close())
+
+								if corruptionType == "first-byte" {
+									data[bh.Offset] ^= 0xff
+								} else {
+									// Corrupt a random bit in the block.
+									r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+									randOffset := r.Uint64N(bh.Length) + bh.Offset
+									randBit := uint(r.IntN(8))
+									data[randOffset] ^= (1 << randBit)
+								}
+
+								corrupted, err := mem.Create("corrupted", vfs.WriteCategoryUnspecified)
+								require.NoError(t, err)
+								_, err = corrupted.Write(data)
+								require.NoError(t, err)
+								require.NoError(t, corrupted.Close())
+
+								// Verify that we encounter a checksum mismatch error while iterating
+								// over the sstable.
+								corrupted, err = mem.Open("corrupted")
+								require.NoError(t, err)
+
+								r, err := newReader(corrupted, ReaderOptions{})
+
+								if corruptionType == "first-byte" {
+									require.NoError(t, err)
+									iter, err := r.NewIter(NoTransforms, nil, nil)
+									require.NoError(t, err)
+									for kv := iter.First(); kv != nil; kv = iter.Next() {
+									}
+									require.Regexp(t, `checksum mismatch`, iter.Error())
+									require.Regexp(t, `checksum mismatch`, iter.Close())
+
+									iter, err = r.NewIter(NoTransforms, nil, nil)
+									require.NoError(t, err)
+									for kv := iter.Last(); kv != nil; kv = iter.Prev() {
+									}
+									require.Regexp(t, `checksum mismatch`, iter.Error())
+									require.Regexp(t, `checksum mismatch`, iter.Close())
+
+									require.NoError(t, r.Close())
+								} else {
+									// Check that the error message has the bit flip message if there was an error.
+									checkBitFlipErr := func(err error) bool {
+										if err != nil {
+											details := errors.GetAllSafeDetails(err)
+											re := regexp.MustCompile(`bit flip found`)
+											for _, d := range details {
+												for _, s := range d.SafeDetails {
+													if re.MatchString(s) {
+														return true
+													}
+												}
+											}
+											require.Fail(t, "expected at least one detail to match bit flip found", err)
+										}
+										return false
+									}
+									if checkBitFlipErr(err) {
+										break
+									}
+									iter, err := r.NewIter(NoTransforms, nil, nil)
+									if checkBitFlipErr(err) {
+										break
+									}
+									for kv := iter.First(); kv != nil; kv = iter.Next() {
+									}
+									if checkBitFlipErr(iter.Error()) && checkBitFlipErr(iter.Close()) {
+									}
+									iter, err = r.NewIter(NoTransforms, nil, nil)
+									if checkBitFlipErr(err) {
+										break
+									}
+									for kv := iter.Last(); kv != nil; kv = iter.Prev() {
+									}
+									if checkBitFlipErr(iter.Error()) && checkBitFlipErr(iter.Close()) {
+									}
+									require.NoError(t, r.Close())
+								}
+							}
 						})
-						require.NoError(t, w.Set(bytes.Repeat([]byte("a"), blockSize), nil))
-						require.NoError(t, w.Set(bytes.Repeat([]byte("b"), blockSize), nil))
-						require.NoError(t, w.Set(bytes.Repeat([]byte("c"), blockSize), nil))
-						require.NoError(t, w.Close())
-					}
-
-					// Load the layout so that we no the location of the data blocks.
-					var layout *Layout
-					{
-						f, err := mem.Open("test")
-						require.NoError(t, err)
-
-						r, err := newReader(f, ReaderOptions{})
-						require.NoError(t, err)
-						layout, err = r.Layout()
-						require.NoError(t, err)
-						require.EqualValues(t, len(layout.Data), 3)
-						require.NoError(t, r.Close())
-					}
-
-					for _, bh := range layout.Data {
-						// Read the sstable and corrupt the first byte in the target data
-						// block.
-						orig, err := mem.Open("test")
-						require.NoError(t, err)
-						data, err := io.ReadAll(orig)
-						require.NoError(t, err)
-						require.NoError(t, orig.Close())
-
-						// Corrupt the first byte in the block.
-						data[bh.Offset] ^= 0xff
-
-						corrupted, err := mem.Create("corrupted", vfs.WriteCategoryUnspecified)
-						require.NoError(t, err)
-						_, err = corrupted.Write(data)
-						require.NoError(t, err)
-						require.NoError(t, corrupted.Close())
-
-						// Verify that we encounter a checksum mismatch error while iterating
-						// over the sstable.
-						corrupted, err = mem.Open("corrupted")
-						require.NoError(t, err)
-
-						r, err := newReader(corrupted, ReaderOptions{})
-						require.NoError(t, err)
-
-						iter, err := r.NewIter(NoTransforms, nil, nil)
-						require.NoError(t, err)
-						for kv := iter.First(); kv != nil; kv = iter.Next() {
-						}
-						require.Regexp(t, `checksum mismatch`, iter.Error())
-						require.Regexp(t, `checksum mismatch`, iter.Close())
-
-						iter, err = r.NewIter(NoTransforms, nil, nil)
-						require.NoError(t, err)
-						for kv := iter.Last(); kv != nil; kv = iter.Prev() {
-						}
-						require.Regexp(t, `checksum mismatch`, iter.Error())
-						require.Regexp(t, `checksum mismatch`, iter.Close())
-
-						require.NoError(t, r.Close())
 					}
 				})
 			}
@@ -1760,7 +1814,7 @@ func buildTestTableWithProvider(
 		value := make([]byte, i%100)
 		key = binary.BigEndian.AppendUint64(key, i)
 		ikey.UserKey = key
-		require.NoError(t, w.AddWithForceObsolete(ikey, value, false /* forceObsolete */))
+		require.NoError(t, w.Add(ikey, value, false /* forceObsolete */))
 	}
 
 	require.NoError(t, w.Close())
@@ -1798,7 +1852,7 @@ func buildBenchmarkTable(
 		binary.BigEndian.PutUint64(key, i+uint64(offset))
 		keys = append(keys, key)
 		ikey.UserKey = key
-		require.NoError(b, w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
+		require.NoError(b, w.Add(ikey, nil, false /* forceObsolete */))
 	}
 
 	if err := w.Close(); err != nil {
@@ -2397,7 +2451,7 @@ func BenchmarkIteratorScanObsolete(b *testing.B) {
 			if i == 0 {
 				forceObsolete = false
 			}
-			require.NoError(b, w.AddWithForceObsolete(
+			require.NoError(b, w.Add(
 				base.MakeInternalKey(key, 0, InternalKeyKindSet), val, forceObsolete))
 		}
 		require.NoError(b, w.Close())
@@ -2444,11 +2498,11 @@ func BenchmarkIteratorScanObsolete(b *testing.B) {
 										b.Fatalf("sstable does not intersect")
 									}
 								}
-								transforms := IterTransforms{HideObsoletePoints: hideObsoletePoints}
-								iter, err := r.NewPointIter(
-									context.Background(), transforms, nil, nil, filterer,
-									AlwaysUseFilterBlock, block.NoReadEnv,
-									MakeTrivialReaderProvider(r))
+								iter, err := r.NewPointIter(context.Background(), IterOptions{
+									Transforms:     IterTransforms{HideObsoletePoints: hideObsoletePoints},
+									Filterer:       filterer,
+									ReaderProvider: MakeTrivialReaderProvider(r),
+								})
 								require.NoError(b, err)
 								b.ResetTimer()
 								for i := 0; i < b.N; i++ {
@@ -2482,4 +2536,72 @@ func newReader(r ReadableFile, o ReaderOptions) (*Reader, error) {
 		return nil, err
 	}
 	return NewReader(context.Background(), readable, o)
+}
+
+// TestReaderReportsCorruption tests that the reader reports corruption when
+// an external file goes missing after obtaining a remote.ObjectReader for it.
+func TestReaderReportsCorruption(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	remoteStorage := remote.NewInMem()
+	settings := objstorageprovider.DefaultSettings(vfs.NewMem(), "")
+	settings.Remote.StorageFactory = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
+		"locator": remoteStorage,
+	})
+	settings.Remote.CreateOnSharedLocator = "locator"
+	settings.Remote.CreateOnShared = remote.CreateOnSharedAll
+	provider, err := objstorageprovider.Open(settings)
+	require.NoError(t, err)
+	defer provider.Close()
+	require.NoError(t, provider.SetCreatorID(1))
+
+	writable, objMeta, err := provider.Create(ctx, base.FileTypeTable, 1, objstorage.CreateOptions{
+		PreferSharedStorage: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, objMeta.Remote.Storage)
+
+	// Create an sst file with multiple data blocks.
+	w := NewWriter(writable, WriterOptions{BlockSize: 1})
+	for i := range 100 {
+		require.NoError(t, w.Set([]byte(fmt.Sprintf("%04d", i)), []byte(fmt.Sprintf("value%04d", i))))
+	}
+	require.NoError(t, w.Close())
+
+	readable, err := provider.OpenForReading(ctx, base.FileTypeTable, 1, objstorage.OpenOptions{})
+	require.NoError(t, err)
+	r, err := NewReader(context.Background(), readable, ReaderOptions{})
+	require.NoError(t, err)
+	defer r.Close()
+
+	var lastReportedCorruption error
+	env := block.ReadEnv{
+		ReportCorruptionFn: func(opaque any, err error) error {
+			lastReportedCorruption = err
+			return errors.Wrap(err, "error passed through ReportCorruptionFn")
+		},
+	}
+	iter, err := r.NewPointIter(context.Background(), IterOptions{
+		Transforms: NoTransforms,
+		Env:        env,
+	})
+	require.NoError(t, err)
+	defer iter.Close()
+	kv := iter.First()
+	require.NotNil(t, kv)
+
+	// Delete all objects from the store and expect to get a corruption error.
+	objects, err := remoteStorage.List("", "")
+	require.NoError(t, err)
+	for _, o := range objects {
+		require.NoError(t, remoteStorage.Delete(o))
+	}
+	for ; kv != nil; kv = iter.Next() {
+	}
+	iterErr := iter.Error()
+	require.ErrorContains(t, iterErr, "error passed through ReportCorruptionFn: in-mem remote storage object does not exist")
+	require.True(t, base.IsCorruptionError(iterErr))
+	require.ErrorContains(t, lastReportedCorruption, "in-mem remote storage object does not exist")
+	require.True(t, base.IsCorruptionError(lastReportedCorruption))
 }

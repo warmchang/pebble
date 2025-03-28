@@ -455,7 +455,7 @@ func TestFinalBlockIsWritten(t *testing.T) {
 						IndexBlockSize: indexBlockSize,
 					})
 					for _, k := range keys[:nk] {
-						if err := w.AddWithForceObsolete(InternalKey{UserKey: []byte(k)}, xxx[:vLen], false /* forceObsolete */); err != nil {
+						if err := w.Add(InternalKey{UserKey: []byte(k)}, xxx[:vLen], false /* forceObsolete */); err != nil {
 							t.Errorf("nk=%d, vLen=%d: set: %v", nk, vLen, err)
 							continue loop
 						}
@@ -624,6 +624,7 @@ func TestReadFooter(t *testing.T) {
 		{strings.Repeat("a", minFooterLen-1), "file size is too small"},
 		{strings.Repeat("a", levelDBFooterLen), "bad magic number"},
 		{strings.Repeat("a", rocksDBFooterLen), "bad magic number"},
+		{strings.Repeat("a", checkedPebbleDBFooterLen), "bad magic number"},
 		{encode(TableFormatLevelDB, 0)[1:], "file size is too small"},
 		{encode(TableFormatRocksDBv2, 0)[1:], "footer too short"},
 		{encode(TableFormatRocksDBv2, block.ChecksumTypeNone), "unsupported checksum type"},

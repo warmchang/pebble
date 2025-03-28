@@ -81,6 +81,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	// Make a copy of the options so that we don't mutate the passed in options.
 	opts = opts.Clone()
 	opts.EnsureDefaults()
+	if opts.Experimental.CompactionScheduler == nil {
+		opts.Experimental.CompactionScheduler = newConcurrencyLimitScheduler(defaultTimeSource{})
+	}
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
@@ -409,7 +412,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 		opts.FileCache = NewFileCache(opts.Experimental.FileCacheShards, fileCacheSize)
 		defer opts.FileCache.Unref()
 	}
-	d.fileCache = opts.FileCache.newHandle(d.cacheHandle, d.objProvider, d.opts.LoggerAndTracer, d.opts.MakeReaderOptions(), d.reportSSTableCorruption)
+	d.fileCache = opts.FileCache.newHandle(d.cacheHandle, d.objProvider, d.opts.LoggerAndTracer, d.opts.MakeReaderOptions(), d.reportCorruption)
 	d.newIters = d.fileCache.newIters
 	d.tableNewRangeKeyIter = tableNewRangeKeyIter(d.newIters)
 
@@ -525,6 +528,10 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	d.mu.versions.visibleSeqNum.Store(d.mu.versions.logSeqNum.Load())
 
+	// Register with the CompactionScheduler before calling
+	// d.maybeScheduleFlush, since completion of the flush can trigger
+	// compactions.
+	d.opts.Experimental.CompactionScheduler.Register(2, d)
 	if !d.opts.ReadOnly {
 		d.maybeScheduleFlush()
 		for d.mu.compact.flushing {

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -171,11 +172,53 @@ func ValidateChecksum(checksumType ChecksumType, b []byte, bh Handle) error {
 		return errors.Errorf("unsupported checksum type: %d", checksumType)
 	}
 	if expectedChecksum != computedChecksum {
-		return base.CorruptionErrorf("block %d/%d: %s checksum mismatch %x != %x",
+		// Check if the checksum was due to a singular bit flip and report it.
+		data := slices.Clone(b[:bh.Length+1])
+		found, indexFound, bitFound := checkSliceForBitFlip(data, checksumType, expectedChecksum)
+		err := base.CorruptionErrorf("block %d/%d: %s checksum mismatch %x != %x",
 			errors.Safe(bh.Offset), errors.Safe(bh.Length), checksumType,
 			expectedChecksum, computedChecksum)
+		if found {
+			err = errors.WithSafeDetails(err, ". bit flip found: byte index %d. got: %x. want: %x.",
+				indexFound, data[indexFound], data[indexFound]^(1<<bitFound))
+		}
+		return err
 	}
 	return nil
+}
+
+func checkSliceForBitFlip(
+	data []byte, checksumType ChecksumType, expectedChecksum uint32,
+) (found bool, indexFound int, bitFound int) {
+	// TODO(edward) This checking process likely can be made faster.
+	iterationLimit := 40 * (1 << 10) // 40KB
+	for i := 0; i < min(len(data), iterationLimit); i++ {
+		foundFlip, bit := checkByteForFlip(data, i, checksumType, expectedChecksum)
+		if foundFlip {
+			return true, i, bit
+		}
+	}
+	return false, 0, 0
+}
+
+func checkByteForFlip(
+	data []byte, i int, checksumType ChecksumType, expectedChecksum uint32,
+) (found bool, bit int) {
+	for bit := 0; bit < 8; bit++ {
+		data[i] ^= (1 << bit)
+		var computedChecksum uint32
+		switch checksumType {
+		case ChecksumTypeCRC32c:
+			computedChecksum = crc.New(data).Value()
+		case ChecksumTypeXXHash64:
+			computedChecksum = uint32(xxhash.Sum64(data))
+		}
+		data[i] ^= (1 << bit)
+		if computedChecksum == expectedChecksum {
+			return true, bit
+		}
+	}
+	return false, 0
 }
 
 // Metadata is an in-memory buffer that stores metadata for a block. It is
@@ -334,8 +377,9 @@ type ReadEnv struct {
 
 	// ReportCorruptionFn is called with ReportCorruptionArg and the error
 	// whenever an SSTable corruption is detected. The argument is used to avoid
-	// allocating a separate function for each object.
-	ReportCorruptionFn  func(opaque any, err error)
+	// allocating a separate function for each object. It returns an error with
+	// more details.
+	ReportCorruptionFn  func(opaque any, err error) error
 	ReportCorruptionArg any
 }
 
@@ -363,10 +407,11 @@ func (env *ReadEnv) BlockRead(blockLength uint64, readDuration time.Duration) {
 
 // maybeReportCorruption calls the ReportCorruptionFn if the given error
 // indicates corruption.
-func (env *ReadEnv) maybeReportCorruption(err error) {
+func (env *ReadEnv) maybeReportCorruption(err error) error {
 	if env.ReportCorruptionFn != nil && base.IsCorruptionError(err) {
-		env.ReportCorruptionFn(env.ReportCorruptionArg, err)
+		return env.ReportCorruptionFn(env.ReportCorruptionArg, err)
 	}
+	return err
 }
 
 // A Reader reads blocks from a single file, handling caching, checksum
@@ -428,8 +473,7 @@ func (r *Reader) Read(
 		}
 		value, err := r.doRead(ctx, env, readHandle, bh, initBlockMetadataFn)
 		if err != nil {
-			env.maybeReportCorruption(err)
-			return BufferHandle{}, err
+			return BufferHandle{}, env.maybeReportCorruption(err)
 		}
 		return value.MakeHandle(), nil
 	}
@@ -447,8 +491,7 @@ func (r *Reader) Read(
 		// to report corruption errors separately, since the ReportCorruptionArg
 		// could be different. In particular, we might read the same physical block
 		// (e.g. an index block) for two different virtual tables.
-		env.maybeReportCorruption(err)
-		return BufferHandle{}, err
+		return BufferHandle{}, env.maybeReportCorruption(err)
 	}
 
 	if cv != nil {
@@ -464,8 +507,7 @@ func (r *Reader) Read(
 	value, err := r.doRead(ctx, env, readHandle, bh, initBlockMetadataFn)
 	if err != nil {
 		crh.SetReadError(err)
-		env.maybeReportCorruption(err)
-		return BufferHandle{}, err
+		return BufferHandle{}, env.maybeReportCorruption(err)
 	}
 	crh.SetReadValue(value.v)
 	return value.MakeHandle(), nil
@@ -537,13 +579,13 @@ func (r *Reader) doRead(
 		decompressed = compressed
 	} else {
 		// Decode the length of the decompressed value.
-		decodedLen, prefixLen, err := DecompressedLen(typ, compressed.BlockData())
+		decodedLen, err := DecompressedLen(typ, compressed.BlockData())
 		if err != nil {
 			compressed.Release()
 			return Value{}, err
 		}
 		decompressed = Alloc(decodedLen, env.BufferPool)
-		err = DecompressInto(typ, compressed.BlockData()[prefixLen:], decompressed.BlockData())
+		err = DecompressInto(typ, compressed.BlockData(), decompressed.BlockData())
 		compressed.Release()
 		if err != nil {
 			decompressed.Release()

@@ -192,6 +192,9 @@ type pickedCompaction struct {
 	score float64
 	// kind indicates the kind of compaction.
 	kind compactionKind
+	// manualID > 0 iff this is a manual compaction. It exists solely for
+	// internal bookkeeping.
+	manualID uint64
 	// startLevel is the level that is being compacted. Inputs from startLevel
 	// and outputLevel will be merged to produce a set of outputLevel files.
 	startLevel *compactionLevel
@@ -1153,6 +1156,44 @@ func responsibleForGarbageBytes(
 	return uint64(totalGarbage) / uint64(useCount)
 }
 
+func (p *compactionPickerByScore) getCompactionConcurrency() int {
+	maxConcurrentCompactions := p.opts.MaxConcurrentCompactions()
+	// Compaction concurrency is controlled by L0 read-amp. We allow one
+	// additional compaction per L0CompactionConcurrency sublevels, as well as
+	// one additional compaction per CompactionDebtConcurrency bytes of
+	// compaction debt. Compaction concurrency is tied to L0 sublevels as that
+	// signal is independent of the database size. We tack on the compaction
+	// debt as a second signal to prevent compaction concurrency from dropping
+	// significantly right after a base compaction finishes, and before those
+	// bytes have been compacted further down the LSM.
+	//
+	// Let n be the number of in-progress compactions.
+	//
+	// l0ReadAmp >= ccSignal1 then can run another compaction, where
+	// ccSignal1 = n * p.opts.Experimental.L0CompactionConcurrency
+	// Rearranging,
+	// n <= l0ReadAmp / p.opts.Experimental.L0CompactionConcurrency.
+	// So we can run up to
+	// l0ReadAmp / p.opts.Experimental.L0CompactionConcurrency + 1 compactions
+	l0ReadAmpCompactions := 1
+	if p.opts.Experimental.L0CompactionConcurrency > 0 {
+		l0ReadAmp := p.vers.L0Sublevels.MaxDepthAfterOngoingCompactions()
+		l0ReadAmpCompactions = (l0ReadAmp / p.opts.Experimental.L0CompactionConcurrency) + 1
+	}
+	// compactionDebt >= ccSignal2 then can run another compaction, where
+	// ccSignal2 = uint64(n) * p.opts.Experimental.CompactionDebtConcurrency
+	// Rearranging,
+	// n <= compactionDebt / p.opts.Experimental.CompactionDebtConcurrency
+	// So we can run up to
+	// compactionDebt / p.opts.Experimental.CompactionDebtConcurrency + 1 compactions.
+	compactionDebtCompactions := 1
+	if p.opts.Experimental.CompactionDebtConcurrency > 0 {
+		compactionDebt := p.estimatedCompactionDebt(0)
+		compactionDebtCompactions = int(compactionDebt/p.opts.Experimental.CompactionDebtConcurrency) + 1
+	}
+	return max(min(maxConcurrentCompactions, max(l0ReadAmpCompactions, compactionDebtCompactions)), 1)
+}
+
 // pickAuto picks the best compaction, if any.
 //
 // On each call, pickAuto computes per-level size adjustments based on
@@ -1163,24 +1204,6 @@ func responsibleForGarbageBytes(
 // If a score-based compaction cannot be found, pickAuto falls back to looking
 // for an elision-only compaction to remove obsolete keys.
 func (p *compactionPickerByScore) pickAuto(env compactionEnv) (pc *pickedCompaction) {
-	// Compaction concurrency is controlled by L0 read-amp. We allow one
-	// additional compaction per L0CompactionConcurrency sublevels, as well as
-	// one additional compaction per CompactionDebtConcurrency bytes of
-	// compaction debt. Compaction concurrency is tied to L0 sublevels as that
-	// signal is independent of the database size. We tack on the compaction
-	// debt as a second signal to prevent compaction concurrency from dropping
-	// significantly right after a base compaction finishes, and before those
-	// bytes have been compacted further down the LSM.
-	if n := len(env.inProgressCompactions); n > 0 {
-		l0ReadAmp := p.vers.L0Sublevels.MaxDepthAfterOngoingCompactions()
-		compactionDebt := p.estimatedCompactionDebt(0)
-		ccSignal1 := n * p.opts.Experimental.L0CompactionConcurrency
-		ccSignal2 := uint64(n) * p.opts.Experimental.CompactionDebtConcurrency
-		if l0ReadAmp < ccSignal1 && compactionDebt < ccSignal2 {
-			return nil
-		}
-	}
-
 	scores := p.calculateLevelScores(env.inProgressCompactions)
 
 	// TODO(bananabrick): Either remove, or change this into an event sent to the
@@ -1459,6 +1482,8 @@ func (p *compactionPickerByScore) pickedCompactionFromCandidateFile(
 	}
 
 	if !pc.setupInputs(p.opts, env.diskAvailBytes, pc.startLevel) {
+		// TODO(radu): do we expect this to happen? (it does seem to happen if I add
+		// a log here).
 		return nil
 	}
 
@@ -1489,6 +1514,9 @@ func (p *compactionPickerByScore) pickElisionOnlyCompaction(
 // necessary. A rewrite compaction outputs files to the same level as
 // the input level.
 func (p *compactionPickerByScore) pickRewriteCompaction(env compactionEnv) (pc *pickedCompaction) {
+	if p.vers.Stats.MarkedForCompaction == 0 {
+		return nil
+	}
 	for l := numLevels - 1; l >= 0; l-- {
 		candidate := markedForCompactionAnnotator.LevelAnnotation(p.vers.Levels[l])
 		if candidate == nil {
@@ -1584,6 +1612,7 @@ func pickAutoLPositive(
 	}
 
 	if !pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel) {
+		opts.Logger.Errorf("%v", base.AssertionFailedf("setupInputs failed"))
 		return nil
 	}
 	return pc.maybeAddLevel(opts, env.diskAvailBytes)
@@ -1714,7 +1743,7 @@ func (wa WriteAmpHeuristic) String() string {
 
 // Helper method to pick compactions originating from L0. Uses information about
 // sublevels to generate a compaction.
-func pickL0(env compactionEnv, opts *Options, vers *version, baseLevel int) (pc *pickedCompaction) {
+func pickL0(env compactionEnv, opts *Options, vers *version, baseLevel int) *pickedCompaction {
 	// It is important to pass information about Lbase files to L0Sublevels
 	// so it can pick a compaction that does not conflict with an Lbase => Lbase+1
 	// compaction. Without this, we observed reduced concurrency of L0=>Lbase
@@ -1722,51 +1751,44 @@ func pickL0(env compactionEnv, opts *Options, vers *version, baseLevel int) (pc 
 	//
 	// TODO(bilal) Remove the minCompactionDepth parameter once fixing it at 1
 	// has been shown to not cause a performance regression.
-	lcf, err := vers.L0Sublevels.PickBaseCompaction(1, vers.Levels[baseLevel].Slice())
-	if err != nil {
-		opts.Logger.Errorf("error when picking base compaction: %s", err)
-		return
-	}
+	lcf := vers.L0Sublevels.PickBaseCompaction(opts.Logger, 1, vers.Levels[baseLevel].Slice())
 	if lcf != nil {
-		pc = newPickedCompactionFromL0(lcf, opts, vers, baseLevel, true)
-		pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel)
-		if pc.startLevel.files.Empty() {
-			opts.Logger.Fatalf("empty compaction chosen")
+		pc := newPickedCompactionFromL0(lcf, opts, vers, baseLevel, true)
+		if pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel) {
+			if pc.startLevel.files.Empty() {
+				opts.Logger.Errorf("%v", base.AssertionFailedf("empty compaction chosen"))
+			}
+			return pc.maybeAddLevel(opts, env.diskAvailBytes)
 		}
-		return pc.maybeAddLevel(opts, env.diskAvailBytes)
+		// TODO(radu): investigate why this happens.
+		// opts.Logger.Errorf("%v", base.AssertionFailedf("setupInputs failed"))
 	}
 
 	// Couldn't choose a base compaction. Try choosing an intra-L0
 	// compaction. Note that we pass in L0CompactionThreshold here as opposed to
 	// 1, since choosing a single sublevel intra-L0 compaction is
 	// counterproductive.
-	lcf, err = vers.L0Sublevels.PickIntraL0Compaction(env.earliestUnflushedSeqNum, minIntraL0Count)
-	if err != nil {
-		opts.Logger.Errorf("error when picking intra-L0 compaction: %s", err)
-		return
-	}
+	lcf = vers.L0Sublevels.PickIntraL0Compaction(env.earliestUnflushedSeqNum, minIntraL0Count)
 	if lcf != nil {
-		pc = newPickedCompactionFromL0(lcf, opts, vers, 0, false)
-		if !pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel) {
-			return nil
-		}
-		if pc.startLevel.files.Empty() {
-			opts.Logger.Fatalf("empty compaction chosen")
-		}
-		{
-			iter := pc.startLevel.files.Iter()
-			if iter.First() == nil || iter.Next() == nil {
-				// A single-file intra-L0 compaction is unproductive.
-				return nil
+		pc := newPickedCompactionFromL0(lcf, opts, vers, 0, false)
+		if pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel) {
+			if pc.startLevel.files.Empty() {
+				opts.Logger.Fatalf("empty compaction chosen")
 			}
+			// A single-file intra-L0 compaction is unproductive.
+			if iter := pc.startLevel.files.Iter(); iter.First() != nil && iter.Next() != nil {
+				pc.smallest, pc.largest = manifest.KeyRange(pc.cmp, pc.startLevel.files.Iter())
+				return pc
+			}
+		} else {
+			// TODO(radu): investigate why this happens.
+			// opts.Logger.Errorf("%v", base.AssertionFailedf("setupInputs failed"))
 		}
-
-		pc.smallest, pc.largest = manifest.KeyRange(pc.cmp, pc.startLevel.files.Iter())
 	}
-	return pc
+	return nil
 }
 
-func pickManualCompaction(
+func newPickedManualCompaction(
 	vers *version, opts *Options, env compactionEnv, baseLevel int, manual *manualCompaction,
 ) (pc *pickedCompaction, retryLater bool) {
 	outputLevel := manual.level + 1
@@ -1790,6 +1812,7 @@ func pickManualCompaction(
 		return nil, true
 	}
 	pc = newPickedCompaction(opts, vers, manual.level, defaultOutputLevel(manual.level, baseLevel), baseLevel)
+	pc.manualID = manual.id
 	manual.outputLevel = pc.outputLevel.level
 	pc.startLevel.files = vers.Overlaps(manual.level, base.UserKeyBoundsInclusive(manual.start, manual.end))
 	if pc.startLevel.files.Empty() {
