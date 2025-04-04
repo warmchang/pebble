@@ -26,7 +26,8 @@ func makeTestVersion(numFiles int) (*Version, []*TableMetadata) {
 	var levelFiles [7][]*TableMetadata
 	levelFiles[6] = files
 
-	v := NewVersion(base.DefaultComparer, 0, levelFiles)
+	l0Organizer := NewL0Organizer(base.DefaultComparer, 0 /* flushSplitBytes */)
+	v := NewVersionForTesting(base.DefaultComparer, l0Organizer, levelFiles)
 	return v, files
 }
 
@@ -163,10 +164,8 @@ func BenchmarkNumFilesRangeAnnotation(b *testing.B) {
 			toDelete := rng.IntN(count)
 			v.Levels[6].tree.Delete(files[toDelete], ignoreObsoleteFiles{})
 
-			overlaps := v.Overlaps(6, b)
-			iter := overlaps.Iter()
 			numFiles := 0
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for range v.Overlaps(6, b).All() {
 				numFiles++
 			}
 

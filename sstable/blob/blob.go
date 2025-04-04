@@ -5,8 +5,10 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -16,7 +18,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/valblk"
-	"github.com/cockroachdb/redact"
 )
 
 var (
@@ -51,6 +52,27 @@ type FileWriterOptions struct {
 	Compression   block.Compression
 	ChecksumType  block.ChecksumType
 	FlushGovernor block.FlushGovernor
+	// Only CPUMeasurer.MeasureCPUBlobFileSecondary is used.
+	CpuMeasurer base.CPUMeasurer
+}
+
+func (o *FileWriterOptions) ensureDefaults() {
+	if o.Compression <= block.DefaultCompression || o.Compression >= block.NCompression {
+		o.Compression = block.SnappyCompression
+	}
+	if o.ChecksumType == block.ChecksumTypeNone {
+		o.ChecksumType = block.ChecksumTypeCRC32c
+	}
+	if o.FlushGovernor == (block.FlushGovernor{}) {
+		o.FlushGovernor = block.MakeFlushGovernor(
+			base.DefaultBlockSize,
+			base.DefaultBlockSizeThreshold,
+			base.SizeClassAwareBlockSizeThreshold,
+			nil)
+	}
+	if o.CpuMeasurer == nil {
+		o.CpuMeasurer = base.NoopCPUMeasurer{}
+	}
 }
 
 // FileWriterStats aggregates statistics about a blob file written by a
@@ -63,23 +85,12 @@ type FileWriterStats struct {
 	FileLen                uint64
 }
 
-// Handle describes the location of a value stored within a blob file.
-type Handle struct {
-	FileNum       base.DiskFileNum
-	BlockNum      uint32
-	OffsetInBlock uint32
-	ValueLen      uint32
-}
-
 // String implements the fmt.Stringer interface.
-func (h Handle) String() string {
-	return redact.StringWithoutMarkers(h)
-}
-
-// SafeFormat implements redact.SafeFormatter.
-func (h Handle) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("(%s,blk%d[%d:%d])",
-		h.FileNum, h.BlockNum, h.OffsetInBlock, h.OffsetInBlock+h.ValueLen)
+func (s FileWriterStats) String() string {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "{BlockCount: %d, ValueCount: %d, BlockLenLongest: %d, UncompressedValueBytes: %d, FileLen: %d}",
+		s.BlockCount, s.ValueCount, s.BlockLenLongest, s.UncompressedValueBytes, s.FileLen)
+	return buf.String()
 }
 
 // A FileWriter writes a blob file.
@@ -92,6 +103,7 @@ type FileWriter struct {
 	blockOffsets []uint64
 	err          error
 	checksumType block.ChecksumType
+	cpuMeasurer  base.CPUMeasurer
 	writeQueue   struct {
 		wg  sync.WaitGroup
 		ch  chan compressedBlock
@@ -107,12 +119,14 @@ type compressedBlock struct {
 
 // NewFileWriter creates a new FileWriter.
 func NewFileWriter(fn base.DiskFileNum, w objstorage.Writable, opts FileWriterOptions) *FileWriter {
+	opts.ensureDefaults()
 	fw := writerPool.Get().(*FileWriter)
 	fw.fileNum = fn
 	fw.w = w
 	fw.b.Init(opts.Compression, opts.ChecksumType)
 	fw.flushGov = opts.FlushGovernor
 	fw.checksumType = opts.ChecksumType
+	fw.cpuMeasurer = opts.CpuMeasurer
 	fw.writeQueue.ch = make(chan compressedBlock)
 	fw.writeQueue.wg.Add(1)
 	go fw.drainWriteQueue()
@@ -141,6 +155,29 @@ func (w *FileWriter) AddValue(v []byte) Handle {
 	}
 }
 
+// EstimatedSize returns an estimate of the disk space consumed by the blob file
+// if it were closed now.
+func (w *FileWriter) EstimatedSize() uint64 {
+	sz := w.stats.FileLen                                    // Completed blocks
+	sz += uint64(w.b.Size()) + block.TrailerLen              // Pending uncompressed block
+	sz += uint64(w.stats.BlockCount+1)*12 + block.TrailerLen // Index block (worst case of 12 bytes per block [4 per integer])
+	sz += fileFooterLength                                   // Footer
+	return sz
+}
+
+// FlushForTesting flushes the current block to the write queue. Writers should
+// generally not call FlushForTesting, and instead let the heuristics configured
+// through FileWriterOptions handle flushing.
+//
+// It's exposed so that tests can force flushes to construct blob files with
+// arbitrary structures.
+func (w *FileWriter) FlushForTesting() {
+	if w.b.Size() == 0 {
+		return
+	}
+	w.flush()
+}
+
 func (w *FileWriter) flush() {
 	pb, bh := w.b.CompressAndChecksum()
 	compressedLen := uint64(pb.LengthWithoutTrailer())
@@ -156,8 +193,13 @@ func (w *FileWriter) flush() {
 // until the channel is closed. All value blocks are written by this goroutine.
 func (w *FileWriter) drainWriteQueue() {
 	defer w.writeQueue.wg.Done()
+	// Call once to initialize the CPU measurer.
+	w.cpuMeasurer.MeasureCPU(base.CompactionGoroutineBlobFileSecondary)
 	for cb := range w.writeQueue.ch {
 		_, err := cb.pb.WriteTo(w.w)
+		// Report to the CPU measurer immediately after writing (note that there
+		// may be a time lag until the next block is available to write).
+		w.cpuMeasurer.MeasureCPU(base.CompactionGoroutineBlobFileSecondary)
 		if err != nil {
 			w.writeQueue.err = err
 			continue
@@ -199,6 +241,9 @@ func (w *FileWriter) Close() (FileWriterStats, error) {
 	if stats.BlockCount != uint32(len(w.blockOffsets)) {
 		panic(errors.AssertionFailedf("block count mismatch: %d vs %d",
 			stats.BlockCount, len(w.blockOffsets)))
+	}
+	if stats.BlockCount == 0 {
+		panic(errors.AssertionFailedf("no blocks written"))
 	}
 
 	// Write the index block.

@@ -98,7 +98,7 @@ func writeSSTForIngestion(
 			return nil, err
 		}
 		t.opts.Comparer.ValidateKey.MustValidate(k.K.UserKey)
-		if err := w.Raw().AddWithForceObsolete(k.K, valBytes, false); err != nil {
+		if err := w.Raw().Add(k.K, valBytes, false); err != nil {
 			return nil, err
 		}
 	}
@@ -274,7 +274,7 @@ func openExternalObj(
 		start = syntheticPrefix.Invert(start)
 		end = syntheticPrefix.Invert(end)
 	}
-	pointIter, err = reader.NewIter(sstable.NoTransforms, start, end)
+	pointIter, err = reader.NewIter(sstable.NoTransforms, start, end, sstable.AssertNoBlobHandles)
 	panicIfErr(err)
 
 	rangeDelIter, err = reader.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)

@@ -89,15 +89,20 @@ func MakeVirtualReader(reader *Reader, p VirtualReaderParams) VirtualReader {
 	v.Properties.RawPointTombstoneKeySize = scale(reader.Properties.RawPointTombstoneKeySize)
 	v.Properties.RawPointTombstoneValueSize = scale(reader.Properties.RawPointTombstoneValueSize)
 
+	v.Properties.CompressionName = reader.Properties.CompressionName
+
 	return v
 }
 
 // NewCompactionIter is the compaction iterator function for virtual readers.
 func (v *VirtualReader) NewCompactionIter(
-	transforms IterTransforms, env block.ReadEnv, rp valblk.ReaderProvider,
+	transforms IterTransforms,
+	env block.ReadEnv,
+	rp valblk.ReaderProvider,
+	blobContext TableBlobContext,
 ) (Iterator, error) {
 	return v.reader.newCompactionIter(
-		transforms, env, rp, &v.vState)
+		transforms, env, rp, &v.vState, blobContext)
 }
 
 // NewPointIter returns an iterator for the point keys in the table.
@@ -109,18 +114,8 @@ func (v *VirtualReader) NewCompactionIter(
 // We assume that the [lower, upper) bounds (if specified) will have at least
 // some overlap with the virtual sstable bounds. No overlap is not currently
 // supported in the iterator.
-func (v *VirtualReader) NewPointIter(
-	ctx context.Context,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-) (Iterator, error) {
-	return v.reader.newPointIter(
-		ctx, transforms, lower, upper, filterer, filterBlockSizeLimit,
-		env, rp, &v.vState)
+func (v *VirtualReader) NewPointIter(ctx context.Context, opts IterOptions) (Iterator, error) {
+	return v.reader.newPointIter(ctx, opts, &v.vState)
 }
 
 // ValidateBlockChecksumsOnBacking will call ValidateBlockChecksumsOnBacking on the underlying reader.

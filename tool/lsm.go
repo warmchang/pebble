@@ -322,11 +322,11 @@ func (l *lsmT) buildEdits(edits []*manifest.VersionEdit) error {
 			}
 		}
 
-		v := manifest.NewVersion(l.cmp, 0, currentFiles)
+		l0Organizer := manifest.NewL0Organizer(l.cmp, 0 /* flushSplitBytes */)
+		v := manifest.NewVersionForTesting(l.cmp, l0Organizer, currentFiles)
 		edit.Sublevels = make(map[base.FileNum]int)
 		for sublevel, files := range v.L0SublevelFiles {
-			iter := files.Iter()
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for f := range files.All() {
 				if len(l.state.Edits) > 0 {
 					lastEdit := l.state.Edits[len(l.state.Edits)-1]
 					if sublevel2, ok := lastEdit.Sublevels[f.FileNum]; ok && sublevel == sublevel2 {

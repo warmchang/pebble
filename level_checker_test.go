@@ -109,7 +109,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 			if err != nil {
 				return iterSet{}, err
 			}
-			iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+			iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 			if err != nil {
 				return iterSet{}, err
 			}
@@ -213,7 +213,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 					j := strings.Index(kv, ":")
 					ikey := base.ParseInternalKey(kv[:j])
 					value := []byte(kv[j+1:])
-					err = w.AddWithForceObsolete(ikey, value, false /* forceObsolete */)
+					err = w.Add(ikey, value, false /* forceObsolete */)
 					if err != nil {
 						return err.Error()
 					}
@@ -279,10 +279,8 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				// Start from level 1 in this test.
 				files[i+1] = levels[i]
 			}
-			version := manifest.NewVersion(
-				testkeys.Comparer,
-				0,
-				files)
+			l0Organizer := manifest.NewL0Organizer(testkeys.Comparer, 0 /* flushSplitBytes */)
+			version := manifest.NewVersionForTesting(testkeys.Comparer, l0Organizer, files)
 			readState := &readState{current: version}
 			c := &checkConfig{
 				comparer:  testkeys.Comparer,

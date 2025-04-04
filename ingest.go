@@ -337,6 +337,10 @@ func ingestLoad1(
 				r.Properties.KeySchemaName)
 		}
 	}
+	if r.Properties.NumValuesInBlobFiles > 0 {
+		return nil, keyspan.Span{}, errors.Newf(
+			"pebble: ingesting tables with blob references is not supported")
+	}
 
 	meta = &tableMetadata{}
 	meta.FileNum = fileNum
@@ -356,7 +360,7 @@ func ingestLoad1(
 	maybeSetStatsFromProperties(meta.PhysicalMeta(), &r.Properties)
 
 	{
-		iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+		iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 		if err != nil {
 			return nil, keyspan.Span{}, err
 		}
@@ -1079,6 +1083,10 @@ func ingestTargetLevel(
 // flushed. The ingested sstable files are moved into the DB and must reside on
 // the same filesystem as the DB. Sstables can be created for ingestion using
 // sstable.Writer. On success, Ingest removes the input paths.
+//
+// Ingested sstables must have been created with a known KeySchema (when written
+// with columnar blocks) and Comparer. They must not contain any references to
+// external blob files.
 //
 // Two types of sstables are accepted for ingestion(s): one is sstables present
 // in the instance's vfs.FS and can be referenced locally. The other is sstables
@@ -2038,6 +2046,8 @@ func (d *DB) ingestApply(
 			}
 		}
 		if err != nil {
+			// No need to invalidate the pickedCompactionCache since the latest
+			// version has not changed.
 			d.mu.versions.logUnlock()
 			return nil, err
 		}
@@ -2093,10 +2103,7 @@ func (d *DB) ingestApply(
 		// for files, and if they are, we should signal those compactions to error
 		// out.
 		for level := range current.Levels {
-			overlaps := current.Overlaps(level, exciseSpan.UserKeyBounds())
-			iter := overlaps.Iter()
-
-			for m := iter.First(); m != nil; m = iter.Next() {
+			for m := range current.Overlaps(level, exciseSpan.UserKeyBounds()).All() {
 				newFiles, err := d.excise(ctx, exciseSpan.UserKeyBounds(), m, ve, level)
 				if err != nil {
 					return nil, err
@@ -2144,8 +2151,7 @@ func (d *DB) ingestApply(
 			// ingestion.
 			if checkCompactions {
 				for i := range c.inputs {
-					iter := c.inputs[i].files.Iter()
-					for f := iter.First(); f != nil; f = iter.Next() {
+					for f := range c.inputs[i].files.All() {
 						if _, ok := replacedFiles[f.FileNum]; ok {
 							c.cancel.Store(true)
 							break

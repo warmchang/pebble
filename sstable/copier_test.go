@@ -53,6 +53,8 @@ func TestCopySpan(t *testing.T) {
 						tableFormat = TableFormatPebblev4
 					case "pebblev5":
 						tableFormat = TableFormatPebblev5
+					case "pebblev6":
+						tableFormat = TableFormatPebblev6
 					}
 				case "block_size":
 					var err error
@@ -124,7 +126,7 @@ func TestCopySpan(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
-			iter, err := r.NewIter(block.NoTransforms, start, end)
+			iter, err := r.NewIter(block.NoTransforms, start, end, AssertNoBlobHandles)
 			if err != nil {
 				return err.Error()
 			}

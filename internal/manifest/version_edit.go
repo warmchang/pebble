@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/strparse"
 	"github.com/cockroachdb/pebble/sstable"
 )
 
@@ -356,8 +357,8 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 			}{}
 			var syntheticPrefix sstable.SyntheticPrefix
 			var syntheticSuffix sstable.SyntheticSuffix
-			var blobReferences []BlobReference
-			var blobReferenceDepth uint64
+			var blobReferences BlobReferences
+			var blobReferenceDepth BlobReferenceDepth
 			if tag == tagNewFile4 || tag == tagNewFile5 {
 				for {
 					customTag, err := d.readUvarint()
@@ -413,10 +414,11 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 					case customTagBlobReferences:
 						// The first varint encodes the 'blob reference depth'
 						// of the table.
-						blobReferenceDepth, err = d.readUvarint()
+						v, err := d.readUvarint()
 						if err != nil {
 							return err
 						}
+						blobReferenceDepth = BlobReferenceDepth(v)
 						n, err := d.readUvarint()
 						if err != nil {
 							return err
@@ -456,7 +458,7 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 				LargestSeqNum:            largestSeqNum,
 				LargestSeqNumAbsolute:    largestSeqNum,
 				BlobReferences:           blobReferences,
-				BlobReferenceDepth:       int(blobReferenceDepth),
+				BlobReferenceDepth:       blobReferenceDepth,
 				MarkedForCompaction:      markedForCompaction,
 				Virtual:                  virtualState.virtual,
 				SyntheticPrefixAndSuffix: sstable.MakeSyntheticPrefixAndSuffix(syntheticPrefix, syntheticSuffix),
@@ -640,7 +642,7 @@ func ParseVersionEditDebug(s string) (_ *VersionEdit, err error) {
 			return nil, errors.Errorf("malformed line %q", l)
 		}
 		field = strings.TrimSpace(field)
-		p := makeDebugParser(value)
+		p := strparse.MakeParser(debugParserSeparators, value)
 		switch field {
 		case "add-table":
 			level := p.Level()
@@ -1148,46 +1150,26 @@ func (b *BulkVersionEdit) Accumulate(ve *VersionEdit) error {
 //
 // curr may be nil, which is equivalent to a pointer to a zero version.
 func (b *BulkVersionEdit) Apply(
-	curr *Version, comparer *base.Comparer, flushSplitBytes int64, readCompactionRate int64,
+	curr *Version, l0Organizer *L0Organizer, readCompactionRate int64,
 ) (*Version, error) {
+	comparer := curr.cmp
 	v := &Version{
 		cmp: comparer,
 	}
 
 	// Adjust the count of files marked for compaction.
-	if curr != nil {
-		v.Stats.MarkedForCompaction = curr.Stats.MarkedForCompaction
-	}
+	v.Stats.MarkedForCompaction = curr.Stats.MarkedForCompaction
 	v.Stats.MarkedForCompaction += b.MarkedForCompactionCountDiff
 	if v.Stats.MarkedForCompaction < 0 {
 		return nil, base.CorruptionErrorf("pebble: version marked for compaction count negative")
 	}
 
 	for level := range v.Levels {
-		if curr == nil || curr.Levels[level].tree.root == nil {
-			v.Levels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
-		} else {
-			v.Levels[level] = curr.Levels[level].clone()
-		}
-		if curr == nil || curr.RangeKeyLevels[level].tree.root == nil {
-			v.RangeKeyLevels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
-		} else {
-			v.RangeKeyLevels[level] = curr.RangeKeyLevels[level].clone()
-		}
+		v.Levels[level] = curr.Levels[level].clone()
+		v.RangeKeyLevels[level] = curr.RangeKeyLevels[level].clone()
 
 		if len(b.AddedTables[level]) == 0 && len(b.DeletedTables[level]) == 0 {
 			// There are no edits on this level.
-			if level == 0 {
-				// Initialize L0Sublevels.
-				if curr == nil || curr.L0Sublevels == nil {
-					if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
-						return nil, errors.Wrap(err, "pebble: internal error")
-					}
-				} else {
-					v.L0Sublevels = curr.L0Sublevels
-					v.L0SublevelFiles = v.L0Sublevels.Levels
-				}
-			}
 			continue
 		}
 
@@ -1265,6 +1247,7 @@ func (b *BulkVersionEdit) Apply(
 			// Track the keys with the smallest and largest keys, so that we can
 			// check consistency of the modified span.
 			if sm == nil || base.InternalCompare(comparer.Compare, sm.Smallest, f.Smallest) > 0 {
+
 				sm = f
 			}
 			if la == nil || base.InternalCompare(comparer.Compare, la.Largest, f.Largest) < 0 {
@@ -1284,37 +1267,6 @@ func (b *BulkVersionEdit) Apply(
 		}
 
 		if level == 0 {
-			if curr != nil && curr.L0Sublevels != nil && len(deletedTablesMap) == 0 {
-				// Flushes and ingestions that do not delete any L0 files do not require
-				// a regeneration of L0Sublevels from scratch. We can instead generate
-				// it incrementally.
-				var err error
-				// AddL0Files requires addedFiles to be sorted in seqnum order.
-				SortBySeqNum(addedTables)
-				v.L0Sublevels, err = curr.L0Sublevels.AddL0Files(addedTables, flushSplitBytes, &v.Levels[0])
-				if errors.Is(err, errInvalidL0SublevelsOpt) {
-					err = v.InitL0Sublevels(flushSplitBytes)
-				} else if invariants.Enabled && err == nil {
-					copyOfSublevels, err := NewL0Sublevels(&v.Levels[0], comparer.Compare, comparer.FormatKey, flushSplitBytes)
-					if err != nil {
-						panic(fmt.Sprintf("error when regenerating sublevels: %s", err))
-					}
-					s1 := describeSublevels(comparer.FormatKey, false /* verbose */, copyOfSublevels.Levels)
-					s2 := describeSublevels(comparer.FormatKey, false /* verbose */, v.L0Sublevels.Levels)
-					if s1 != s2 {
-						// Add verbosity.
-						s1 := describeSublevels(comparer.FormatKey, true /* verbose */, copyOfSublevels.Levels)
-						s2 := describeSublevels(comparer.FormatKey, true /* verbose */, v.L0Sublevels.Levels)
-						panic(fmt.Sprintf("incremental L0 sublevel generation produced different output than regeneration: %s != %s", s1, s2))
-					}
-				}
-				if err != nil {
-					return nil, errors.Wrap(err, "pebble: internal error")
-				}
-				v.L0SublevelFiles = v.L0Sublevels.Levels
-			} else if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
-				return nil, errors.Wrap(err, "pebble: internal error")
-			}
 			if err := CheckOrdering(comparer.Compare, comparer.FormatKey, Level(0), v.Levels[level].Iter()); err != nil {
 				return nil, errors.Wrap(err, "pebble: internal error")
 			}
@@ -1340,6 +1292,9 @@ func (b *BulkVersionEdit) Apply(
 			}
 		}
 	}
+
+	l0Organizer.Update(b.AddedTables[0], b.DeletedTables[0], &v.Levels[0])
+	v.L0SublevelFiles = l0Organizer.SublevelFiles()
 
 	// We maintain stats about active references in blob files and can infer
 	// when a blob file has become a 'zombie,' and is no longer referenced in

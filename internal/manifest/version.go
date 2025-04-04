@@ -8,6 +8,7 @@ import (
 	"bytes"
 	stdcmp "cmp"
 	"fmt"
+	"iter"
 	"slices"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/strparse"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
@@ -236,45 +238,13 @@ type TableMetadata struct {
 	Largest  InternalKey
 	// BlobReferences is a list of blob files containing values that are
 	// referenced by this sstable.
-	BlobReferences []BlobReference
-	// BlobReferenceDepth is an upper bound on the number of blob files that a
-	// reader scanning the table would need to keep open if they only open and
-	// close referenced blob files once. In other words, it's the stack depth of
-	// blob files referenced by this sstable. If a flush or compaction rewrites
-	// an sstable's values to a new blob file, the resulting sstable has a blob
-	// reference depth of 1. When a compaction reuses blob references, the max
-	// blob reference depth of the files in each level is used, and then the
-	// depth is summed, and assigned to the output. This is a loose upper bound
-	// (assuming worst case distribution of keys in all inputs) but avoids
-	// tracking key spans for references and using key comparisons.
-	//
-	// Because the blob reference depth is the size of the working set of blob
-	// files referenced by the table, it cannot exceed the count of distinct
-	// blob file references.
-	//
-	// Example: Consider a compaction of file f0 from L0 and files f1, f2, f3
-	// from L1, where the former has blob reference depth of 1 and files f1, f2,
-	// f3 all happen to have a blob-reference-depth of 1. Say we produce many
-	// output files, one of which is f4. We are assuming here that the blobs
-	// referenced by f0 whose keys happened to be written to f4 are spread all
-	// across the key span of f4. Say keys from f1 and f2 also made their way to
-	// f4. Then we will first have keys that refer to blobs referenced by f1,f0
-	// and at some point once we move past the keys of f1, we will have keys
-	// that refer to blobs referenced by f2,f0. In some sense, we have a working
-	// set of 2 blob files at any point in time, and this is similar to the idea
-	// of level stack depth for reads -- hence we adopt the depth terminology.
-	// We want to keep this stack depth in check, since locality is important,
-	// while allowing it to be higher than 1, since otherwise we will need to
-	// rewrite blob files in every compaction (defeating the write amp benefit
-	// we are looking for). Similar to the level depth, this simplistic analysis
-	// does not take into account distribution of keys involved in the
-	// compaction and which of them have blob references. Also the locality is
-	// actually better than in this analysis because more of the keys will be
-	// from the lower level.
+	BlobReferences BlobReferences
+	// BlobReferenceDepth is the stack depth of blob files referenced by this
+	// sstable. See the comment on the BlobReferenceDepth type for more details.
 	//
 	// INVARIANT: BlobReferenceDepth == 0 iff len(BlobReferences) == 0
 	// INVARIANT: BlobReferenceDepth <= len(BlobReferences)
-	BlobReferenceDepth int
+	BlobReferenceDepth BlobReferenceDepth
 
 	// refs is the reference count for the table, used to determine when a table
 	// is obsolete. When a table's reference count falls to zero, the table is
@@ -297,6 +267,8 @@ type TableMetadata struct {
 
 	// For L0 files only. Protected by DB.mu. Used to generate L0 sublevels and
 	// pick L0 compactions. Only accurate for the most recent Version.
+	// TODO(radu): this is very hacky and fragile. This information should live
+	// inside l0Sublevels.
 	SubLevel         int
 	L0Index          int
 	minIntervalIndex int
@@ -882,6 +854,16 @@ func (m *TableMetadata) DebugString(format base.FormatKey, verbose bool) string 
 	return b.String()
 }
 
+const debugParserSeparators = ":-[]();"
+
+// errFromPanic can be used in a recover block to convert panics into errors.
+func errFromPanic(r any) error {
+	if err, ok := r.(error); ok {
+		return err
+	}
+	return errors.Errorf("%v", r)
+}
+
 // ParseTableMetadataDebug parses a TableMetadata from its DebugString
 // representation.
 func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
@@ -894,7 +876,7 @@ func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
 	// Input format:
 	//	000000:[a#0,SET-z#0,SET] seqnums:[5-5] points:[...] ranges:[...] size:5
 	m := &TableMetadata{}
-	p := makeDebugParser(s)
+	p := strparse.MakeParser(debugParserSeparators, s)
 	m.FileNum = p.FileNum()
 	var backingNum base.DiskFileNum
 	if p.Peek() == "(" {
@@ -956,7 +938,7 @@ func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
 			p.Expect(";")
 			p.Expect("depth")
 			p.Expect(":")
-			m.BlobReferenceDepth = int(p.Uint64())
+			m.BlobReferenceDepth = BlobReferenceDepth(p.Uint64())
 			p.Expect("]")
 
 		default:
@@ -1062,7 +1044,7 @@ func (m *TableMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
 	// Assert that there's a nonzero blob reference depth if and only if the
 	// table has a nonzero count of blob references. Additionally, the file's
 	// blob reference depth should be bounded by the number of blob references.
-	if (len(m.BlobReferences) == 0) != (m.BlobReferenceDepth == 0) || m.BlobReferenceDepth > len(m.BlobReferences) {
+	if (len(m.BlobReferences) == 0) != (m.BlobReferenceDepth == 0) || m.BlobReferenceDepth > BlobReferenceDepth(len(m.BlobReferences)) {
 		return base.CorruptionErrorf("table %s with %d blob refs but %d blob ref depth",
 			m.FileNum, len(m.BlobReferences), m.BlobReferenceDepth)
 	}
@@ -1141,10 +1123,10 @@ func (m *TableMetadata) cmpSmallestKey(b *TableMetadata, cmp Compare) int {
 
 // KeyRange returns the minimum smallest and maximum largest internalKey for
 // all the TableMetadata in iters.
-func KeyRange(ucmp Compare, iters ...LevelIterator) (smallest, largest InternalKey) {
+func KeyRange(ucmp Compare, iters ...iter.Seq[*TableMetadata]) (smallest, largest InternalKey) {
 	first := true
 	for _, iter := range iters {
-		for meta := iter.First(); meta != nil; meta = iter.Next() {
+		for meta := range iter {
 			if first {
 				first = false
 				smallest, largest = meta.Smallest, meta.Largest
@@ -1194,10 +1176,23 @@ func SortBySmallest(files []*TableMetadata, cmp Compare) {
 // NumLevels is the number of levels a Version contains.
 const NumLevels = 7
 
-// NewVersion constructs a new Version with the provided files. It requires
-// the provided files are already well-ordered. It's intended for testing.
-func NewVersion(
-	comparer *base.Comparer, flushSplitBytes int64, files [NumLevels][]*TableMetadata,
+// NewInitialVersion creates a version with no files. The L0Organizer should be freshly created.
+func NewInitialVersion(comparer *base.Comparer) *Version {
+	v := &Version{
+		cmp: comparer,
+	}
+	for level := range v.Levels {
+		v.Levels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
+		v.RangeKeyLevels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
+	}
+	return v
+}
+
+// NewVersionForTesting constructs a new Version with the provided files. It
+// requires the provided files are already well-ordered. The L0Organizer should
+// be freshly created.
+func NewVersionForTesting(
+	comparer *base.Comparer, l0Organizer *L0Organizer, files [7][]*TableMetadata,
 ) *Version {
 	v := &Version{
 		cmp: comparer,
@@ -1208,7 +1203,7 @@ func NewVersion(
 		// order to test consistency checking, etc. Once we've constructed the
 		// initial B-Tree, we swap out the btreeCmp for the correct one.
 		// TODO(jackson): Adjust or remove the tests and remove this.
-		v.Levels[l].tree, _ = makeBTree(comparer.Compare, btreeCmpSpecificOrder(files[l]), files[l])
+		v.Levels[l].tree = makeBTree(comparer.Compare, btreeCmpSpecificOrder(files[l]), files[l])
 		v.Levels[l].level = l
 		if l == 0 {
 			v.Levels[l].tree.bcmp = btreeCmpSeqNum
@@ -1219,17 +1214,9 @@ func NewVersion(
 			v.Levels[l].totalSize += f.Size
 		}
 	}
-	if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
-		panic(err)
-	}
+	l0Organizer.ResetForTesting(&v.Levels[0])
+	v.L0SublevelFiles = l0Organizer.SublevelFiles()
 	return v
-}
-
-// TestingNewVersion returns a blank Version, used for tests.
-func TestingNewVersion(comparer *base.Comparer) *Version {
-	return &Version{
-		cmp: comparer,
-	}
 }
 
 // Version is a collection of table metadata for on-disk tables at various
@@ -1259,25 +1246,7 @@ func TestingNewVersion(comparer *base.Comparer) *Version {
 type Version struct {
 	refs atomic.Int32
 
-	// The level 0 sstables are organized in a series of sublevels. Similar to
-	// the seqnum invariant in normal levels, there is no internal key in a
-	// higher level table that has both the same user key and a higher sequence
-	// number. Within a sublevel, tables are sorted by their internal key range
-	// and any two tables at the same sublevel do not overlap. Unlike the normal
-	// levels, sublevel n contains older tables (lower sequence numbers) than
-	// sublevel n+1.
-	//
-	// The L0Sublevels struct is mostly used for compaction picking. As most
-	// internal data structures in it are only necessary for compaction picking
-	// and not for iterator creation, the reference to L0Sublevels is nil'd
-	// after this version becomes the non-newest version, to reduce memory
-	// usage.
-	//
-	// L0Sublevels.Levels contains L0 files ordered by sublevels. All the files
-	// in Levels[0] are in L0Sublevels.Levels. L0SublevelFiles is also set to
-	// a reference to that slice, as that slice is necessary for iterator
-	// creation and needs to outlast L0Sublevels.
-	L0Sublevels     *L0Sublevels
+	// L0SublevelFiles contains the L0 sublevels.
 	L0SublevelFiles []LevelSlice
 
 	Levels [NumLevels]LevelMetadata
@@ -1324,9 +1293,9 @@ func describeSublevels(format base.FormatKey, verbose bool, sublevels []LevelSli
 	var buf bytes.Buffer
 	for sublevel := len(sublevels) - 1; sublevel >= 0; sublevel-- {
 		fmt.Fprintf(&buf, "L0.%d:\n", sublevel)
-		sublevels[sublevel].Each(func(f *TableMetadata) {
+		for f := range sublevels[sublevel].All() {
 			fmt.Fprintf(&buf, "  %s\n", f.DebugString(format, verbose))
-		})
+		}
 	}
 	return buf.String()
 }
@@ -1341,8 +1310,7 @@ func (v *Version) string(verbose bool) string {
 			continue
 		}
 		fmt.Fprintf(&buf, "L%d:\n", level)
-		iter := v.Levels[level].Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range v.Levels[level].All() {
 			fmt.Fprintf(&buf, "  %s\n", f.DebugString(v.cmp.FormatKey, verbose))
 		}
 	}
@@ -1350,14 +1318,16 @@ func (v *Version) string(verbose bool) string {
 }
 
 // ParseVersionDebug parses a Version from its DebugString output.
-func ParseVersionDebug(comparer *base.Comparer, flushSplitBytes int64, s string) (*Version, error) {
+func ParseVersionDebug(
+	comparer *base.Comparer, l0Organizer *L0Organizer, s string,
+) (*Version, error) {
 	var files [NumLevels][]*TableMetadata
 	level := -1
 	for _, l := range strings.Split(s, "\n") {
 		if l == "" {
 			continue
 		}
-		p := makeDebugParser(l)
+		p := strparse.MakeParser(debugParserSeparators, l)
 		if l, ok := p.TryLevel(); ok {
 			level = l
 			continue
@@ -1376,7 +1346,7 @@ func ParseVersionDebug(comparer *base.Comparer, flushSplitBytes int64, s string)
 	// partial order that represents newest to oldest. Reverse the order of L0
 	// files to ensure we construct the same sublevels.
 	slices.Reverse(files[0])
-	v := NewVersion(comparer, flushSplitBytes, files)
+	v := NewVersionForTesting(comparer, l0Organizer, files)
 	if err := v.CheckOrdering(); err != nil {
 		return nil, err
 	}
@@ -1459,22 +1429,12 @@ func (v *Version) Next() *Version {
 	return v.next
 }
 
-// InitL0Sublevels initializes the L0Sublevels
-func (v *Version) InitL0Sublevels(flushSplitBytes int64) error {
-	var err error
-	v.L0Sublevels, err = NewL0Sublevels(&v.Levels[0], v.cmp.Compare, v.cmp.FormatKey, flushSplitBytes)
-	if err == nil && v.L0Sublevels != nil {
-		v.L0SublevelFiles = v.L0Sublevels.Levels
-	}
-	return err
-}
-
 // CalculateInuseKeyRanges examines table metadata in levels [level, maxLevel]
 // within bounds [smallest,largest], returning an ordered slice of key ranges
 // that include all keys that exist within levels [level, maxLevel] and within
 // [smallest,largest].
 func (v *Version) CalculateInuseKeyRanges(
-	level, maxLevel int, smallest, largest []byte,
+	l0Organizer *L0Organizer, level, maxLevel int, smallest, largest []byte,
 ) []base.UserKeyBounds {
 	// Use two slices, alternating which one is input and which one is output
 	// as we descend the LSM.
@@ -1484,7 +1444,7 @@ func (v *Version) CalculateInuseKeyRanges(
 	// We use the L0 Sublevels structure to efficiently calculate the merged
 	// in-use key ranges.
 	if level == 0 {
-		output = v.L0Sublevels.InUseKeyRanges(smallest, largest)
+		output = l0Organizer.InUseKeyRanges(smallest, largest)
 		level++
 	}
 
@@ -1605,12 +1565,15 @@ func seekGT(iter *LevelIterator, cmp base.Compare, boundary base.UserKeyBoundary
 // searches among the files. If level is zero, Contains scans the entire
 // level.
 func (v *Version) Contains(level int, m *TableMetadata) bool {
-	iter := v.Levels[level].Iter()
-	if level > 0 {
-		overlaps := v.Overlaps(level, m.UserKeyBounds())
-		iter = overlaps.Iter()
+	if level == 0 {
+		for f := range v.Levels[0].All() {
+			if f == m {
+				return true
+			}
+		}
+		return false
 	}
-	for f := iter.First(); f != nil; f = iter.Next() {
+	for f := range v.Overlaps(level, m.UserKeyBounds()).All() {
 		if f == m {
 			return true
 		}
@@ -1762,9 +1725,6 @@ func (l *VersionList) PushBack(v *Version) {
 	v.next = &l.root
 	v.next.prev = v
 	v.list = l
-	// Let L0Sublevels on the second newest version get GC'd, as it is no longer
-	// necessary. See the comment in Version.
-	v.prev.L0Sublevels = nil
 }
 
 // Remove removes the specified version from the list.

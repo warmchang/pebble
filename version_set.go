@@ -69,8 +69,12 @@ type versionSet struct {
 	dynamicBaseLevel bool
 
 	// Mutable fields.
-	versions versionList
-	picker   compactionPicker
+	versions    versionList
+	l0Organizer *manifest.L0Organizer
+	picker      compactionPicker
+	// curCompactionConcurrency is updated whenever picker is updated.
+	// INVARIANT: >= 1.
+	curCompactionConcurrency atomic.Int32
 
 	// Not all metrics are kept here. See DB.Metrics().
 	metrics Metrics
@@ -128,6 +132,8 @@ type versionSet struct {
 	writerCond sync.Cond
 	// State for deciding when to write a snapshot. Protected by mu.
 	rotationHelper record.RotationHelper
+
+	pickedCompactionCache pickedCompactionCache
 }
 
 // objectInfo describes an object in object storage (either a sstable or a blob
@@ -154,6 +160,7 @@ func (vs *versionSet) init(
 	vs.cmp = opts.Comparer
 	vs.dynamicBaseLevel = true
 	vs.versions.Init(mu)
+	vs.l0Organizer = manifest.NewL0Organizer(opts.Comparer, opts.FlushSplitBytes)
 	vs.obsoleteFn = vs.addObsoleteLocked
 	vs.zombieTables = make(map[base.DiskFileNum]objectInfo)
 	vs.virtualBackings = manifest.MakeVirtualBackings()
@@ -173,18 +180,15 @@ func (vs *versionSet) create(
 	mu *sync.Mutex,
 ) error {
 	vs.init(dirname, provider, opts, marker, getFormatMajorVersion, mu)
-	var bve bulkVersionEdit
-	newVersion, err := bve.Apply(nil /* curr */, opts.Comparer, opts.FlushSplitBytes, opts.Experimental.ReadCompactionRate)
-	if err != nil {
-		return err
-	}
-	vs.append(newVersion)
+	emptyVersion := manifest.NewInitialVersion(opts.Comparer)
+	vs.append(emptyVersion)
 
-	vs.picker = newCompactionPickerByScore(newVersion, &vs.virtualBackings, vs.opts, nil)
+	vs.setCompactionPicker(
+		newCompactionPickerByScore(emptyVersion, vs.l0Organizer, &vs.virtualBackings, vs.opts, nil))
 	// Note that a "snapshot" version edit is written to the manifest when it is
 	// created.
 	vs.manifestFileNum = vs.getNextDiskFileNum()
-	err = vs.createManifest(vs.dirname, vs.manifestFileNum, vs.minUnflushedLogNum, vs.nextFileNum.Load(), nil /* virtualBackings */)
+	err := vs.createManifest(vs.dirname, vs.manifestFileNum, vs.minUnflushedLogNum, vs.nextFileNum.Load(), nil /* virtualBackings */)
 	if err == nil {
 		if err = vs.manifest.Flush(); err != nil {
 			vs.opts.Logger.Fatalf("MANIFEST flush failed: %v", err)
@@ -233,13 +237,13 @@ func (vs *versionSet) load(
 	// Read the versionEdits in the manifest file.
 	var bve bulkVersionEdit
 	bve.AddedTablesByFileNum = make(map[base.FileNum]*tableMetadata)
-	manifest, err := vs.fs.Open(manifestPath)
+	manifestFile, err := vs.fs.Open(manifestPath)
 	if err != nil {
 		return errors.Wrapf(err, "pebble: could not open manifest file %q for DB %q",
 			errors.Safe(manifestFilename), dirname)
 	}
-	defer manifest.Close()
-	rr := record.NewReader(manifest, 0 /* logNum */)
+	defer manifestFile.Close()
+	rr := record.NewReader(manifestFile, 0 /* logNum */)
 	for {
 		r, err := rr.Next()
 		if err == io.EOF || record.IsInvalidRecord(err) {
@@ -337,11 +341,12 @@ func (vs *versionSet) load(
 		}
 	}
 
-	newVersion, err := bve.Apply(nil, opts.Comparer, opts.FlushSplitBytes, opts.Experimental.ReadCompactionRate)
+	emptyVersion := manifest.NewInitialVersion(opts.Comparer)
+	newVersion, err := bve.Apply(emptyVersion, vs.l0Organizer, opts.Experimental.ReadCompactionRate)
 	if err != nil {
 		return err
 	}
-	newVersion.L0Sublevels.InitCompactingFileInfo(nil /* in-progress compactions */)
+	vs.l0Organizer.InitCompactingFileInfo(nil /* in-progress compactions */)
 	vs.append(newVersion)
 
 	for i := range vs.metrics.Levels {
@@ -351,8 +356,7 @@ func (vs *versionSet) load(
 		l.Size = int64(files.SizeSum())
 	}
 	for _, l := range newVersion.Levels {
-		iter := l.Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range l.All() {
 			if !f.Virtual {
 				_, localSize := sizeIfLocal(f.FileBacking, vs.provider)
 				vs.metrics.Table.Local.LiveSize = uint64(int64(vs.metrics.Table.Local.LiveSize) + localSize)
@@ -364,7 +368,8 @@ func (vs *versionSet) load(
 		vs.metrics.Table.Local.LiveSize = uint64(int64(vs.metrics.Table.Local.LiveSize) + localSize)
 	})
 
-	vs.picker = newCompactionPickerByScore(newVersion, &vs.virtualBackings, vs.opts, nil)
+	vs.setCompactionPicker(
+		newCompactionPickerByScore(newVersion, vs.l0Organizer, &vs.virtualBackings, vs.opts, nil))
 	return nil
 }
 
@@ -408,6 +413,11 @@ func (vs *versionSet) logUnlock() {
 	vs.writerCond.Signal()
 }
 
+func (vs *versionSet) logUnlockAndInvalidatePickedCompactionCache() {
+	vs.pickedCompactionCache.invalidate()
+	vs.logUnlock()
+}
+
 // logAndApply logs the version edit to the manifest, applies the version edit
 // to the current version, and installs the new version.
 //
@@ -440,7 +450,7 @@ func (vs *versionSet) logAndApply(
 	if !vs.writing {
 		vs.opts.Logger.Fatalf("MANIFEST not locked for writing")
 	}
-	defer vs.logUnlock()
+	defer vs.logUnlockAndInvalidatePickedCompactionCache()
 
 	if ve.MinUnflushedLogNum != 0 {
 		if ve.MinUnflushedLogNum < vs.minUnflushedLogNum ||
@@ -564,7 +574,7 @@ func (vs *versionSet) logAndApply(
 			return errors.Wrap(err, "MANIFEST accumulate failed")
 		}
 		newVersion, err = b.Apply(
-			currentVersion, vs.cmp, vs.opts.FlushSplitBytes, vs.opts.Experimental.ReadCompactionRate,
+			currentVersion, vs.l0Organizer, vs.opts.Experimental.ReadCompactionRate,
 		)
 		if err != nil {
 			return errors.Wrap(err, "MANIFEST apply failed")
@@ -632,7 +642,7 @@ func (vs *versionSet) logAndApply(
 	// L0Sublevels.
 	inProgress := inProgressCompactions()
 
-	newVersion.L0Sublevels.InitCompactingFileInfo(inProgressL0Compactions(inProgress))
+	vs.l0Organizer.InitCompactingFileInfo(inProgressL0Compactions(inProgress))
 
 	// Update the zombie tables set first, as installation of the new version
 	// will unref the previous version which could result in addObsoleteLocked
@@ -711,11 +721,17 @@ func (vs *versionSet) logAndApply(
 	vs.metrics.Levels[0].Sublevels = int32(len(newVersion.L0SublevelFiles))
 	vs.metrics.Table.Local.LiveSize = uint64(int64(vs.metrics.Table.Local.LiveSize) + localLiveSizeDelta)
 
-	vs.picker = newCompactionPickerByScore(newVersion, &vs.virtualBackings, vs.opts, inProgress)
+	vs.setCompactionPicker(
+		newCompactionPickerByScore(newVersion, vs.l0Organizer, &vs.virtualBackings, vs.opts, inProgress))
 	if !vs.dynamicBaseLevel {
 		vs.picker.forceBaseLevel1()
 	}
 	return nil
+}
+
+func (vs *versionSet) setCompactionPicker(picker *compactionPickerByScore) {
+	vs.picker = picker
+	vs.curCompactionConcurrency.Store(int32(picker.getCompactionConcurrency()))
 }
 
 type fileBackingInfo struct {
@@ -908,8 +924,7 @@ func (vs *versionSet) createManifest(
 	}
 
 	for level, levelMetadata := range vs.currentVersion().Levels {
-		iter := levelMetadata.Iter()
-		for meta := iter.First(); meta != nil; meta = iter.Next() {
+		for meta := range levelMetadata.All() {
 			snapshot.NewTables = append(snapshot.NewTables, newTableEntry{
 				Level: level,
 				Meta:  meta,
@@ -988,8 +1003,7 @@ func (vs *versionSet) append(v *version) {
 		// Verify that the virtualBackings contains all the backings referenced by
 		// the version.
 		for _, l := range v.Levels {
-			iter := l.Iter()
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for f := range l.All() {
 				if f.Virtual {
 					if _, ok := vs.virtualBackings.Get(f.FileBacking.DiskFileNum); !ok {
 						panic(fmt.Sprintf("%s is not in virtualBackings", f.FileBacking.DiskFileNum))
@@ -1008,8 +1022,7 @@ func (vs *versionSet) addLiveFileNums(m map[base.DiskFileNum]struct{}) {
 	current := vs.currentVersion()
 	for v := vs.versions.Front(); true; v = v.Next() {
 		for _, lm := range v.Levels {
-			iter := lm.Iter()
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for f := range lm.All() {
 				m[f.FileBacking.DiskFileNum] = struct{}{}
 			}
 		}

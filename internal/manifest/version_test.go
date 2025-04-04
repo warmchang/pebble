@@ -84,7 +84,7 @@ func TestIkeyRange(t *testing.T) {
 		}
 		levelMetadata := MakeLevelMetadata(base.DefaultComparer.Compare, 0, f)
 
-		sm, la := KeyRange(base.DefaultComparer.Compare, levelMetadata.Iter())
+		sm, la := KeyRange(base.DefaultComparer.Compare, levelMetadata.All())
 		got := string(sm.UserKey) + "-" + string(la.UserKey)
 		if got != tc.want {
 			t.Errorf("KeyRange(%q) = %q, %q", tc.input, got, tc.want)
@@ -98,7 +98,8 @@ func TestOverlaps(t *testing.T) {
 		switch d.Cmd {
 		case "define":
 			var err error
-			v, err = ParseVersionDebug(testkeys.Comparer, 64*1024 /* flush split bytes */, d.Input)
+			l0Organizer := NewL0Organizer(base.DefaultComparer, 64*1024 /* flushSplitBytes */)
+			v, err = ParseVersionDebug(testkeys.Comparer, l0Organizer, d.Input)
 			if err != nil {
 				return err.Error()
 			}
@@ -114,9 +115,9 @@ func TestOverlaps(t *testing.T) {
 			overlaps := v.Overlaps(level, base.UserKeyBoundsEndExclusiveIf([]byte(start), []byte(end), exclusiveEnd))
 			var buf bytes.Buffer
 			fmt.Fprintf(&buf, "%d files:\n", overlaps.Len())
-			overlaps.Each(func(f *TableMetadata) {
+			for f := range overlaps.All() {
 				fmt.Fprintf(&buf, "%s\n", f.DebugString(base.DefaultFormatter, false))
-			})
+			}
 			return buf.String()
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -292,17 +293,18 @@ func TestCheckOrdering(t *testing.T) {
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "check-ordering":
-				v, err := ParseVersionDebug(base.DefaultComparer, 10*1024*1024, d.Input)
+				l0Organizer := NewL0Organizer(base.DefaultComparer, 10*1024*1024 /* flushSplitBytes */)
+				v, err := ParseVersionDebug(base.DefaultComparer, l0Organizer, d.Input)
 				if err != nil {
 					return err.Error()
 				}
 				// L0 files compare on sequence numbers. Use the seqnums from the
 				// smallest / largest bounds for the table.
-				v.Levels[0].Slice().Each(func(m *TableMetadata) {
+				for m := range v.Levels[0].All() {
 					m.SmallestSeqNum = m.Smallest.SeqNum()
 					m.LargestSeqNum = m.Largest.SeqNum()
 					m.LargestSeqNumAbsolute = m.LargestSeqNum
-				})
+				}
 				if err = v.CheckOrdering(); err != nil {
 					return err.Error()
 				}
@@ -436,14 +438,6 @@ func TestTableMetadata_ParseRoundTrip(t *testing.T) {
 }
 
 func TestCalculateInuseKeyRanges(t *testing.T) {
-	newVersion := func(files [NumLevels][]*TableMetadata) *Version {
-		t.Helper()
-		v := NewVersion(base.DefaultComparer, 64*1024, files)
-		if err := v.CheckOrdering(); err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
 	newFileMeta := func(fileNum base.FileNum, size uint64, smallest, largest base.InternalKey) *TableMetadata {
 		m := &TableMetadata{
 			FileNum: fileNum,
@@ -455,7 +449,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 	}
 	tests := []struct {
 		name     string
-		v        *Version
+		levels   [NumLevels][]*TableMetadata
 		level    int
 		depth    int
 		smallest []byte
@@ -464,7 +458,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 	}{
 		{
 			name: "No files in next level",
-			v: newVersion([NumLevels][]*TableMetadata{
+			levels: [NumLevels][]*TableMetadata{
 				1: {
 					newFileMeta(
 						1,
@@ -479,7 +473,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 						base.ParseInternalKey("e.SET.2"),
 					),
 				},
-			}),
+			},
 			level:    1,
 			depth:    2,
 			smallest: []byte("a"),
@@ -491,7 +485,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 		},
 		{
 			name: "No overlapping key ranges",
-			v: newVersion([NumLevels][]*TableMetadata{
+			levels: [NumLevels][]*TableMetadata{
 				1: {
 					newFileMeta(
 						1,
@@ -520,7 +514,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 						base.ParseInternalKey("w.SET.1"),
 					),
 				},
-			}),
+			},
 			level:    1,
 			depth:    2,
 			smallest: []byte("a"),
@@ -534,7 +528,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 		},
 		{
 			name: "First few non-overlapping, followed by overlapping",
-			v: newVersion([NumLevels][]*TableMetadata{
+			levels: [NumLevels][]*TableMetadata{
 				1: {
 					newFileMeta(
 						1,
@@ -575,7 +569,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 						base.ParseInternalKey("w.SET.1"),
 					),
 				},
-			}),
+			},
 			level:    1,
 			depth:    2,
 			smallest: []byte("a"),
@@ -589,7 +583,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 		},
 		{
 			name: "All overlapping",
-			v: newVersion([NumLevels][]*TableMetadata{
+			levels: [NumLevels][]*TableMetadata{
 				1: {
 					newFileMeta(
 						1,
@@ -624,7 +618,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 						base.ParseInternalKey("w.SET.1"),
 					),
 				},
-			}),
+			},
 			level:    1,
 			depth:    2,
 			smallest: []byte("a"),
@@ -636,7 +630,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 		},
 		{
 			name: "Touching ranges",
-			v: newVersion([NumLevels][]*TableMetadata{
+			levels: [NumLevels][]*TableMetadata{
 				1: {
 					newFileMeta(
 						1,
@@ -653,7 +647,7 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 						base.ParseInternalKey("c.SET.1"),
 					),
 				},
-			}),
+			},
 			level:    1,
 			depth:    2,
 			smallest: []byte("a"),
@@ -665,7 +659,13 @@ func TestCalculateInuseKeyRanges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.v.CalculateInuseKeyRanges(tt.level, tt.depth, tt.smallest, tt.largest); !reflect.DeepEqual(got, tt.want) {
+			l0Organizer := NewL0Organizer(base.DefaultComparer, 64*1024 /* flushSplitBytes */)
+			v := NewVersionForTesting(base.DefaultComparer, l0Organizer, tt.levels)
+			if err := v.CheckOrdering(); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := v.CalculateInuseKeyRanges(l0Organizer, tt.level, tt.depth, tt.smallest, tt.largest); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("CalculateInuseKeyRanges() = %v, want %v", got, tt.want)
 			}
 		})
@@ -740,7 +740,8 @@ func TestCalculateInuseKeyRangesRandomized(t *testing.T) {
 				return cmp(a.Smallest.UserKey, b.Smallest.UserKey)
 			})
 		}
-		v := NewVersion(base.DefaultComparer, 64*1024, files)
+		l0Organizer := NewL0Organizer(base.DefaultComparer, 64*1024 /* flushSplitBytes */)
+		v := NewVersionForTesting(base.DefaultComparer, l0Organizer, files)
 		if err := v.CheckOrdering(); err != nil {
 			t.Fatal(err)
 		}
@@ -751,7 +752,7 @@ func TestCalculateInuseKeyRangesRandomized(t *testing.T) {
 			maxWidth := rng.IntN(endKeyspace-s) + 1
 			e := rng.IntN(maxWidth) + s
 			sKey, eKey := makeUserKey(s), makeUserKey(e)
-			keyRanges := v.CalculateInuseKeyRanges(l, NumLevels-1, sKey, eKey)
+			keyRanges := v.CalculateInuseKeyRanges(l0Organizer, l, NumLevels-1, sKey, eKey)
 
 			for level := l; level < NumLevels; level++ {
 				for _, f := range files[level] {

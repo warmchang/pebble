@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
@@ -77,12 +78,6 @@ type ShortAttributeExtractor = base.ShortAttributeExtractor
 
 // UserKeyPrefixBound exports the sstable.UserKeyPrefixBound type.
 type UserKeyPrefixBound = sstable.UserKeyPrefixBound
-
-// CompactionLimiter exports the base.CompactionLimiter type.
-type CompactionLimiter = base.CompactionLimiter
-
-// CompactionSlot exports the base.CompactionSlot type.
-type CompactionSlot = base.CompactionSlot
 
 // IterKeyType configures which types of keys an iterator should surface.
 type IterKeyType int8
@@ -666,24 +661,6 @@ type Options struct {
 		// compaction will never get triggered.
 		MultiLevelCompactionHeuristic MultiLevelHeuristic
 
-		// MaxWriterConcurrency is used to indicate the maximum number of
-		// compression workers the compression queue is allowed to use. If
-		// MaxWriterConcurrency > 0, then the Writer will use parallelism, to
-		// compress and write blocks to disk. Otherwise, the writer will
-		// compress and write blocks to disk synchronously.
-		MaxWriterConcurrency int
-
-		// ForceWriterParallelism is used to force parallelism in the sstable
-		// Writer for the metamorphic tests. Even with the MaxWriterConcurrency
-		// option set, we only enable parallelism in the sstable Writer if there
-		// is enough CPU available, and this option bypasses that.
-		ForceWriterParallelism bool
-
-		// CPUWorkPermissionGranter should be set if Pebble should be given the
-		// ability to optionally schedule additional CPU. See the documentation
-		// for CPUWorkPermissionGranter for more details.
-		CPUWorkPermissionGranter CPUWorkPermissionGranter
-
 		// EnableColumnarBlocks is used to decide whether to enable writing
 		// TableFormatPebblev5 sstables. This setting is only respected by
 		// FormatColumnarBlocks. In lower format major versions, the
@@ -757,11 +734,10 @@ type Options struct {
 		// the excise phase of IngestAndExcise.
 		EnableDeleteOnlyCompactionExcises func() bool
 
-		// CompactionLimiter, if set, is used to limit concurrent compactions as well
-		// as to pace compactions and flushing compactions already chosen. If nil,
-		// no limiting or pacing happens other than that controlled by other options
-		// like L0CompactionConcurrency and CompactionDebtConcurrency.
-		CompactionLimiter CompactionLimiter
+		// CompactionScheduler, if set, is used to limit concurrent compactions as
+		// well as to pace compactions already chosen. If nil, a default scheduler
+		// is created and used.
+		CompactionScheduler CompactionScheduler
 
 		UserKeyCategories UserKeyCategories
 	}
@@ -916,13 +892,36 @@ type Options struct {
 	// The default merger concatenates values.
 	Merger *Merger
 
-	// MaxConcurrentCompactions specifies the maximum number of concurrent
-	// compactions (not including download compactions).
+	// MaxConcurrentCompactions is the upper bound on the value returned by
+	// DB.GetAllowedWithoutPermission (reported to the CompactionScheduler).
+	// More abstractly, it is a rough upper bound on the number of concurrent
+	// compactions, not including download compactions (which have a separate
+	// limit specified by MaxConcurrentDownloads).
 	//
-	// Concurrent compactions are performed:
+	// This is a rough upper bound since delete-only compactions (a) do not use
+	// the CompactionScheduler, and (b) the CompactionScheduler may use other
+	// criteria to decide on how many compactions to permit.
+	//
+	// Elaborating on (b), when the ConcurrencyLimitScheduler is being used, the
+	// value returned by DB.GetAllowedWithoutPermission fully controls how many
+	// compactions get to run. Other CompactionSchedulers may use additional
+	// criteria, like resource availability.
+	//
+	// Elaborating on (a), we don't use the CompactionScheduler to schedule
+	// delete-only compactions since they are expected to be almost free from a
+	// CPU and disk usage perspective. Since the CompactionScheduler does not
+	// know about their existence, the total running count can exceed this
+	// value. For example, consider MaxConcurrentCompactions returns 3, and the
+	// current value returned from DB.GetAllowedWithoutPermission is also 3. Say
+	// 3 delete-only compactions are also running. Then the
+	// ConcurrencyLimitScheduler can also start 3 other compactions, for a total
+	// of 6.
+	//
+	// DB.GetAllowedWithoutPermission returns a value in the interval [1,
+	// MaxConcurrentCompactions]. A value > 1 is returned:
 	//  - when L0 read-amplification passes the L0CompactionConcurrency threshold;
-	//  - for automatic background compactions;
-	//  - when a manual compaction for a level is split and parallelized.
+	//  - when compaction debt passes the CompactionDebtConcurrency threshold;
+	//  - when there are multiple manual compactions waiting to run.
 	//
 	// MaxConcurrentCompactions() must be greater than 0.
 	//
@@ -1037,19 +1036,41 @@ type Options struct {
 	// changing options dynamically?
 	WALMinSyncInterval func() time.Duration
 
+	// The controls below manage deletion pacing, which slows down
+	// deletions when compactions finish or when readers close and
+	// obsolete files must be cleaned up. Rapid deletion of many
+	// files simultaneously can increase disk latency on certain
+	// SSDs, and this functionality helps protect against that.
+
 	// TargetByteDeletionRate is the rate (in bytes per second) at which sstable file
 	// deletions are limited to (under normal circumstances).
-	//
-	// Deletion pacing is used to slow down deletions when compactions finish up
-	// or readers close and newly-obsolete files need cleaning up. Deleting lots
-	// of files at once can cause disk latency to go up on some SSDs, which this
-	// functionality guards against.
 	//
 	// This value is only a best-effort target; the effective rate can be
 	// higher if deletions are falling behind or disk space is running low.
 	//
 	// Setting this to 0 disables deletion pacing, which is also the default.
 	TargetByteDeletionRate int
+
+	// FreeSpaceThresholdBytes specifies the minimum amount of free disk space that Pebble
+	// attempts to maintain. If free disk space drops below this threshold, deletions
+	// are accelerated above TargetByteDeletionRate until the threshold is restored.
+	// Default is 16GB.
+	FreeSpaceThresholdBytes uint64
+
+	// FreeSpaceTimeframe sets the duration (in seconds) within which Pebble attempts
+	// to restore the free disk space back to FreeSpaceThreshold. A lower value means
+	// more aggressive deletions. Default is 10s.
+	FreeSpaceTimeframe time.Duration
+
+	// ObsoleteBytesMaxRatio specifies the maximum allowed ratio of obsolete files to
+	// live files. If this ratio is exceeded, Pebble speeds up deletions above the
+	// TargetByteDeletionRate until the ratio is restored. Default is 0.20.
+	ObsoleteBytesMaxRatio float64
+
+	// ObsoleteBytesTimeframe sets the duration (in seconds) within which Pebble aims
+	// to restore the obsolete-to-live bytes ratio below ObsoleteBytesMaxRatio. A lower
+	// value means more aggressive deletions. Default is 300s.
+	ObsoleteBytesTimeframe time.Duration
 
 	// EnableSQLRowSpillMetrics specifies whether the Pebble instance will only be used
 	// to temporarily persist data spilled to disk for row-oriented SQL query execution.
@@ -1137,6 +1158,22 @@ func (o *Options) EnsureDefaults() {
 		o.Cleaner = DeleteCleaner{}
 	}
 
+	if o.FreeSpaceThresholdBytes == 0 {
+		o.FreeSpaceThresholdBytes = 16 << 30 // 16 GB
+	}
+
+	if o.FreeSpaceTimeframe == 0 {
+		o.FreeSpaceTimeframe = 10 * time.Second
+	}
+
+	if o.ObsoleteBytesMaxRatio == 0 {
+		o.ObsoleteBytesMaxRatio = 0.20
+	}
+
+	if o.ObsoleteBytesTimeframe == 0 {
+		o.ObsoleteBytesTimeframe = 300 * time.Second
+	}
+
 	if o.Experimental.DisableIngestAsFlushable == nil {
 		o.Experimental.DisableIngestAsFlushable = func() bool { return false }
 	}
@@ -1145,9 +1182,6 @@ func (o *Options) EnsureDefaults() {
 	}
 	if o.Experimental.CompactionDebtConcurrency <= 0 {
 		o.Experimental.CompactionDebtConcurrency = 1 << 30 // 1 GB
-	}
-	if o.Experimental.CompactionLimiter == nil {
-		o.Experimental.CompactionLimiter = &base.DefaultCompactionLimiter{}
 	}
 	if o.KeySchema == "" && len(o.KeySchemas) == 0 {
 		ks := colblk.DefaultKeySchema(o.Comparer, 16 /* bundleSize */)
@@ -1274,9 +1308,6 @@ func (o *Options) EnsureDefaults() {
 	if o.Experimental.FileCacheShards <= 0 {
 		o.Experimental.FileCacheShards = runtime.GOMAXPROCS(0)
 	}
-	if o.Experimental.CPUWorkPermissionGranter == nil {
-		o.Experimental.CPUWorkPermissionGranter = defaultCPUWorkGranter{}
-	}
 	if o.Experimental.MultiLevelCompactionHeuristic == nil {
 		o.Experimental.MultiLevelCompactionHeuristic = WriteAmpHeuristic{}
 	}
@@ -1401,6 +1432,10 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  mem_table_size=%d\n", o.MemTableSize)
 	fmt.Fprintf(&buf, "  mem_table_stop_writes_threshold=%d\n", o.MemTableStopWritesThreshold)
 	fmt.Fprintf(&buf, "  min_deletion_rate=%d\n", o.TargetByteDeletionRate)
+	fmt.Fprintf(&buf, "  free_space_threshold_bytes=%d\n", o.FreeSpaceThresholdBytes)
+	fmt.Fprintf(&buf, "  free_space_timeframe=%s\n", o.FreeSpaceTimeframe.String())
+	fmt.Fprintf(&buf, "  obsolete_bytes_max_ratio=%f\n", o.ObsoleteBytesMaxRatio)
+	fmt.Fprintf(&buf, "  obsolete_bytes_timeframe=%s\n", o.ObsoleteBytesTimeframe.String())
 	fmt.Fprintf(&buf, "  merger=%s\n", o.Merger.Name)
 	if o.Experimental.MultiLevelCompactionHeuristic != nil {
 		fmt.Fprintf(&buf, "  multilevel_compaction_heuristic=%s\n", o.Experimental.MultiLevelCompactionHeuristic.String())
@@ -1417,8 +1452,6 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  validate_on_ingest=%t\n", o.Experimental.ValidateOnIngest)
 	fmt.Fprintf(&buf, "  wal_dir=%s\n", o.WALDir)
 	fmt.Fprintf(&buf, "  wal_bytes_per_sync=%d\n", o.WALBytesPerSync)
-	fmt.Fprintf(&buf, "  max_writer_concurrency=%d\n", o.Experimental.MaxWriterConcurrency)
-	fmt.Fprintf(&buf, "  force_writer_parallelism=%t\n", o.Experimental.ForceWriterParallelism)
 	fmt.Fprintf(&buf, "  secondary_cache_size_bytes=%d\n", o.Experimental.SecondaryCacheSizeBytes)
 	fmt.Fprintf(&buf, "  create_on_shared=%d\n", o.Experimental.CreateOnShared)
 
@@ -1739,6 +1772,14 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				// may be meaningful again eventually.
 			case "min_deletion_rate":
 				o.TargetByteDeletionRate, err = strconv.Atoi(value)
+			case "free_space_threshold_bytes":
+				o.FreeSpaceThresholdBytes, err = strconv.ParseUint(value, 10, 64)
+			case "free_space_timeframe":
+				o.FreeSpaceTimeframe, err = time.ParseDuration(value)
+			case "obsolete_bytes_max_ratio":
+				o.ObsoleteBytesMaxRatio, err = strconv.ParseFloat(value, 64)
+			case "obsolete_bytes_timeframe":
+				o.ObsoleteBytesTimeframe, err = time.ParseDuration(value)
 			case "min_flush_rate":
 				// Do nothing; option existed in older versions of pebble, and
 				// may be meaningful again eventually.
@@ -1817,9 +1858,9 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "wal_bytes_per_sync":
 				o.WALBytesPerSync, err = strconv.Atoi(value)
 			case "max_writer_concurrency":
-				o.Experimental.MaxWriterConcurrency, err = strconv.Atoi(value)
+				// No longer implemented; ignore.
 			case "force_writer_parallelism":
-				o.Experimental.ForceWriterParallelism, err = strconv.ParseBool(value)
+				// No longer implemented; ignore.
 			case "secondary_cache_size_bytes":
 				o.Experimental.SecondaryCacheSizeBytes, err = strconv.ParseInt(value, 10, 64)
 			case "create_on_shared":
@@ -2086,6 +2127,22 @@ func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstab
 	writerOpts.NumDeletionsThreshold = o.Experimental.NumDeletionsThreshold
 	writerOpts.DeletionSizeRatioThreshold = o.Experimental.DeletionSizeRatioThreshold
 	return writerOpts
+}
+
+// MakeBlobWriterOptions constructs blob.FileWriterOptions from the corresponding
+// options in the receiver.
+func (o *Options) MakeBlobWriterOptions(level int) blob.FileWriterOptions {
+	lo := o.Level(level)
+	return blob.FileWriterOptions{
+		Compression:  resolveDefaultCompression(lo.Compression()),
+		ChecksumType: block.ChecksumTypeCRC32c,
+		FlushGovernor: block.MakeFlushGovernor(
+			lo.BlockSize,
+			lo.BlockSizeThreshold,
+			base.SizeClassAwareBlockSizeThreshold,
+			o.AllocatorSizeClasses,
+		),
+	}
 }
 
 func resolveDefaultCompression(c Compression) Compression {

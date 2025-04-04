@@ -88,8 +88,16 @@ func openCleanupManager(
 		opts:            opts,
 		objProvider:     objProvider,
 		onTableDeleteFn: onTableDeleteFn,
-		deletePacer:     newDeletionPacer(crtime.NowMono(), int64(opts.TargetByteDeletionRate), getDeletePacerInfo),
-		jobsCh:          make(chan *cleanupJob, jobsQueueDepth),
+		deletePacer: newDeletionPacer(
+			crtime.NowMono(),
+			opts.FreeSpaceThresholdBytes,
+			int64(opts.TargetByteDeletionRate),
+			opts.FreeSpaceTimeframe,
+			opts.ObsoleteBytesMaxRatio,
+			opts.ObsoleteBytesTimeframe,
+			getDeletePacerInfo,
+		),
+		jobsCh: make(chan *cleanupJob, jobsQueueDepth),
 	}
 	cm.mu.completedJobsCond.L = &cm.mu.Mutex
 	cm.waitGroup.Add(1)
@@ -537,7 +545,7 @@ func (d *DB) deleteObsoleteFiles(jobID JobID) {
 		return cmp.Compare(a.FileNum, b.FileNum)
 	})
 	for _, f := range obsoleteTables {
-		d.fileCache.Evict(f.FileNum)
+		d.fileCache.Evict(f.FileNum, base.FileTypeTable)
 		filesToDelete = append(filesToDelete, obsoleteFile{
 			fileType: base.FileTypeTable,
 			nonLogFile: deletableFile{
@@ -549,7 +557,7 @@ func (d *DB) deleteObsoleteFiles(jobID JobID) {
 		})
 	}
 	for _, f := range obsoleteBlobs {
-		d.fileCache.Evict(f.FileNum)
+		d.fileCache.Evict(f.FileNum, base.FileTypeBlob)
 		filesToDelete = append(filesToDelete, obsoleteFile{
 			fileType: base.FileTypeBlob,
 			nonLogFile: deletableFile{

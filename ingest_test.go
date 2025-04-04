@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/blobtest"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangekey"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
 	"github.com/kr/pretty"
@@ -75,11 +77,15 @@ func TestSSTableKeyCompare(t *testing.T) {
 
 func TestIngestLoad(t *testing.T) {
 	mem := vfs.NewMem()
+	keySchema := colblk.DefaultKeySchema(testkeys.Comparer, 16)
 
 	datadriven.RunTest(t, "testdata/ingest_load", func(t *testing.T, td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "load":
-			writerOpts := sstable.WriterOptions{}
+			writerOpts := sstable.WriterOptions{
+				Comparer:  testkeys.Comparer,
+				KeySchema: &keySchema,
+			}
 			var dbVersion FormatMajorVersion
 			for _, cmdArgs := range td.CmdArgs {
 				v, err := strconv.Atoi(cmdArgs.Vals[0])
@@ -100,6 +106,8 @@ func TestIngestLoad(t *testing.T) {
 			if err != nil {
 				return err.Error()
 			}
+			var bv blobtest.Values
+			var br blobtest.References
 			w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), writerOpts)
 			for _, data := range strings.Split(td.Input, "\n") {
 				if strings.HasPrefix(data, "EncodeSpan: ") {
@@ -116,9 +124,17 @@ func TestIngestLoad(t *testing.T) {
 					return fmt.Sprintf("malformed input: %s\n", data)
 				}
 				key := base.ParseInternalKey(data[:j])
-				value := []byte(data[j+1:])
-				if err := w.AddWithForceObsolete(key, value, false /* forceObsolete */); err != nil {
-					return err.Error()
+				if bv.IsBlobHandle(data[j+1:]) {
+					ih, err := bv.ParseInlineHandle(data[j+1:], &br)
+					require.NoError(t, err)
+					if err := w.AddWithBlobHandle(key, ih, base.ShortAttribute(0), false /* forceObsolete */); err != nil {
+						return err.Error()
+					}
+				} else {
+					value := []byte(data[j+1:])
+					if err := w.Add(key, value, false /* forceObsolete */); err != nil {
+						return err.Error()
+					}
 				}
 			}
 			if err := w.Close(); err != nil {
@@ -126,8 +142,10 @@ func TestIngestLoad(t *testing.T) {
 			}
 
 			opts := &Options{
-				Comparer: DefaultComparer,
-				FS:       mem,
+				Comparer:   testkeys.Comparer,
+				KeySchema:  keySchema.Name,
+				KeySchemas: sstable.MakeKeySchemas(&keySchema),
+				FS:         mem,
 			}
 			opts.WithFSDefaults()
 			lr, err := ingestLoad(context.Background(), opts, dbVersion, []string{"ext"}, nil, nil, nil, []base.FileNum{1})
@@ -203,7 +221,7 @@ func TestIngestLoadRand(t *testing.T) {
 					// Duplicate key, ignore.
 					continue
 				}
-				require.NoError(t, w.AddWithForceObsolete(keys[i], nil, false /* forceObsolete */))
+				require.NoError(t, w.Add(keys[i], nil, false /* forceObsolete */))
 				count++
 			}
 			expected[i].Stats.NumEntries = count
@@ -901,8 +919,7 @@ func TestExcise(t *testing.T) {
 			currVersion := d.mu.versions.currentVersion()
 			var ptr *manifest.FileBacking
 			for _, level := range currVersion.Levels {
-				lIter := level.Iter()
-				for f := lIter.First(); f != nil; f = lIter.Next() {
+				for f := range level.All() {
 					if _, ok := fileNums[f.FileNum]; ok {
 						if ptr == nil {
 							ptr = f.FileBacking
@@ -1136,7 +1153,7 @@ func testIngestSharedImpl(
 				func(key *InternalKey, value LazyValue, _ IteratorLevel) error {
 					val, _, err := value.Value(nil)
 					require.NoError(t, err)
-					require.NoError(t, w.AddWithForceObsolete(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
+					require.NoError(t, w.Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
@@ -1411,7 +1428,7 @@ type blockedCompaction struct {
 func TestConcurrentExcise(t *testing.T) {
 	var d, d1, d2 *DB
 	var efos map[string]*EventuallyFileOnlySnapshot
-	backgroundErrs := make(chan error, 5)
+	compactionErrs := make(chan error, 5)
 	var compactions map[string]*blockedCompaction
 	defer func() {
 		for _, e := range efos {
@@ -1447,15 +1464,12 @@ func TestConcurrentExcise(t *testing.T) {
 		}
 		efos = make(map[string]*EventuallyFileOnlySnapshot)
 		compactions = make(map[string]*blockedCompaction)
-		backgroundErrs = make(chan error, 5)
+		compactionErrs = make(chan error, 5)
 
 		var el EventListener
 		el.EnsureDefaults(testLogger{t: t})
 		el.FlushBegin = func(info FlushInfo) {
 			// Don't block flushes
-		}
-		el.BackgroundError = func(err error) {
-			backgroundErrs <- err
 		}
 		el.CompactionBegin = func(info CompactionInfo) {
 			if info.Reason == "move" {
@@ -1466,6 +1480,11 @@ func TestConcurrentExcise(t *testing.T) {
 			if blockNextCompaction {
 				blockNextCompaction = false
 				blockedJobID = info.JobID
+			}
+		}
+		el.CompactionEnd = func(info CompactionInfo) {
+			if info.Err != nil {
+				compactionErrs <- info.Err
 			}
 		}
 		el.TableCreated = func(info TableCreateInfo) {
@@ -1638,7 +1657,7 @@ func TestConcurrentExcise(t *testing.T) {
 				func(key *InternalKey, value LazyValue, _ IteratorLevel) error {
 					val, _, err := value.Value(nil)
 					require.NoError(t, err)
-					require.NoError(t, w.AddWithForceObsolete(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
+					require.NoError(t, w.Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
@@ -1819,8 +1838,8 @@ func TestConcurrentExcise(t *testing.T) {
 				return "spun off in separate goroutine"
 			}
 			return "ok"
-		case "wait-for-background-error":
-			err := <-backgroundErrs
+		case "wait-for-compaction-error":
+			err := <-compactionErrs
 			return err.Error()
 		default:
 			return fmt.Sprintf("unknown command: %s", td.Cmd)
@@ -2075,7 +2094,7 @@ func TestIngestExternal(t *testing.T) {
 				func(key *InternalKey, value LazyValue, _ IteratorLevel) error {
 					val, _, err := value.Value(nil)
 					require.NoError(t, err)
-					require.NoError(t, w.AddWithForceObsolete(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
+					require.NoError(t, w.Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false /* forceObsolete */))
 					return nil
 				},
 				func(start, end []byte, seqNum base.SeqNum) error {
@@ -2625,7 +2644,7 @@ func TestIngestCompact(t *testing.T) {
 
 	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{})
 	key := []byte("a")
-	require.NoError(t, w.AddWithForceObsolete(base.MakeInternalKey(key, 0, InternalKeyKindSet), nil, false /* forceObsolete */))
+	require.NoError(t, w.Add(base.MakeInternalKey(key, 0, InternalKeyKindSet), nil, false /* forceObsolete */))
 	require.NoError(t, w.Close())
 
 	// Make N copies of the sstable.
@@ -3284,7 +3303,7 @@ func TestIngest_UpdateSequenceNumber(t *testing.T) {
 			}
 			key := base.ParseInternalKey(data[:j])
 			value := []byte(data[j+1:])
-			if err := w.AddWithForceObsolete(key, value, false /* forceObsolete */); err != nil {
+			if err := w.Add(key, value, false /* forceObsolete */); err != nil {
 				return nil, err
 			}
 		}
@@ -3828,6 +3847,6 @@ func runBenchmarkManySSTablesInUseKeyRanges(b *testing.B, d *DB, count int) {
 	smallest := []byte("0")
 	largest := []byte("z")
 	for i := 0; i < b.N; i++ {
-		_ = v.CalculateInuseKeyRanges(0, numLevels-1, smallest, largest)
+		_ = v.CalculateInuseKeyRanges(d.mu.versions.l0Organizer, 0, numLevels-1, smallest, largest)
 	}
 }

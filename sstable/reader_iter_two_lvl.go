@@ -15,7 +15,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/objstorage"
-	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/valblk"
 )
 
@@ -153,15 +152,7 @@ func (i *twoLevelIterator[I, PI, D, PD]) resolveMaybeExcluded(dir int8) intersec
 // sstable bounds. If the virtualState passed in is not nil, then virtual
 // sstable bounds will be enforced.
 func newColumnBlockTwoLevelIterator(
-	ctx context.Context,
-	r *Reader,
-	v *virtualState,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
+	ctx context.Context, r *Reader, v *virtualState, opts IterOptions,
 ) (*twoLevelIteratorColumnBlocks, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -170,10 +161,11 @@ func newColumnBlockTwoLevelIterator(
 		panic(errors.AssertionFailedf("table format %d should not use columnar block format", r.tableFormat))
 	}
 	i := twoLevelIterColumnBlockPool.Get().(*twoLevelIteratorColumnBlocks)
-	i.secondLevel.init(ctx, r, v, transforms, lower, upper, filterer,
-		false, // Disable the use of the filter block in the second level.
-		env)
-	var getInternalValuer block.GetInternalValueForPrefixAndValueHandler
+	i.secondLevel.init(ctx, r, v, opts)
+	// Only check the bloom filter at the top level.
+	i.useFilterBlock = i.secondLevel.useFilterBlock
+	i.secondLevel.useFilterBlock = false
+
 	if r.Properties.NumValueBlocks > 0 {
 		// NB: we cannot avoid this ~248 byte allocation, since valueBlockReader
 		// can outlive the singleLevelIterator due to be being embedded in a
@@ -184,16 +176,14 @@ func newColumnBlockTwoLevelIterator(
 		// versions of keys, and therefore never expose a LazyValue that is
 		// separated to their callers, they can put this valueBlockReader into a
 		// sync.Pool.
-		i.secondLevel.vbReader = valblk.MakeReader(&i.secondLevel, rp, r.valueBIH, env.Stats)
-		getInternalValuer = &i.secondLevel.vbReader
+		i.secondLevel.internalValueConstructor.vbReader = valblk.MakeReader(&i.secondLevel, opts.ReaderProvider, r.valueBIH, opts.Env.Stats)
 		i.secondLevel.vbRH = r.blockReader.UsePreallocatedReadHandle(
 			objstorage.NoReadBefore, &i.secondLevel.vbRHPrealloc)
 	}
-	i.secondLevel.data.InitOnce(r.keySchema, r.Comparer, getInternalValuer)
-	i.useFilterBlock = shouldUseFilterBlock(r, filterBlockSizeLimit)
+	i.secondLevel.data.InitOnce(r.keySchema, r.Comparer, &i.secondLevel.internalValueConstructor)
 	topLevelIndexH, err := r.readTopLevelIndexBlock(ctx, i.secondLevel.readBlockEnv, i.secondLevel.indexFilterRH)
 	if err == nil {
-		err = i.topLevelIndex.InitHandle(r.Comparer, topLevelIndexH, transforms)
+		err = i.topLevelIndex.InitHandle(r.Comparer, topLevelIndexH, opts.Transforms)
 	}
 	if err != nil {
 		_ = i.Close()
@@ -210,15 +200,7 @@ func newColumnBlockTwoLevelIterator(
 // sstable bounds. If the virtualState passed in is not nil, then virtual
 // sstable bounds will be enforced.
 func newRowBlockTwoLevelIterator(
-	ctx context.Context,
-	r *Reader,
-	v *virtualState,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
+	ctx context.Context, r *Reader, v *virtualState, opts IterOptions,
 ) (*twoLevelIteratorRowBlocks, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -227,9 +209,11 @@ func newRowBlockTwoLevelIterator(
 		panic(errors.AssertionFailedf("table format %s uses block columnar format", r.tableFormat))
 	}
 	i := twoLevelIterRowBlockPool.Get().(*twoLevelIteratorRowBlocks)
-	i.secondLevel.init(ctx, r, v, transforms, lower, upper, filterer,
-		false, // Disable the use of the filter block in the second level.
-		env)
+	i.secondLevel.init(ctx, r, v, opts)
+	// Only check the bloom filter at the top level.
+	i.useFilterBlock = i.secondLevel.useFilterBlock
+	i.secondLevel.useFilterBlock = false
+
 	if r.tableFormat >= TableFormatPebblev3 {
 		if r.Properties.NumValueBlocks > 0 {
 			// NB: we cannot avoid this ~248 byte allocation, since valueBlockReader
@@ -241,19 +225,19 @@ func newRowBlockTwoLevelIterator(
 			// versions of keys, and therefore never expose a LazyValue that is
 			// separated to their callers, they can put this valueBlockReader into a
 			// sync.Pool.
-			i.secondLevel.vbReader = valblk.MakeReader(&i.secondLevel, rp, r.valueBIH, env.Stats)
-			i.secondLevel.data.SetGetLazyValuer(&i.secondLevel.vbReader)
+			i.secondLevel.internalValueConstructor.vbReader = valblk.MakeReader(&i.secondLevel, opts.ReaderProvider, r.valueBIH, opts.Env.Stats)
+			// We can set the GetLazyValuer directly to the vbReader because
+			// rowblk sstables never contain blob value handles.
+			i.secondLevel.data.SetGetLazyValuer(&i.secondLevel.internalValueConstructor.vbReader)
 			i.secondLevel.vbRH = r.blockReader.UsePreallocatedReadHandle(
 				objstorage.NoReadBefore, &i.secondLevel.vbRHPrealloc)
 		}
 		i.secondLevel.data.SetHasValuePrefix(true)
 	}
 
-	i.useFilterBlock = shouldUseFilterBlock(r, filterBlockSizeLimit)
-
 	topLevelIndexH, err := r.readTopLevelIndexBlock(ctx, i.secondLevel.readBlockEnv, i.secondLevel.indexFilterRH)
 	if err == nil {
-		err = i.topLevelIndex.InitHandle(r.Comparer, topLevelIndexH, transforms)
+		err = i.topLevelIndex.InitHandle(r.Comparer, topLevelIndexH, opts.Transforms)
 	}
 	if err != nil {
 		_ = i.Close()

@@ -4,7 +4,11 @@
 
 package base
 
-import "context"
+import (
+	"context"
+
+	"github.com/cockroachdb/errors"
+)
 
 // A value can have user-defined attributes that are a function of the value
 // byte slice. For now, we only support "short attributes", which can be
@@ -216,7 +220,7 @@ func (lv *LazyValue) fetchValue(
 	if !f.fetched {
 		f.fetched = true
 		f.value, f.callerOwned, f.err = f.Fetcher.Fetch(ctx,
-			lv.ValueOrHandle, lv.Fetcher.BlobFileNum, lv.Fetcher.Attribute.ValueLen, buf)
+			lv.ValueOrHandle, f.BlobFileNum, f.Attribute.ValueLen, buf)
 	}
 	return f.value, f.callerOwned, f.err
 }
@@ -262,8 +266,9 @@ func (lv *LazyValue) Clone(buf []byte, fetcher *LazyFetcher) (LazyValue, []byte)
 	var lvCopy LazyValue
 	if lv.Fetcher != nil {
 		*fetcher = LazyFetcher{
-			Fetcher:   lv.Fetcher.Fetcher,
-			Attribute: lv.Fetcher.Attribute,
+			Fetcher:     lv.Fetcher.Fetcher,
+			Attribute:   lv.Fetcher.Attribute,
+			BlobFileNum: lv.Fetcher.BlobFileNum,
 			// Not copying anything that has been extracted.
 		}
 		lvCopy.Fetcher = fetcher
@@ -276,4 +281,27 @@ func (lv *LazyValue) Clone(buf []byte, fetcher *LazyFetcher) (LazyValue, []byte)
 	buf = append(buf, lv.ValueOrHandle...)
 	lvCopy.ValueOrHandle = buf[bufLen : bufLen+vLen]
 	return lvCopy, buf
+}
+
+// NoBlobFetches is a ValueFetcher that returns an error. It's intended to be
+// used in situations where sstables should not encode a blob value, or the
+// caller should not fetch the handle's value.
+var NoBlobFetches = &errValueFetcher{
+	Err: errors.AssertionFailedf("unexpected blob value"),
+}
+
+// errValueFetcher is a ValueFetcher that returns an error.
+type errValueFetcher struct {
+	Err error
+}
+
+// Assert that *errValueFetcher implements base.ValueFetcher.
+var _ ValueFetcher = (*errValueFetcher)(nil)
+
+// Fetch implements base.ValueFetcher.
+func (e *errValueFetcher) Fetch(
+	_ context.Context, _ []byte, blobFileNum DiskFileNum, valLen uint32, _ []byte,
+) (val []byte, callerOwned bool, err error) {
+	err = errors.Wrapf(e.Err, "fetching %d-byte value from %s", valLen, blobFileNum)
+	return nil, false, err
 }

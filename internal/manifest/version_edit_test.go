@@ -390,17 +390,20 @@ func TestVersionEditApply(t *testing.T) {
 	const readCompactionRate = 32000
 
 	versions := make(map[string]*Version)
+	l0Organizers := make(map[string]*L0Organizer)
 	datadriven.RunTest(t, "testdata/version_edit_apply",
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "define":
 				// Define a version.
 				name := d.CmdArgs[0].String()
-				v, err := ParseVersionDebug(base.DefaultComparer, flushSplitBytes, d.Input)
+				l0Organizer := NewL0Organizer(base.DefaultComparer, flushSplitBytes)
+				v, err := ParseVersionDebug(base.DefaultComparer, l0Organizer, d.Input)
 				if err != nil {
 					d.Fatalf(t, "%v", err)
 				}
 				versions[name] = v
+				l0Organizers[name] = l0Organizer
 				return v.DebugString()
 
 			case "apply":
@@ -417,8 +420,7 @@ func TestVersionEditApply(t *testing.T) {
 				bve := BulkVersionEdit{}
 				bve.AddedTablesByFileNum = make(map[base.FileNum]*TableMetadata)
 				for _, l := range v.Levels {
-					it := l.Iter()
-					for f := it.First(); f != nil; f = it.Next() {
+					for f := range l.All() {
 						bve.AddedTablesByFileNum[f.FileNum] = f
 					}
 				}
@@ -443,19 +445,25 @@ func TestVersionEditApply(t *testing.T) {
 					}
 				}
 
-				newv, err := bve.Apply(v, base.DefaultComparer, flushSplitBytes, readCompactionRate)
+				l0Organizer := l0Organizers[name]
+				if l0Organizer == nil {
+					d.Fatalf(t, "no L0 organizer")
+				}
+				newv, err := bve.Apply(v, l0Organizer, readCompactionRate)
 				if err != nil {
 					return err.Error()
 				}
 				if saveName != "" {
 					versions[saveName] = newv
+					l0Organizers[saveName] = l0Organizer
 				}
 
-				// Reinitialize the L0 sublevels in the original version; otherwise we
-				// will get "AddL0Files called twice on the same receiver" panics.
-				if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
-					panic(err)
-				}
+				// Reinitialize the L0 organizer in case we want to use the same version
+				// again (l0Organizer now reflects newv).
+				l0Organizer = NewL0Organizer(base.DefaultComparer, flushSplitBytes)
+				l0Organizer.ResetForTesting(&v.Levels[0])
+				l0Organizers[name] = l0Organizer
+
 				return newv.DebugString()
 
 			default:

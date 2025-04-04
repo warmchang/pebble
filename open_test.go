@@ -332,7 +332,7 @@ func TestNewDBFilenames(t *testing.T) {
 			"LOCK",
 			"MANIFEST-000001",
 			"OPTIONS-000003",
-			"marker.format-version.000007.020",
+			"marker.format-version.000008.021",
 			"marker.manifest.000001.MANIFEST-000001",
 		},
 	}
@@ -1457,7 +1457,8 @@ func TestCheckConsistency(t *testing.T) {
 					}
 				}
 
-				v := manifest.NewVersion(base.DefaultComparer, 0, filesByLevel)
+				l0Organizer := manifest.NewL0Organizer(base.DefaultComparer, 0 /* flushSplitBytes */)
+				v := manifest.NewVersionForTesting(base.DefaultComparer, l0Organizer, filesByLevel)
 				err := checkConsistency(v, provider)
 				if err != nil {
 					if redactErr {

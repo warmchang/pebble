@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
@@ -101,12 +102,17 @@ type RawColumnWriter struct {
 	previousUserKey       invariants.Value[[]byte]
 	validator             invariants.Value[*colblk.DataBlockValidator]
 	disableKeyOrderChecks bool
+	cpuMeasurer           base.CPUMeasurer
 }
 
 // Assert that *RawColumnWriter implements RawWriter.
 var _ RawWriter = (*RawColumnWriter)(nil)
 
-func newColumnarWriter(writable objstorage.Writable, o WriterOptions) *RawColumnWriter {
+// cpuMeasurer, if non-nil, is only used for calling
+// cpuMeasurer.MeasureCPUSSTableSecondary.
+func newColumnarWriter(
+	writable objstorage.Writable, o WriterOptions, cpuMeasurer base.CPUMeasurer,
+) *RawColumnWriter {
 	if writable == nil {
 		panic("pebble: nil writable")
 	}
@@ -176,6 +182,7 @@ func newColumnarWriter(writable objstorage.Writable, o WriterOptions) *RawColumn
 
 	w.writeQueue.ch = make(chan *compressedBlock)
 	w.writeQueue.wg.Add(1)
+	w.cpuMeasurer = cpuMeasurer
 	go w.drainWriteQueue()
 	return w
 }
@@ -188,7 +195,7 @@ func (w *RawColumnWriter) Error() error {
 // EstimatedSize returns the estimated size of the sstable being written if
 // a call to Close() was made without adding additional keys.
 func (w *RawColumnWriter) EstimatedSize() uint64 {
-	sz := rocksDBFooterLen + w.queuedDataSize
+	sz := uint64(w.opts.TableFormat.FooterSize()) + w.queuedDataSize
 	// TODO(jackson): Avoid iterating over partitions by incrementally
 	// maintaining the size contribution of all buffered partitions.
 	for _, bib := range w.indexBuffering.partitions {
@@ -317,7 +324,7 @@ func (w *RawColumnWriter) EncodeSpan(span keyspan.Span) error {
 	return nil
 }
 
-// AddWithForceObsolete adds a point key/value pair when writing a
+// Add adds a point key/value pair when writing a
 // strict-obsolete sstable. For a given Writer, the keys passed to Add must be
 // in increasing order. Span keys (range deletions, range keys) must be added
 // through EncodeSpan.
@@ -331,9 +338,7 @@ func (w *RawColumnWriter) EncodeSpan(span keyspan.Span) error {
 // that strict-obsolete ssts must satisfy. S2, due to RANGEDELs, is solely the
 // responsibility of the caller. S1 is solely the responsibility of the
 // callee.
-func (w *RawColumnWriter) AddWithForceObsolete(
-	key InternalKey, value []byte, forceObsolete bool,
-) error {
+func (w *RawColumnWriter) Add(key InternalKey, value []byte, forceObsolete bool) error {
 	switch key.Kind() {
 	case base.InternalKeyKindRangeDelete, base.InternalKeyKindRangeKeySet,
 		base.InternalKeyKindRangeKeyUnset, base.InternalKeyKindRangeKeyDelete:
@@ -379,7 +384,52 @@ func (w *RawColumnWriter) AddWithForceObsolete(
 			valuePrefix = block.InPlaceValuePrefix(eval.kcmp.PrefixEqual())
 		}
 	}
+	return w.add(key, len(value), valueStoredWithKey, valuePrefix, eval)
+}
 
+// AddWithBlobHandle implements the RawWriter interface.
+func (w *RawColumnWriter) AddWithBlobHandle(
+	key InternalKey, h blob.InlineHandle, attr base.ShortAttribute, forceObsolete bool,
+) error {
+	// Blob value handles require at least TableFormatPebblev6.
+	if w.opts.TableFormat <= TableFormatPebblev5 {
+		w.err = errors.Newf("pebble: blob value handles are not supported in %s", w.opts.TableFormat.String())
+		return w.err
+	}
+	switch key.Kind() {
+	case base.InternalKeyKindRangeDelete, base.InternalKeyKindRangeKeySet,
+		base.InternalKeyKindRangeKeyUnset, base.InternalKeyKindRangeKeyDelete:
+		return errors.Newf("%s must be added through EncodeSpan", key.Kind())
+	case base.InternalKeyKindMerge:
+		return errors.Errorf("MERGE does not support blob value handles")
+	}
+
+	eval, err := w.evaluatePoint(key, int(h.ValueLen))
+	if err != nil {
+		return err
+	}
+	eval.isObsolete = eval.isObsolete || forceObsolete
+	w.prevPointKey.trailer = key.Trailer
+	w.prevPointKey.isObsolete = eval.isObsolete
+
+	n := h.Encode(w.tmp[:])
+	valueStoredWithKey := w.tmp[:n]
+	valuePrefix := block.BlobValueHandlePrefix(eval.kcmp.PrefixEqual(), attr)
+	err = w.add(key, int(h.ValueLen), valueStoredWithKey, valuePrefix, eval)
+	if err != nil {
+		return err
+	}
+	w.props.NumValuesInBlobFiles++
+	return nil
+}
+
+func (w *RawColumnWriter) add(
+	key InternalKey,
+	valueLen int,
+	valueStoredWithKey []byte,
+	valuePrefix block.ValuePrefix,
+	eval pointKeyEvaluation,
+) error {
 	// Append the key to the data block. We have NOT yet committed to
 	// including the key in the block. The data block writer permits us to
 	// finish the block excluding the last-appended KV.
@@ -408,12 +458,12 @@ func (w *RawColumnWriter) AddWithForceObsolete(
 	}
 
 	for i := range w.blockPropCollectors {
-		v := value
-		if key.Kind() == base.InternalKeyKindSet {
-			// Values for SET are not required to be in-place, and in the future
-			// may not even be read by the compaction, so pass nil values. Block
-			// property collectors in such Pebble DB's must not look at the
-			// value.
+		v := valueStoredWithKey
+		if key.Kind() == base.InternalKeyKindSet || key.Kind() == base.InternalKeyKindSetWithDelete || !valuePrefix.IsInPlaceValue() {
+			// Values for SET, SETWITHDEL keys are not required to be in-place,
+			// and may not even be read by the compaction, so pass nil values.
+			// Block property collectors in such Pebble DB's must not look at
+			// the value.
 			v = nil
 		}
 		if err := w.blockPropCollectors[i].AddPointKey(key, v); err != nil {
@@ -439,12 +489,12 @@ func (w *RawColumnWriter) AddWithForceObsolete(
 		w.dataBlock.deletionSize += len(key.UserKey)
 	case InternalKeyKindDeleteSized:
 		var size uint64
-		if len(value) > 0 {
+		if len(valueStoredWithKey) > 0 {
 			var n int
-			size, n = binary.Uvarint(value)
+			size, n = binary.Uvarint(valueStoredWithKey)
 			if n <= 0 {
 				return errors.Newf("%s key's value (%x) does not parse as uvarint",
-					errors.Safe(key.Kind().String()), value)
+					errors.Safe(key.Kind().String()), valueStoredWithKey)
 			}
 		}
 		w.props.NumDeletions++
@@ -457,7 +507,7 @@ func (w *RawColumnWriter) AddWithForceObsolete(
 		w.props.NumMergeOperands++
 	}
 	w.props.RawKeySize += uint64(key.Size())
-	w.props.RawValueSize += uint64(len(value))
+	w.props.RawValueSize += uint64(valueLen)
 	return nil
 }
 
@@ -819,10 +869,15 @@ func (w *RawColumnWriter) flushBufferedIndexBlocks() (rootIndex block.Handle, er
 // Other blocks are written directly by the client goroutine. See Close.
 func (w *RawColumnWriter) drainWriteQueue() {
 	defer w.writeQueue.wg.Done()
+	// Call once to initialize the CPU measurer.
+	w.cpuMeasurer.MeasureCPU(base.CompactionGoroutineSSTableSecondary)
 	for cb := range w.writeQueue.ch {
 		if _, err := w.layout.WritePrecompressedDataBlock(cb.physical); err != nil {
 			w.writeQueue.err = err
 		}
+		// Report to the CPU measurer immediately after writing (note that there
+		// may be a time lag until the next block is available to write).
+		w.cpuMeasurer.MeasureCPU(base.CompactionGoroutineSSTableSecondary)
 		cb.blockBuf.clear()
 		cb.physical = block.PhysicalBlock{}
 		compressedBlockPool.Put(cb)

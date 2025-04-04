@@ -77,23 +77,24 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+// IterOptions defines options for configuring a sstable pointer iterator.
+type IterOptions struct {
+	Lower, Upper         []byte
+	Transforms           IterTransforms
+	Filterer             *BlockPropertiesFilterer
+	FilterBlockSizeLimit FilterBlockSizeLimit
+	Env                  block.ReadEnv
+	ReaderProvider       valblk.ReaderProvider
+	BlobContext          TableBlobContext
+}
+
 // NewPointIter returns an iterator for the point keys in the table.
 //
 // If transform.HideObsoletePoints is set, the callee assumes that filterer
 // already includes obsoleteKeyBlockPropertyFilter. The caller can satisfy this
 // contract by first calling TryAddBlockPropertyFilterForHideObsoletePoints.
-func (r *Reader) NewPointIter(
-	ctx context.Context,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-) (Iterator, error) {
-	return r.newPointIter(
-		ctx, transforms, lower, upper, filterer, filterBlockSizeLimit,
-		env, rp, nil)
+func (r *Reader) NewPointIter(ctx context.Context, opts IterOptions) (Iterator, error) {
+	return r.newPointIter(ctx, opts, nil /* vState */)
 }
 
 // TryAddBlockPropertyFilterForHideObsoletePoints is expected to be called
@@ -113,14 +114,7 @@ func (r *Reader) TryAddBlockPropertyFilterForHideObsoletePoints(
 }
 
 func (r *Reader) newPointIter(
-	ctx context.Context,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-	vState *virtualState,
+	ctx context.Context, opts IterOptions, vState *virtualState,
 ) (Iterator, error) {
 	// NB: pebble.fileCache wraps the returned iterator with one which performs
 	// reference counting on the Reader, preventing the Reader from being closed
@@ -130,22 +124,18 @@ func (r *Reader) newPointIter(
 	if r.Properties.IndexType == twoLevelIndex {
 		if r.tableFormat.BlockColumnar() {
 			res, err = newColumnBlockTwoLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, vState, opts)
 		} else {
 			res, err = newRowBlockTwoLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, vState, opts)
 		}
 	} else {
 		if r.tableFormat.BlockColumnar() {
 			res, err = newColumnBlockSingleLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, vState, opts)
 		} else {
 			res, err = newRowBlockSingleLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, vState, opts)
 		}
 	}
 	if err != nil {
@@ -162,46 +152,66 @@ func (r *Reader) newPointIter(
 //
 // NewIter must only be used when the Reader is guaranteed to outlive any
 // LazyValues returned from the iter.
-func (r *Reader) NewIter(transforms IterTransforms, lower, upper []byte) (Iterator, error) {
+func (r *Reader) NewIter(
+	transforms IterTransforms, lower, upper []byte, blobContext TableBlobContext,
+) (Iterator, error) {
 	// TODO(radu): we should probably not use bloom filters in this case, as there
 	// likely isn't a cache set up.
-	return r.NewPointIter(
-		context.TODO(), transforms, lower, upper, nil, AlwaysUseFilterBlock,
-		block.NoReadEnv, MakeTrivialReaderProvider(r))
+	opts := IterOptions{
+		Lower:                lower,
+		Upper:                upper,
+		Transforms:           transforms,
+		Filterer:             nil,
+		FilterBlockSizeLimit: AlwaysUseFilterBlock,
+		Env:                  block.NoReadEnv,
+		ReaderProvider:       MakeTrivialReaderProvider(r),
+		BlobContext:          blobContext,
+	}
+	return r.NewPointIter(context.TODO(), opts)
 }
 
 // NewCompactionIter returns an iterator similar to NewIter but it also increments
 // the number of bytes iterated. If an error occurs, NewCompactionIter cleans up
 // after itself and returns a nil iterator.
 func (r *Reader) NewCompactionIter(
-	transforms IterTransforms, env block.ReadEnv, rp valblk.ReaderProvider,
+	transforms IterTransforms,
+	env block.ReadEnv,
+	rp valblk.ReaderProvider,
+	blobContext TableBlobContext,
 ) (Iterator, error) {
-	return r.newCompactionIter(transforms, env, rp, nil)
+	return r.newCompactionIter(transforms, env, rp, nil, blobContext)
 }
 
 func (r *Reader) newCompactionIter(
-	transforms IterTransforms, env block.ReadEnv, rp valblk.ReaderProvider, vState *virtualState,
+	transforms IterTransforms,
+	env block.ReadEnv,
+	rp valblk.ReaderProvider,
+	vState *virtualState,
+	blobContext TableBlobContext,
 ) (Iterator, error) {
 	if vState != nil && vState.isSharedIngested {
 		transforms.HideObsoletePoints = true
 	}
+	ctx := context.Background()
+	opts := IterOptions{
+		Transforms:           transforms,
+		Filterer:             nil,
+		FilterBlockSizeLimit: NeverUseFilterBlock,
+		Env:                  env,
+		ReaderProvider:       rp,
+		BlobContext:          blobContext,
+	}
 
 	if r.Properties.IndexType == twoLevelIndex {
 		if !r.tableFormat.BlockColumnar() {
-			i, err := newRowBlockTwoLevelIterator(
-				context.Background(),
-				r, vState, transforms, nil /* lower */, nil /* upper */, nil,
-				NeverUseFilterBlock, env, rp)
+			i, err := newRowBlockTwoLevelIterator(ctx, r, vState, opts)
 			if err != nil {
 				return nil, err
 			}
 			i.SetupForCompaction()
 			return i, nil
 		}
-		i, err := newColumnBlockTwoLevelIterator(
-			context.Background(),
-			r, vState, transforms, nil /* lower */, nil /* upper */, nil,
-			NeverUseFilterBlock, env, rp)
+		i, err := newColumnBlockTwoLevelIterator(ctx, r, vState, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -209,18 +219,14 @@ func (r *Reader) newCompactionIter(
 		return i, nil
 	}
 	if !r.tableFormat.BlockColumnar() {
-		i, err := newRowBlockSingleLevelIterator(
-			context.Background(), r, vState, transforms, nil /* lower */, nil, /* upper */
-			nil, NeverUseFilterBlock, env, rp)
+		i, err := newRowBlockSingleLevelIterator(ctx, r, vState, opts)
 		if err != nil {
 			return nil, err
 		}
 		i.SetupForCompaction()
 		return i, nil
 	}
-	i, err := newColumnBlockSingleLevelIterator(
-		context.Background(), r, vState, transforms, nil /* lower */, nil, /* upper */
-		nil, NeverUseFilterBlock, env, rp)
+	i, err := newColumnBlockSingleLevelIterator(ctx, r, vState, opts)
 	if err != nil {
 		return nil, err
 	}

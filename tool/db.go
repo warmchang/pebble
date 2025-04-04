@@ -527,7 +527,13 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 	iter, _ := db.NewIter(&pebble.IterOptions{
 		UpperBound: d.end,
 	})
-	for valid := iter.SeekGE(d.start); valid; valid = iter.Next() {
+	var valid bool
+	if len(d.start) == 0 {
+		valid = iter.First()
+	} else {
+		valid = iter.SeekGE(d.start)
+	}
+	for ; valid; valid = iter.Next() {
 		if fmtKeys || fmtValues {
 			needDelimiter := false
 			if fmtKeys {
@@ -715,10 +721,9 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 				d.fmtValue.setForComparer(ve.ComparerName, d.comparers)
 			}
 		}
-		v, err := bve.Apply(
-			nil /* version */, cmp, d.opts.FlushSplitBytes,
-			d.opts.Experimental.ReadCompactionRate,
-		)
+		l0Organizer := manifest.NewL0Organizer(cmp, d.opts.FlushSplitBytes)
+		emptyVersion := manifest.NewInitialVersion(cmp)
+		v, err := bve.Apply(emptyVersion, l0Organizer, d.opts.Experimental.ReadCompactionRate)
 		if err != nil {
 			return err
 		}
@@ -734,9 +739,8 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 		var total props
 		var all []props
 		for _, l := range v.Levels {
-			iter := l.Iter()
 			var level props
-			for t := iter.First(); t != nil; t = iter.Next() {
+			for t := range l.All() {
 				if t.Virtual {
 					// TODO(bananabrick): Handle virtual sstables here. We don't
 					// really have any stats or properties at this point. Maybe

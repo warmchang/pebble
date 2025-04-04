@@ -64,8 +64,8 @@ type singleLevelIterator[I any, PI indexBlockIterator[I], D any, PD dataBlockIte
 	// dataBH refers to the last data block that the iterator considered
 	// loading. It may not actually have loaded the block, due to an error or
 	// because it was considered irrelevant.
-	dataBH   block.Handle
-	vbReader valblk.Reader
+	dataBH                   block.Handle
+	internalValueConstructor defaultInternalValueConstructor
 	// vbRH is the read handle for value blocks, which are in a different
 	// part of the sstable than data blocks.
 	vbRH         objstorage.ReadHandle
@@ -74,7 +74,6 @@ type singleLevelIterator[I any, PI indexBlockIterator[I], D any, PD dataBlockIte
 	closeHook    func()
 
 	readBlockEnv block.ReadEnv
-
 	// boundsCmp and positionedUsingLatestBounds are for optimizing iteration
 	// that uses multiple adjacent bounds. The seek after setting a new bound
 	// can use the fact that the iterator is either within the previous bounds
@@ -202,15 +201,7 @@ var _ base.InternalIterator = (*singleLevelIteratorRowBlocks)(nil)
 // sstable bounds. If the virtualState passed in is not nil, then virtual
 // sstable bounds will be enforced.
 func newColumnBlockSingleLevelIterator(
-	ctx context.Context,
-	r *Reader,
-	v *virtualState,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
+	ctx context.Context, r *Reader, v *virtualState, opts IterOptions,
 ) (*singleLevelIteratorColumnBlocks, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -219,21 +210,15 @@ func newColumnBlockSingleLevelIterator(
 		panic(errors.AssertionFailedf("table format %d should not use columnar block format", r.tableFormat))
 	}
 	i := singleLevelIterColumnBlockPool.Get().(*singleLevelIteratorColumnBlocks)
-	useFilterBlock := shouldUseFilterBlock(r, filterBlockSizeLimit)
-	i.init(
-		ctx, r, v, transforms, lower, upper, filterer, useFilterBlock,
-		env,
-	)
-	var getInternalValuer block.GetInternalValueForPrefixAndValueHandler
+	i.init(ctx, r, v, opts)
 	if r.Properties.NumValueBlocks > 0 {
-		i.vbReader = valblk.MakeReader(i, rp, r.valueBIH, env.Stats)
-		getInternalValuer = &i.vbReader
+		i.internalValueConstructor.vbReader = valblk.MakeReader(i, opts.ReaderProvider, r.valueBIH, opts.Env.Stats)
 		i.vbRH = r.blockReader.UsePreallocatedReadHandle(objstorage.NoReadBefore, &i.vbRHPrealloc)
 	}
-	i.data.InitOnce(r.keySchema, r.Comparer, getInternalValuer)
+	i.data.InitOnce(r.keySchema, r.Comparer, &i.internalValueConstructor)
 	indexH, err := r.readTopLevelIndexBlock(ctx, i.readBlockEnv, i.indexFilterRH)
 	if err == nil {
-		err = i.index.InitHandle(r.Comparer, indexH, transforms)
+		err = i.index.InitHandle(r.Comparer, indexH, opts.Transforms)
 	}
 	if err != nil {
 		_ = i.Close()
@@ -250,15 +235,7 @@ func newColumnBlockSingleLevelIterator(
 // sstable bounds. If the virtualState passed in is not nil, then virtual
 // sstable bounds will be enforced.
 func newRowBlockSingleLevelIterator(
-	ctx context.Context,
-	r *Reader,
-	v *virtualState,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
+	ctx context.Context, r *Reader, v *virtualState, opts IterOptions,
 ) (*singleLevelIteratorRowBlocks, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -267,15 +244,13 @@ func newRowBlockSingleLevelIterator(
 		panic(errors.AssertionFailedf("table format %s uses block columnar format", r.tableFormat))
 	}
 	i := singleLevelIterRowBlockPool.Get().(*singleLevelIteratorRowBlocks)
-	useFilterBlock := shouldUseFilterBlock(r, filterBlockSizeLimit)
-	i.init(
-		ctx, r, v, transforms, lower, upper, filterer, useFilterBlock,
-		env,
-	)
+	i.init(ctx, r, v, opts)
 	if r.tableFormat >= TableFormatPebblev3 {
 		if r.Properties.NumValueBlocks > 0 {
-			i.vbReader = valblk.MakeReader(i, rp, r.valueBIH, env.Stats)
-			(&i.data).SetGetLazyValuer(&i.vbReader)
+			i.internalValueConstructor.vbReader = valblk.MakeReader(i, opts.ReaderProvider, r.valueBIH, opts.Env.Stats)
+			// We can set the GetLazyValuer directly to the vbReader because
+			// rowblk sstables never contain blob value handles.
+			(&i.data).SetGetLazyValuer(&i.internalValueConstructor.vbReader)
 			i.vbRH = r.blockReader.UsePreallocatedReadHandle(objstorage.NoReadBefore, &i.vbRHPrealloc)
 		}
 		i.data.SetHasValuePrefix(true)
@@ -283,7 +258,7 @@ func newRowBlockSingleLevelIterator(
 
 	indexH, err := r.readTopLevelIndexBlock(ctx, i.readBlockEnv, i.indexFilterRH)
 	if err == nil {
-		err = i.index.InitHandle(r.Comparer, indexH, transforms)
+		err = i.index.InitHandle(r.Comparer, indexH, opts.Transforms)
 	}
 	if err != nil {
 		_ = i.Close()
@@ -294,29 +269,24 @@ func newRowBlockSingleLevelIterator(
 
 // init initializes the singleLevelIterator struct. It does not read the index.
 func (i *singleLevelIterator[I, PI, D, PD]) init(
-	ctx context.Context,
-	r *Reader,
-	v *virtualState,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	useFilterBlock bool,
-	env block.ReadEnv,
+	ctx context.Context, r *Reader, v *virtualState, opts IterOptions,
 ) {
 	i.inPool = false
 	i.ctx = ctx
-	i.lower = lower
-	i.upper = upper
-	i.bpfs = filterer
-	i.useFilterBlock = useFilterBlock
+	i.lower = opts.Lower
+	i.upper = opts.Upper
+	i.bpfs = opts.Filterer
+	i.useFilterBlock = shouldUseFilterBlock(r, opts.FilterBlockSizeLimit)
 	i.reader = r
 	i.cmp = r.Comparer.Compare
-	i.transforms = transforms
+	i.transforms = opts.Transforms
+	i.readBlockEnv = opts.Env
+	i.internalValueConstructor.blobContext = opts.BlobContext
+	i.internalValueConstructor.env = &i.readBlockEnv
 	if v != nil {
 		i.vState = v
-		i.endKeyInclusive, i.lower, i.upper = v.constrainBounds(lower, upper, false /* endInclusive */)
+		i.endKeyInclusive, i.lower, i.upper = v.constrainBounds(opts.Lower, opts.Upper, false /* endInclusive */)
 	}
-	i.readBlockEnv = env
 
 	i.indexFilterRH = r.blockReader.UsePreallocatedReadHandle(
 		objstorage.ReadBeforeForIndexAndFilter, &i.indexFilterRHPrealloc)
@@ -1562,7 +1532,7 @@ func (i *singleLevelIterator[I, PI, D, PD]) closeInternal() error {
 	if i.bpfs != nil {
 		releaseBlockPropertiesFilterer(i.bpfs)
 	}
-	i.vbReader.Close()
+	i.internalValueConstructor.vbReader.Close()
 	if i.vbRH != nil {
 		err = firstError(err, i.vbRH.Close())
 		i.vbRH = nil

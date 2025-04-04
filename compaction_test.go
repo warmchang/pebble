@@ -6,6 +6,7 @@ package pebble
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	crand "crypto/rand"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"math/rand/v2"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,22 +41,31 @@ import (
 )
 
 func newVersion(opts *Options, files [numLevels][]*tableMetadata) *version {
-	v := manifest.NewVersion(
+	v, _ := newVersionAndL0Organizer(opts, files)
+	return v
+}
+
+func newVersionAndL0Organizer(
+	opts *Options, files [numLevels][]*tableMetadata,
+) (*version, *manifest.L0Organizer) {
+	l0Organizer := manifest.NewL0Organizer(opts.Comparer, opts.FlushSplitBytes)
+	v := manifest.NewVersionForTesting(
 		opts.Comparer,
-		opts.FlushSplitBytes,
+		l0Organizer,
 		files)
 	if err := v.CheckOrdering(); err != nil {
 		panic(err)
 	}
-	return v
+	return v, l0Organizer
 }
 
 type compactionPickerForTesting struct {
-	score     float64
-	level     int
-	baseLevel int
-	opts      *Options
-	vers      *manifest.Version
+	score       float64
+	level       int
+	baseLevel   int
+	opts        *Options
+	vers        *manifest.Version
+	l0Organizer *manifest.L0Organizer
 }
 
 var _ compactionPicker = &compactionPickerForTesting{}
@@ -89,9 +100,9 @@ func (p *compactionPickerForTesting) pickAuto(env compactionEnv) (pc *pickedComp
 		file:        iter.Take(),
 	}
 	if cInfo.level == 0 {
-		return pickL0(env, p.opts, p.vers, p.baseLevel)
+		return pickL0(env, p.opts, p.vers, p.l0Organizer, p.baseLevel)
 	}
-	return pickAutoLPositive(env, p.opts, p.vers, cInfo, p.baseLevel)
+	return pickAutoLPositive(env, p.opts, p.vers, p.l0Organizer, cInfo, p.baseLevel)
 }
 
 func (p *compactionPickerForTesting) pickElisionOnlyCompaction(
@@ -115,9 +126,9 @@ func (p *compactionPickerForTesting) pickReadTriggeredCompaction(
 func TestPickCompaction(t *testing.T) {
 	fileNums := func(files manifest.LevelSlice) string {
 		var ss []string
-		files.Each(func(meta *tableMetadata) {
+		for meta := range files.All() {
 			ss = append(ss, strconv.Itoa(int(meta.FileNum)))
-		})
+		}
 		sort.Strings(ss)
 		return strings.Join(ss, ",")
 	}
@@ -134,14 +145,14 @@ func TestPickCompaction(t *testing.T) {
 
 	testCases := []struct {
 		desc      string
-		version   *version
+		files     [numLevels][]*tableMetadata
 		picker    compactionPickerForTesting
 		want      string
 		wantMulti bool
 	}{
 		{
 			desc: "no compaction",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -150,13 +161,13 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("j.SET.102"),
 					),
 				},
-			}),
+			},
 			want: "",
 		},
 
 		{
 			desc: "1 L0 file",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -165,7 +176,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("j.SET.102"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -176,7 +187,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files (0 overlaps)",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -191,7 +202,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("l.SET.112"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -202,7 +213,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files, with ikey overlap",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -217,7 +228,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("q.SET.112"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -228,7 +239,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files, with ukey overlap",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -243,7 +254,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("i.SET.111"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -254,7 +265,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "1 L0 file, 2 L1 files (0 overlaps)",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -277,7 +288,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("z.SET.212"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -288,7 +299,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "1 L0 file, 2 L1 files (1 overlap), 4 L2 files (3 overlaps)",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -337,7 +348,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("z.SET.332"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     0,
@@ -348,7 +359,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can grow",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -389,7 +400,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("z2.SET.312"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     1,
@@ -401,7 +412,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can't grow (range)",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -442,7 +453,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("z2.SET.312"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     1,
@@ -454,7 +465,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can't grow (size)",
-			version: newVersion(opts, [numLevels][]*tableMetadata{
+			files: [numLevels][]*tableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -495,7 +506,7 @@ func TestPickCompaction(t *testing.T) {
 						base.ParseInternalKey("z2.SET.312"),
 					),
 				},
-			}),
+			},
 			picker: compactionPickerForTesting{
 				score:     99,
 				level:     1,
@@ -510,14 +521,14 @@ func TestPickCompaction(t *testing.T) {
 			opts: opts,
 			cmp:  DefaultComparer,
 		}
-		vs.versions.Init(nil)
-		vs.append(tc.version)
 		tc.picker.opts = opts
-		tc.picker.vers = tc.version
+		tc.picker.vers, tc.picker.l0Organizer = newVersionAndL0Organizer(opts, tc.files)
+		vs.versions.Init(nil)
+		vs.append(tc.picker.vers)
 		vs.picker = &tc.picker
 		pc, got := vs.picker.pickAuto(compactionEnv{diskAvailBytes: math.MaxUint64}), ""
 		if pc != nil {
-			c := newCompaction(pc, opts, time.Now(), nil /* provider */, nil /* slot */)
+			c := newCompaction(pc, opts, time.Now(), nil /* provider */, noopGrantHandle{})
 
 			gotStart := fileNums(c.startLevel.files)
 			gotML := ""
@@ -536,73 +547,6 @@ func TestPickCompaction(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("%s:\ngot  %q\nwant %q", tc.desc, got, tc.want)
 		}
-	}
-}
-
-type cpuPermissionGranter struct {
-	// requestCount is used to confirm that every GetPermission function call
-	// has a corresponding CPUWorkDone function call.
-	requestCount int
-	used         bool
-	permit       bool
-}
-
-type cpuWorkHandle struct {
-	permit bool
-}
-
-func (c cpuWorkHandle) Permitted() bool {
-	return c.permit
-}
-
-func (t *cpuPermissionGranter) GetPermission(dur time.Duration) CPUWorkHandle {
-	t.requestCount++
-	t.used = true
-	return cpuWorkHandle{t.permit}
-}
-
-func (t *cpuPermissionGranter) CPUWorkDone(_ CPUWorkHandle) {
-	t.requestCount--
-}
-
-// Simple test to check if compactions are using the granter, and if exactly
-// the acquired handles are returned.
-func TestCompactionCPUGranter(t *testing.T) {
-	mem := vfs.NewMem()
-	opts := &Options{FS: mem}
-	opts.WithFSDefaults()
-	g := &cpuPermissionGranter{permit: true}
-	opts.Experimental.CPUWorkPermissionGranter = g
-	d, err := Open("", opts)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	d.Set([]byte{'a'}, []byte{'a'}, nil)
-	err = d.Compact([]byte{'a'}, []byte{'b'}, true)
-	if err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-	require.True(t, g.used)
-	require.Equal(t, g.requestCount, 0)
-}
-
-// Tests that there's no errors or panics when the default CPU granter is used.
-func TestCompactionCPUGranterDefault(t *testing.T) {
-	mem := vfs.NewMem()
-	opts := &Options{FS: mem}
-	opts.WithFSDefaults()
-	d, err := Open("", opts)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	d.Set([]byte{'a'}, []byte{'a'}, nil)
-	err = d.Compact([]byte{'a'}, []byte{'b'}, true)
-	if err != nil {
-		t.Fatalf("Compact: %v", err)
 	}
 }
 
@@ -653,8 +597,7 @@ func TestCompaction(t *testing.T) {
 		}
 		defer provider.Close()
 		for _, levelMetadata := range v.Levels {
-			iter := levelMetadata.Iter()
-			for meta := iter.First(); meta != nil; meta = iter.Next() {
+			for meta := range levelMetadata.All() {
 				if meta.Virtual {
 					continue
 				}
@@ -667,7 +610,7 @@ func TestCompaction(t *testing.T) {
 					return "", "", errors.WithStack(err)
 				}
 				defer r.Close()
-				iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+				iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 				if err != nil {
 					return "", "", errors.WithStack(err)
 				}
@@ -955,6 +898,7 @@ func TestManualCompaction(t *testing.T) {
 		}
 		opts.WithFSDefaults()
 		opts.Experimental.EnableColumnarBlocks = func() bool { return true }
+		opts.Experimental.CompactionScheduler = NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
 
 		var err error
 		d, err = Open("", opts)
@@ -975,8 +919,7 @@ func TestManualCompaction(t *testing.T) {
 		ongoingCompaction.startLevel.files = curr.Overlaps(startLevel, base.UserKeyBoundsInclusive(start, end))
 		ongoingCompaction.outputLevel.files = curr.Overlaps(outputLevel, base.UserKeyBoundsInclusive(start, end))
 		for _, cl := range ongoingCompaction.inputs {
-			iter := cl.files.Iter()
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for f := range cl.files.All() {
 				f.CompactionState = manifest.CompactionStateCompacting
 			}
 		}
@@ -988,8 +931,7 @@ func TestManualCompaction(t *testing.T) {
 	// d.mu must be held when calling.
 	deleteOngoingCompaction := func(ongoingCompaction *compaction) {
 		for _, cl := range ongoingCompaction.inputs {
-			iter := cl.files.Iter()
-			for f := iter.First(); f != nil; f = iter.Next() {
+			for f := range cl.files.All() {
 				f.CompactionState = manifest.CompactionStateNotCompacting
 			}
 		}
@@ -1060,6 +1002,7 @@ func TestManualCompaction(t *testing.T) {
 				}
 				opts.WithFSDefaults()
 				opts.Experimental.EnableColumnarBlocks = func() bool { return true }
+				opts.Experimental.CompactionScheduler = NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
 
 				var err error
 				if d, err = runDBDefineCmd(td, opts); err != nil {
@@ -1158,10 +1101,6 @@ func TestManualCompaction(t *testing.T) {
 					if len(d.mu.compact.manual) == 0 {
 						return errors.New("no manual compaction queued")
 					}
-					manual := d.mu.compact.manual[0]
-					if manual.retries == 0 {
-						return errors.New("manual compaction has not been retried")
-					}
 					return nil
 				})
 				if err != nil {
@@ -1175,6 +1114,13 @@ func TestManualCompaction(t *testing.T) {
 				d.mu.Lock()
 				deleteOngoingCompaction(ongoingCompaction)
 				ongoingCompaction = nil
+				d.mu.Unlock()
+				d.opts.Experimental.CompactionScheduler.(*ConcurrencyLimitScheduler).
+					adjustRunningCompactionsForTesting(-1)
+				// If the ongoing compaction conflicted with the manual compaction,
+				// the CompactionScheduler may believe there is no waiting compaction.
+				// So explicitly call maybeScheduleCompaction.
+				d.mu.Lock()
 				d.maybeScheduleCompaction()
 				d.mu.Unlock()
 				if err := <-ch; err != nil {
@@ -1194,6 +1140,8 @@ func TestManualCompaction(t *testing.T) {
 				d.mu.Lock()
 				ongoingCompaction = createOngoingCompaction([]byte(start), []byte(end), startLevel, outputLevel)
 				d.mu.Unlock()
+				d.opts.Experimental.CompactionScheduler.(*ConcurrencyLimitScheduler).
+					adjustRunningCompactionsForTesting(+1)
 				return ""
 
 			case "remove-ongoing-compaction":
@@ -1201,6 +1149,9 @@ func TestManualCompaction(t *testing.T) {
 				deleteOngoingCompaction(ongoingCompaction)
 				ongoingCompaction = nil
 				d.mu.Unlock()
+				d.opts.Experimental.CompactionScheduler.(*ConcurrencyLimitScheduler).
+					adjustRunningCompactionsForTesting(-1)
+
 				return ""
 
 			case "set-concurrent-compactions":
@@ -1276,6 +1227,12 @@ func TestManualCompaction(t *testing.T) {
 		{
 			testData:   "testdata/manual_compaction_set_with_del_sstable_Pebblev5",
 			minVersion: FormatColumnarBlocks,
+			maxVersion: FormatColumnarBlocks,
+		},
+		{
+			testData:   "testdata/manual_compaction_set_with_del_sstable_Pebblev6",
+			minVersion: FormatTableFormatV6,
+			maxVersion: FormatTableFormatV6,
 		},
 	}
 
@@ -1295,7 +1252,8 @@ func TestManualCompaction(t *testing.T) {
 
 func TestCompactionOutputLevel(t *testing.T) {
 	opts := DefaultOptions()
-	version := manifest.TestingNewVersion(opts.Comparer)
+	version := manifest.NewInitialVersion(opts.Comparer)
+	l0Organizer := manifest.NewL0Organizer(opts.Comparer, 0 /* flushSplitBytes */)
 
 	datadriven.RunTest(t, "testdata/compaction_output_level",
 		func(t *testing.T, d *datadriven.TestData) (res string) {
@@ -1310,8 +1268,8 @@ func TestCompactionOutputLevel(t *testing.T) {
 				var start, base int
 				d.ScanArgs(t, "start", &start)
 				d.ScanArgs(t, "base", &base)
-				pc := newPickedCompaction(opts, version, start, defaultOutputLevel(start, base), base)
-				c := newCompaction(pc, opts, time.Now(), nil /* provider */, nil /* slot */)
+				pc := newPickedCompaction(opts, version, l0Organizer, start, defaultOutputLevel(start, base), base)
+				c := newCompaction(pc, opts, time.Now(), nil /* provider */, noopGrantHandle{})
 				return fmt.Sprintf("output=%d\nmax-output-file-size=%d\n",
 					c.outputLevel.level, c.maxOutputFileSize)
 
@@ -1584,23 +1542,45 @@ func TestCompactionTombstones(t *testing.T) {
 		}
 	}()
 
-	var compactInfo *CompactionInfo // protected by d.mu
+	var compactInfo []*CompactionInfo // protected by d.mu
 
 	compactionString := func() string {
 		for d.mu.compact.compactingCount > 0 {
 			d.mu.compact.cond.Wait()
 		}
 
-		s := "(none)"
-		if compactInfo != nil {
-			// Fix the job ID and durations for determinism.
-			compactInfo.JobID = 100
-			compactInfo.Duration = time.Second
-			compactInfo.TotalDuration = 2 * time.Second
-			s = compactInfo.String()
-			compactInfo = nil
+		if len(compactInfo) == 0 {
+			return "(none)"
 		}
-		return s
+		for _, c := range compactInfo {
+			// Fix the job ID and durations for determinism.
+			c.JobID = 0
+			c.Duration = time.Second
+			c.TotalDuration = 2 * time.Second
+			if len(compactInfo) > 1 {
+				// The output table numbering is non-deterministic when there are
+				// multiple concurrent compactions.
+				for i := range c.Output.Tables {
+					c.Output.Tables[i].FileNum = 0
+				}
+			}
+		}
+		// Sort for determinism. We use the negative value of cmp.Compare to sort
+		// delete-only before default since it is more natural in the output, as
+		// delete-only is selected first.
+		slices.SortFunc(compactInfo, func(a, b *CompactionInfo) int {
+			return -cmp.Compare(a.String(), b.String())
+		})
+		var b strings.Builder
+		jobID := 100
+		for _, c := range compactInfo {
+			// Fix the job ID.
+			c.JobID = jobID
+			jobID++
+			fmt.Fprintf(&b, "%s\n", c.String())
+		}
+		compactInfo = nil
+		return b.String()
 	}
 
 	datadriven.RunTest(t, "testdata/compaction_tombstones",
@@ -1608,18 +1588,18 @@ func TestCompactionTombstones(t *testing.T) {
 			switch td.Cmd {
 			case "define":
 				if d != nil {
-					compactInfo = nil
 					require.NoError(t, closeAllSnapshots(d))
 					if err := d.Close(); err != nil {
 						return err.Error()
 					}
+					compactInfo = nil
 				}
 				opts := &Options{
 					FS:         vfs.NewMem(),
 					DebugCheck: DebugCheckLevels,
 					EventListener: &EventListener{
 						CompactionEnd: func(info CompactionInfo) {
-							compactInfo = &info
+							compactInfo = append(compactInfo, &info)
 						},
 					},
 					FormatMajorVersion: internalFormatNewest,
@@ -1627,6 +1607,7 @@ func TestCompactionTombstones(t *testing.T) {
 				opts.WithFSDefaults()
 				opts.Experimental.EnableDeleteOnlyCompactionExcises = func() bool { return true }
 				opts.Experimental.EnableColumnarBlocks = func() bool { return true }
+				opts.Experimental.CompactionScheduler = NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
 				var err error
 				d, err = runDBDefineCmd(td, opts)
 				if err != nil {
@@ -1999,11 +1980,11 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 					}
 
 					c.smallest, c.largest = manifest.KeyRange(c.cmp,
-						c.startLevel.files.Iter(),
-						c.outputLevel.files.Iter())
+						c.startLevel.files.All(),
+						c.outputLevel.files.All())
 
 					c.delElision, c.rangeKeyElision = compact.SetupTombstoneElision(
-						c.cmp, c.version, c.outputLevel.level, base.UserKeyBoundsFromInternal(c.smallest, c.largest),
+						c.cmp, c.version, d.mu.versions.l0Organizer, c.outputLevel.level, base.UserKeyBoundsFromInternal(c.smallest, c.largest),
 					)
 					fmt.Fprintf(&buf, "%t\n", c.allowZeroSeqNum())
 				}
@@ -2520,8 +2501,7 @@ func TestMarkedForCompaction(t *testing.T) {
 			var fileNum uint64
 			td.ScanArgs(t, "file", &fileNum)
 			for l, lm := range vers.Levels {
-				iter := lm.Iter()
-				for f := iter.First(); f != nil; f = iter.Next() {
+				for f := range lm.All() {
 					if f.FileNum != base.FileNum(fileNum) {
 						continue
 					}

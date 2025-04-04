@@ -220,40 +220,6 @@ type Writer interface {
 	RangeKeyDelete(start, end []byte, opts *WriteOptions) error
 }
 
-// CPUWorkHandle represents a handle used by the CPUWorkPermissionGranter API.
-type CPUWorkHandle interface {
-	// Permitted indicates whether Pebble can use additional CPU resources.
-	Permitted() bool
-}
-
-// CPUWorkPermissionGranter is used to request permission to opportunistically
-// use additional CPUs to speed up internal background work.
-type CPUWorkPermissionGranter interface {
-	// GetPermission returns a handle regardless of whether permission is granted
-	// or not. In the latter case, the handle is only useful for recording
-	// the CPU time actually spent on this calling goroutine.
-	GetPermission(time.Duration) CPUWorkHandle
-	// CPUWorkDone must be called regardless of whether CPUWorkHandle.Permitted
-	// returns true or false.
-	CPUWorkDone(CPUWorkHandle)
-}
-
-// Use a default implementation for the CPU work granter to avoid excessive nil
-// checks in the code.
-type defaultCPUWorkHandle struct{}
-
-func (d defaultCPUWorkHandle) Permitted() bool {
-	return false
-}
-
-type defaultCPUWorkGranter struct{}
-
-func (d defaultCPUWorkGranter) GetPermission(_ time.Duration) CPUWorkHandle {
-	return defaultCPUWorkHandle{}
-}
-
-func (d defaultCPUWorkGranter) CPUWorkDone(_ CPUWorkHandle) {}
-
 // DB provides a concurrent, persistent ordered key/value store.
 //
 // A DB's basic operations (Get, Set, Delete) should be self-explanatory. Get
@@ -453,7 +419,10 @@ type DB struct {
 			deletionHints []deleteCompactionHint
 			// The list of manual compactions. The next manual compaction to perform
 			// is at the start of the list. New entries are added to the end.
-			manual []*manualCompaction
+			manual    []*manualCompaction
+			manualLen atomic.Int32
+			// manualID is used to identify manualCompactions in the manual slice.
+			manualID uint64
 			// downloads is the list of pending download tasks. The next download to
 			// perform is at the start of the list. New entries are added to the end.
 			downloads []*downloadSpanTask
@@ -1380,6 +1349,9 @@ type internalIterOpts struct {
 	compaction         bool
 	readEnv            block.ReadEnv
 	boundLimitedFilter sstable.BoundLimitedBlockPropertyFilter
+	// blobValueFetcher is the base.ValueFetcher to use when constructing
+	// internal values to represent values stored externally in blob files.
+	blobValueFetcher base.ValueFetcher
 }
 
 func finishInitializingInternalIter(
@@ -1432,18 +1404,21 @@ func (i *Iterator) constructPointIter(
 		// Already have one.
 		return
 	}
+	readEnv := block.ReadEnv{
+		Stats: &i.stats.InternalStats,
+		// If the file cache has a sstable stats collector, ask it for an
+		// accumulator for this iterator's configured category and QoS. All SSTable
+		// iterators created by this Iterator will accumulate their stats to it as
+		// they Close during iteration.
+		IterStats: i.fc.SSTStatsCollector().Accumulator(
+			uint64(uintptr(unsafe.Pointer(i))),
+			i.opts.Category,
+		),
+	}
+	i.blobValueFetcher.Init(i.fc, readEnv)
 	internalOpts := internalIterOpts{
-		readEnv: block.ReadEnv{
-			Stats: &i.stats.InternalStats,
-			// If the file cache has a sstable stats collector, ask it for an
-			// accumulator for this iterator's configured category and QoS. All SSTable
-			// iterators created by this Iterator will accumulate their stats to it as
-			// they Close during iteration.
-			IterStats: i.fc.SSTStatsCollector().Accumulator(
-				uint64(uintptr(unsafe.Pointer(i))),
-				i.opts.Category,
-			),
-		},
+		readEnv:          readEnv,
+		blobValueFetcher: &i.blobValueFetcher,
 	}
 	if i.opts.RangeKeyMasking.Filter != nil {
 		internalOpts.boundLimitedFilter = &i.rangeKeyMasking
@@ -1666,6 +1641,14 @@ func (d *DB) NewEventuallyFileOnlySnapshot(keyRanges []KeyRange) *EventuallyFile
 // or to call Close concurrently with any other DB method. It is not valid
 // to call any of a DB's methods after the DB has been closed.
 func (d *DB) Close() error {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	// Compactions can be asynchronously started by the CompactionScheduler
+	// calling d.Schedule. When this Unregister returns, we know that the
+	// CompactionScheduler will never again call a method on the DB. Note that
+	// this must be called without holding d.mu.
+	d.opts.Experimental.CompactionScheduler.Unregister()
 	// Lock the commit pipeline for the duration of Close. This prevents a race
 	// with makeRoomForWrite. Rotating the WAL in makeRoomForWrite requires
 	// dropping d.mu several times for I/O. If Close only holds d.mu, an
@@ -1680,10 +1663,14 @@ func (d *DB) Close() error {
 	defer d.commit.mu.Unlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// Check that the DB is not closed again. If there are two concurrent calls
+	// to DB.Close, the best-effort check at the top of DB.Close may not fire.
+	// But since this second check happens after mutex acquisition, the two
+	// concurrent calls will get serialized and the second one will see the
+	// effect of the d.closed.Store below.
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
-
 	// Clear the finalizer that is used to check that an unreferenced DB has been
 	// closed. We're closing the DB here, so the check performed by that
 	// finalizer isn't necessary.
@@ -1916,7 +1903,12 @@ func (d *DB) manualCompact(start, end []byte, level int, parallelize bool) error
 			end:   end,
 		})
 	}
+	for i := range compactions {
+		d.mu.compact.manualID++
+		compactions[i].id = d.mu.compact.manualID
+	}
 	d.mu.compact.manual = append(d.mu.compact.manual, compactions...)
+	d.mu.compact.manualLen.Store(int32(len(d.mu.compact.manual)))
 	d.maybeScheduleCompaction()
 	d.mu.Unlock()
 
@@ -1946,7 +1938,7 @@ func (d *DB) splitManualCompaction(
 	if level == 0 {
 		endLevel = baseLevel
 	}
-	keyRanges := curr.CalculateInuseKeyRanges(level, endLevel, start, end)
+	keyRanges := curr.CalculateInuseKeyRanges(d.mu.versions.l0Organizer, level, endLevel, start, end)
 	for _, keyRange := range keyRanges {
 		splitCompactions = append(splitCompactions, &manualCompaction{
 			level: level,
@@ -2235,9 +2227,8 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 	destTables := make([]SSTableInfo, totalTables)
 	destLevels := make([][]SSTableInfo, len(srcLevels))
 	for i := range destLevels {
-		iter := srcLevels[i].Iter()
 		j := 0
-		for m := iter.First(); m != nil; m = iter.Next() {
+		for m := range srcLevels[i].All() {
 			if opt.start != nil && opt.end != nil {
 				b := base.UserKeyBoundsEndExclusive(opt.start, opt.end)
 				if !m.Overlaps(d.opts.Comparer.Compare, &b) {
@@ -2526,7 +2517,7 @@ func (d *DB) maybeInduceWriteStall(b *Batch) {
 			}
 			continue
 		}
-		l0ReadAmp := d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
+		l0ReadAmp := d.mu.versions.l0Organizer.ReadAmplification()
 		if l0ReadAmp >= d.opts.L0StopWritesThreshold {
 			// There are too many level-0 files, so we wait.
 			if !stalled {

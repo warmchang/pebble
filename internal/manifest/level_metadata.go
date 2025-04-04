@@ -7,6 +7,7 @@ package manifest
 import (
 	"bytes"
 	"fmt"
+	"iter"
 	"reflect"
 
 	"github.com/cockroachdb/pebble/internal/base"
@@ -49,7 +50,7 @@ func MakeLevelMetadata(cmp Compare, level int, files []*TableMetadata) LevelMeta
 	}
 	var lm LevelMetadata
 	lm.level = level
-	lm.tree, _ = makeBTree(cmp, bcmp, files)
+	lm.tree = makeBTree(cmp, bcmp, files)
 	for _, f := range files {
 		lm.totalSize += f.Size
 		if f.Virtual {
@@ -60,14 +61,24 @@ func MakeLevelMetadata(cmp Compare, level int, files []*TableMetadata) LevelMeta
 	return lm
 }
 
-func makeBTree(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) (btree, LevelSlice) {
-	var t btree
-	t.cmp = cmp
-	t.bcmp = bcmp
+func makeBTree(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) btree {
+	t := btree{cmp: cmp, bcmp: bcmp}
 	for _, f := range files {
-		t.Insert(f)
+		if err := t.Insert(f); err != nil {
+			panic(err)
+		}
 	}
-	return t, newLevelSlice(t.Iter())
+	return t
+}
+
+func makeLevelSlice(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) LevelSlice {
+	t := makeBTree(cmp, bcmp, files)
+	slice := newLevelSlice(t.Iter())
+	slice.verifyInvariants()
+	// We can release the tree because the nodes that are referenced by the
+	// LevelSlice are immutable and we never recycle them.
+	t.Release(ignoreObsoleteFiles{})
+	return slice
 }
 
 func (lm *LevelMetadata) insert(f *TableMetadata) error {
@@ -109,6 +120,18 @@ func (lm *LevelMetadata) Size() uint64 {
 // Iter constructs a LevelIterator over the entire level.
 func (lm *LevelMetadata) Iter() LevelIterator {
 	return LevelIterator{iter: lm.tree.Iter()}
+}
+
+// All returns an iterator over all files in the level.
+func (lm *LevelMetadata) All() iter.Seq[*TableMetadata] {
+	return func(yield func(*TableMetadata) bool) {
+		iter := lm.Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
+			if !yield(f) {
+				break
+			}
+		}
+	}
 }
 
 // Slice constructs a slice containing the entire level.
@@ -158,10 +181,7 @@ func (lf LevelFile) Slice() LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceSeqSorted(files []*TableMetadata) LevelSlice {
-	tr, slice := makeBTree(nil, btreeCmpSeqNum, files)
-	tr.Release(ignoreObsoleteFiles{})
-	slice.verifyInvariants()
-	return slice
+	return makeLevelSlice(nil, btreeCmpSeqNum, files)
 }
 
 // NewLevelSliceKeySorted constructs a LevelSlice over the provided files,
@@ -169,10 +189,7 @@ func NewLevelSliceSeqSorted(files []*TableMetadata) LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceKeySorted(cmp base.Compare, files []*TableMetadata) LevelSlice {
-	tr, slice := makeBTree(cmp, btreeCmpSmallestKey(cmp), files)
-	tr.Release(ignoreObsoleteFiles{})
-	slice.verifyInvariants()
-	return slice
+	return makeLevelSlice(cmp, btreeCmpSmallestKey(cmp), files)
 }
 
 // NewLevelSliceSpecificOrder constructs a LevelSlice over the provided files,
@@ -180,8 +197,7 @@ func NewLevelSliceKeySorted(cmp base.Compare, files []*TableMetadata) LevelSlice
 // tests.
 // TODO(jackson): Update tests to avoid requiring this and remove it.
 func NewLevelSliceSpecificOrder(files []*TableMetadata) LevelSlice {
-	tr, slice := makeBTree(nil, btreeCmpSpecificOrder(files), files)
-	tr.Release(ignoreObsoleteFiles{})
+	slice := makeLevelSlice(nil, btreeCmpSpecificOrder(files), files)
 	slice.verifyInvariants()
 	return slice
 }
@@ -243,9 +259,8 @@ type LevelSlice struct {
 
 func (ls LevelSlice) verifyInvariants() {
 	if invariants.Enabled {
-		i := ls.Iter()
 		var length int
-		for f := i.First(); f != nil; f = i.Next() {
+		for range ls.All() {
 			length++
 		}
 		if ls.length != length {
@@ -254,11 +269,15 @@ func (ls LevelSlice) verifyInvariants() {
 	}
 }
 
-// Each invokes fn for each element in the slice.
-func (ls LevelSlice) Each(fn func(*TableMetadata)) {
-	iter := ls.Iter()
-	for f := iter.First(); f != nil; f = iter.Next() {
-		fn(f)
+// All returns an iterator over all files in the slice.
+func (ls LevelSlice) All() iter.Seq[*TableMetadata] {
+	return func(yield func(*TableMetadata) bool) {
+		iter := ls.Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
+			if !yield(f) {
+				break
+			}
+		}
 	}
 }
 
@@ -266,12 +285,12 @@ func (ls LevelSlice) Each(fn func(*TableMetadata)) {
 func (ls LevelSlice) String() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "%d files: ", ls.length)
-	ls.Each(func(f *TableMetadata) {
+	for f := range ls.All() {
 		if buf.Len() > 0 {
 			fmt.Fprintf(&buf, " ")
 		}
 		fmt.Fprint(&buf, f)
-	})
+	}
 	return buf.String()
 }
 
@@ -298,8 +317,7 @@ func (ls *LevelSlice) Len() int {
 // the length of the slice.
 func (ls *LevelSlice) SizeSum() uint64 {
 	var sum uint64
-	iter := ls.Iter()
-	for f := iter.First(); f != nil; f = iter.Next() {
+	for f := range ls.All() {
 		sum += f.Size
 	}
 	return sum
@@ -309,8 +327,7 @@ func (ls *LevelSlice) SizeSum() uint64 {
 // linear in the length of the slice.
 func (ls *LevelSlice) NumVirtual() uint64 {
 	var n uint64
-	iter := ls.Iter()
-	for f := iter.First(); f != nil; f = iter.Next() {
+	for f := range ls.All() {
 		if f.Virtual {
 			n++
 		}
@@ -322,8 +339,7 @@ func (ls *LevelSlice) NumVirtual() uint64 {
 // level.
 func (ls *LevelSlice) VirtualSizeSum() uint64 {
 	var sum uint64
-	iter := ls.Iter()
-	for f := iter.First(); f != nil; f = iter.Next() {
+	for f := range ls.All() {
 		if f.Virtual {
 			sum += f.Size
 		}
