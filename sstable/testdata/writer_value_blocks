@@ -1,7 +1,7 @@
 # Size of value index is 3 bytes plus 5 + 5 = 10 bytes of trailer of the value
 # block and value index block. So size 18 - 13 = 5 size of the value in the
 # value block.
-build table-format=(Pebble,v4)
+build table-format=Pebble,v4
 a@2.SET.1:a2
 b@5.SET.7:b5
 b@4.DEL.3:
@@ -36,7 +36,7 @@ scan-cloned-lazy-values
 
 # Repeat the above test with (Pebble,v5) [columnar blocks].
 
-build table-format=(Pebble,v5)
+build table-format=Pebble,v5
 a@2.SET.1:a2
 b@5.SET.7:b5
 b@4.DEL.3:
@@ -62,7 +62,7 @@ scan-cloned-lazy-values
 4(lazy: len 5, attr: 5): vbat2
 
 # Same data as previous, with disable-value-blocks set to true
-build disable-value-blocks=true table-format=(Pebble,v4)
+build disable-value-blocks=true table-format=Pebble,v4
 a@2.SET.1:a2
 b@5.SET.7:b5
 b@4.DEL.3:
@@ -89,7 +89,7 @@ b@2#1,SET:vbat2
 
 # Same as above but with (Pebble,v5) [columnar blocks].
 
-build disable-value-blocks=true table-format=(Pebble,v5)
+build disable-value-blocks=true table-format=Pebble,v5
 a@2.SET.1:a2
 b@5.SET.7:b5
 b@4.DEL.3:
@@ -109,7 +109,7 @@ b@2#1,SET:vbat2
 # Size of value index is 3 bytes plus 5 + 5 = 10 bytes of trailer of the value
 # block and value index block. So size 33 - 13 = 20 is the total size of the
 # values in the value block.
-build table-format=(Pebble,v4)
+build table-format=Pebble,v4
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 blue@8.SET.16:blue8s
@@ -156,7 +156,7 @@ scan-cloned-lazy-values
 
 # Same as above but with (Pebble,v5) [columnar blocks].
 
-build table-format=(Pebble,v5)
+build table-format=Pebble,v5
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 blue@8.SET.16:blue8s
@@ -195,7 +195,7 @@ scan-cloned-lazy-values
 # block has to encode two tuples, each of 4 bytes (blockNumByteLength=1,
 # blockOffsetByteLength=2, blockLengthByteLength=1), so 2*4=8. The total is
 # 15+26+8=49 bytes, which corresponds to "size: 49" below.
-build block-size=8 table-format=(Pebble,v4)
+build block-size=8 table-format=Pebble,v4
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 blue@8.SET.16:blue8s
@@ -330,7 +330,7 @@ sstable
 
 # Same as above but with (Pebble,v5) [columnar blocks].
 
-build block-size=8 table-format=(Pebble,v5)
+build block-size=8 table-format=Pebble,v5
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 blue@8.SET.16:blue8s
@@ -685,7 +685,7 @@ sstable
       └── 045  magic number: 0xf09faab3f09faab3
 
 # Require that [c,e) must be in-place.
-build in-place-bound=(c,e) table-format=(Pebble,v4)
+build in-place-bound=(c,e) table-format=Pebble,v4
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 c@10.SET.16:c10
@@ -724,7 +724,7 @@ scan-cloned-lazy-values
 
 # Same as above with (Pebble,v5) [columnar blocks].
 
-build in-place-bound=(c,e) table-format=(Pebble,v5)
+build in-place-bound=(c,e) table-format=Pebble,v5
 blue@10.SET.20:blue10
 blue@8.SET.18:blue8
 c@10.SET.16:c10
@@ -753,7 +753,7 @@ scan-cloned-lazy-values
 5(lazy: len 5, attr: 5): eat18
 
 # Try write empty values to value blocks.
-build table-format=(Pebble,v4)
+build table-format=Pebble,v4
 b@5.SET.7:b5
 b@3.SET.2:
 c@6.DEL.7:
@@ -831,7 +831,7 @@ sstable
 
 # Same as above but with (Pebble,v5) [columnar blocks].
 
-build table-format=(Pebble,v5)
+build table-format=Pebble,v5
 b@5.SET.7:b5
 b@3.SET.2:
 c@6.DEL.7:
@@ -973,3 +973,145 @@ sstable
       ├── 004  index: offset=105, length=36
       ├── 041  version: 5
       └── 045  magic number: 0xf09faab3f09faab3
+
+# Same as above but with (Pebble,v6) [footer checksum blocks].
+build table-format=Pebble,v6
+b@5.SET.7:b5
+b@3.SET.2:
+c@6.DEL.7:
+c@5.DEL.6:
+----
+value-blocks: num-values 0, num-blocks: 0, size: 0
+
+scan
+----
+b@5#7,SET:b5
+b@3#2,SET:
+c@6#7,DEL:
+c@5#6,DEL:
+
+layout
+----
+sstable
+ ├── data  offset: 0  length: 100
+ │    ├── data block header
+ │    │    ├── columnar block header
+ │    │    │    ├── 000-004: x 03000000 # maximum key length: 3
+ │    │    │    ├── 004-005: x 01       # version 1
+ │    │    │    ├── 005-007: x 0700     # 7 columns
+ │    │    │    ├── 007-011: x 04000000 # 4 rows
+ │    │    │    ├── 011-012: b 00000100 # col 0: prefixbytes
+ │    │    │    ├── 012-016: x 2e000000 # col 0: page start 46
+ │    │    │    ├── 016-017: b 00000011 # col 1: bytes
+ │    │    │    ├── 017-021: x 38000000 # col 1: page start 56
+ │    │    │    ├── 021-022: b 00000010 # col 2: uint
+ │    │    │    ├── 022-026: x 46000000 # col 2: page start 70
+ │    │    │    ├── 026-027: b 00000001 # col 3: bool
+ │    │    │    ├── 027-031: x 50000000 # col 3: page start 80
+ │    │    │    ├── 031-032: b 00000011 # col 4: bytes
+ │    │    │    ├── 032-036: x 68000000 # col 4: page start 104
+ │    │    │    ├── 036-037: b 00000001 # col 5: bool
+ │    │    │    ├── 037-041: x 70000000 # col 5: page start 112
+ │    │    │    ├── 041-042: b 00000001 # col 6: bool
+ │    │    │    └── 042-046: x 71000000 # col 6: page start 113
+ │    │    ├── data for column 0 (prefixbytes)
+ │    │    │    ├── 046-047: x 04 # bundle size: 16
+ │    │    │    ├── offsets table
+ │    │    │    │    ├── 047-048: x 01 # encoding: 1b
+ │    │    │    │    ├── 048-049: x 00 # data[0] = 0 [54 overall]
+ │    │    │    │    ├── 049-050: x 00 # data[1] = 0 [54 overall]
+ │    │    │    │    ├── 050-051: x 01 # data[2] = 1 [55 overall]
+ │    │    │    │    ├── 051-052: x 01 # data[3] = 1 [55 overall]
+ │    │    │    │    ├── 052-053: x 02 # data[4] = 2 [56 overall]
+ │    │    │    │    └── 053-054: x 02 # data[5] = 2 [56 overall]
+ │    │    │    └── data
+ │    │    │         ├── 054-054: x    # data[00]:  (block prefix)
+ │    │    │         ├── 054-054: x    # data[01]:  (bundle prefix)
+ │    │    │         ├── 054-055: x 62 # data[02]: b
+ │    │    │         ├── 055-055: x    # data[03]: .
+ │    │    │         ├── 055-056: x 63 # data[04]: c
+ │    │    │         └── 056-056: x    # data[05]: .
+ │    │    ├── data for column 1 (bytes)
+ │    │    │    ├── offsets table
+ │    │    │    │    ├── 056-057: x 01 # encoding: 1b
+ │    │    │    │    ├── 057-058: x 00 # data[0] = 0 [62 overall]
+ │    │    │    │    ├── 058-059: x 02 # data[1] = 2 [64 overall]
+ │    │    │    │    ├── 059-060: x 04 # data[2] = 4 [66 overall]
+ │    │    │    │    ├── 060-061: x 06 # data[3] = 6 [68 overall]
+ │    │    │    │    └── 061-062: x 08 # data[4] = 8 [70 overall]
+ │    │    │    └── data
+ │    │    │         ├── 062-064: x 4035 # data[0]: @5
+ │    │    │         ├── 064-066: x 4033 # data[1]: @3
+ │    │    │         ├── 066-068: x 4036 # data[2]: @6
+ │    │    │         └── 068-070: x 4035 # data[3]: @5
+ │    │    ├── data for column 2 (uint)
+ │    │    │    ├── 070-071: x 02   # encoding: 2b
+ │    │    │    ├── 071-072: x 00   # padding (aligning to 16-bit boundary)
+ │    │    │    ├── 072-074: x 0107 # data[0] = 1793
+ │    │    │    ├── 074-076: x 0102 # data[1] = 513
+ │    │    │    ├── 076-078: x 0007 # data[2] = 1792
+ │    │    │    └── 078-080: x 0006 # data[3] = 1536
+ │    │    ├── data for column 3 (bool)
+ │    │    │    ├── 080-081: x 00                                                               # default bitmap encoding
+ │    │    │    ├── 081-088: x 00000000000000                                                   # padding to align to 64-bit boundary
+ │    │    │    ├── 088-096: b 0000010100000000000000000000000000000000000000000000000000000000 # bitmap word 0
+ │    │    │    └── 096-104: b 0000000100000000000000000000000000000000000000000000000000000000 # bitmap summary word 0-63
+ │    │    ├── data for column 4 (bytes)
+ │    │    │    ├── offsets table
+ │    │    │    │    ├── 104-105: x 01 # encoding: 1b
+ │    │    │    │    ├── 105-106: x 00 # data[0] = 0 [110 overall]
+ │    │    │    │    ├── 106-107: x 02 # data[1] = 2 [112 overall]
+ │    │    │    │    ├── 107-108: x 02 # data[2] = 2 [112 overall]
+ │    │    │    │    ├── 108-109: x 02 # data[3] = 2 [112 overall]
+ │    │    │    │    └── 109-110: x 02 # data[4] = 2 [112 overall]
+ │    │    │    └── data
+ │    │    │         ├── 110-112: x 6235 # data[0]: b5
+ │    │    │         ├── 112-112: x      # data[1]:
+ │    │    │         ├── 112-112: x      # data[2]:
+ │    │    │         └── 112-112: x      # data[3]:
+ │    │    ├── data for column 5 (bool)
+ │    │    │    └── 112-113: x 01 # zero bitmap encoding
+ │    │    ├── data for column 6 (bool)
+ │    │    │    └── 113-114: x 01 # zero bitmap encoding
+ │    │    └── 114-115: x 00 # block padding byte
+ │    ├── b@5#7,SET:b5
+ │    ├── b@3#2,SET:
+ │    ├── c@6#7,DEL:
+ │    ├── c@5#6,DEL:
+ │    └── trailer [compression=snappy checksum=0x73ac4dc7]
+ ├── index  offset: 105  length: 36
+ │    ├── 00000    block:0/100
+ │    │   
+ │    └── trailer [compression=none checksum=0x760132f1]
+ ├── properties  offset: 146  length: 525
+ │    ├── 00000    obsolete-key (13)
+ │    ├── 00013    pebble.colblk.schema (65)
+ │    ├── 00078    pebble.raw.point-tombstone.key.size (36)
+ │    ├── 00114    rocksdb.block.based.table.index.type (40)
+ │    ├── 00154    rocksdb.comparator (42)
+ │    ├── 00196    rocksdb.compression (25)
+ │    ├── 00221    rocksdb.compression_options (122)
+ │    ├── 00343    rocksdb.data.size (18)
+ │    ├── 00361    rocksdb.deleted.keys (21)
+ │    ├── 00382    rocksdb.filter.size (20)
+ │    ├── 00402    rocksdb.index.size (19)
+ │    ├── 00421    rocksdb.merge.operands (23)
+ │    ├── 00444    rocksdb.merge.operator (40)
+ │    ├── 00484    rocksdb.num.data.blocks (24)
+ │    ├── 00508    rocksdb.num.entries (20)
+ │    ├── 00528    rocksdb.num.range-deletions (28)
+ │    ├── 00556    rocksdb.property.collectors (41)
+ │    ├── 00597    rocksdb.raw.key.size (21)
+ │    ├── 00618    rocksdb.raw.value.size (23)
+ │    └── trailer [compression=snappy checksum=0x6a5dbad6]
+ ├── meta-index  offset: 676  length: 46
+ │    ├── 0000    rocksdb.properties block:146/525
+ │    │   
+ │    └── trailer [compression=none checksum=0xf5a62be1]
+ └── footer  offset: 727  length: 57
+      ├── 000  checksum type: crc32c
+      ├── 001  meta: offset=676, length=46
+      ├── 004  index: offset=105, length=36
+      ├── 041  footer checksum: 0x29ebd1c0
+      ├── 045  version: 6
+      └── 049  magic number: 0xf09faab3f09faab3

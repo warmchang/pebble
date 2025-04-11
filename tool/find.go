@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/wal"
 	"github.com/spf13/cobra"
 )
@@ -459,7 +458,7 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 				err = nil
 				return
 			}
-			defer r.Close()
+			defer func() { _ = r.Close() }()
 
 			var transforms sstable.IterTransforms
 			var fragTransforms sstable.FragmentIterTransforms
@@ -468,18 +467,21 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 				fragTransforms = m.FragmentIterTransforms()
 			}
 
-			iter, err := r.NewIter(transforms, nil, nil)
+			// TODO(jackson): Adjust to support two modes: one that surfaces the
+			// raw blob value handles, and one that fetches the blob values from
+			// blob files uncovered by scanning the directory entries. See #4448.
+			iter, err := r.NewIter(transforms, nil, nil, sstable.AssertNoBlobHandles)
 			if err != nil {
 				return err
 			}
-			defer iter.Close()
+			defer func() { _ = iter.Close() }()
 			kv := iter.SeekGE(searchKey, base.SeekGEFlagsNone)
 
 			// We configured sstable.Reader to return raw tombstones which requires a
 			// bit more work here to put them in a form that can be iterated in
 			// parallel with the point records.
 			rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
-				iter, err := r.NewRawRangeDelIter(context.Background(), fragTransforms, block.NoReadEnv)
+				iter, err := r.NewRawRangeDelIter(context.Background(), fragTransforms, sstable.NoReadEnv)
 				if err != nil {
 					return nil, err
 				}

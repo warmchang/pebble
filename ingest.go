@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/virtual"
 )
 
 func sstableKeyCompare(userCmp Compare, a, b InternalKey) int {
@@ -119,7 +120,7 @@ func ingestSynthesizeShared(
 	meta := &tableMetadata{
 		FileNum:      fileNum,
 		CreationTime: time.Now().Unix(),
-		Virtual:      true,
+		Virtual:      &virtual.VirtualReaderParams{},
 		Size:         sm.Size,
 	}
 	// For simplicity, we use the same number for both the FileNum and the
@@ -207,10 +208,9 @@ func ingestLoad1External(
 	meta := &tableMetadata{
 		FileNum:      fileNum,
 		CreationTime: time.Now().Unix(),
-		Virtual:      true,
 		Size:         e.Size,
+		Virtual:      &virtual.VirtualReaderParams{},
 	}
-
 	// In the name of keeping this ingestion as fast as possible, we avoid *all*
 	// existence checks and synthesize a table metadata with smallest/largest
 	// keys that overlap whatever the passed-in span was.
@@ -317,7 +317,7 @@ func ingestLoad1(
 	if err != nil {
 		return nil, keyspan.Span{}, err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// Avoid ingesting tables with format versions this DB doesn't support.
 	tf, err := r.TableFormat()
@@ -336,6 +336,10 @@ func ingestLoad1(
 				"pebble: table uses key schema %q unknown to the database",
 				r.Properties.KeySchemaName)
 		}
+	}
+	if r.Properties.NumValuesInBlobFiles > 0 {
+		return nil, keyspan.Span{}, errors.Newf(
+			"pebble: ingesting tables with blob references is not supported")
 	}
 
 	meta = &tableMetadata{}
@@ -356,11 +360,11 @@ func ingestLoad1(
 	maybeSetStatsFromProperties(meta.PhysicalMeta(), &r.Properties)
 
 	{
-		iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+		iter, err := r.NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 		if err != nil {
 			return nil, keyspan.Span{}, err
 		}
-		defer iter.Close()
+		defer func() { _ = iter.Close() }()
 		var smallest InternalKey
 		if kv := iter.First(); kv != nil {
 			if err := ingestValidateKey(opts, &kv.K); err != nil {
@@ -382,7 +386,7 @@ func ingestLoad1(
 		}
 	}
 
-	iter, err := r.NewRawRangeDelIter(ctx, sstable.NoFragmentTransforms, block.NoReadEnv)
+	iter, err := r.NewRawRangeDelIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
 	if err != nil {
 		return nil, keyspan.Span{}, err
 	}
@@ -412,7 +416,7 @@ func ingestLoad1(
 
 	// Update the range-key bounds for the table.
 	{
-		iter, err := r.NewRawRangeKeyIter(ctx, sstable.NoFragmentTransforms, block.NoReadEnv)
+		iter, err := r.NewRawRangeKeyIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
 		if err != nil {
 			return nil, keyspan.Span{}, err
 		}
@@ -448,10 +452,14 @@ func ingestLoad1(
 				lastRangeKey = s.Clone()
 			} else {
 				// s == nil.
-				rangeKeyValidator.Validate(nil /* nextFileSmallestKey */)
+				if err := rangeKeyValidator.Validate(nil /* nextFileSmallestKey */); err != nil {
+					return nil, keyspan.Span{}, err
+				}
 			}
 		} else {
-			rangeKeyValidator.Validate(nil /* nextFileSmallestKey */)
+			if err := rangeKeyValidator.Validate(nil /* nextFileSmallestKey */); err != nil {
+				return nil, keyspan.Span{}, err
+			}
 			lastRangeKey = keyspan.Span{}
 		}
 	}
@@ -1080,6 +1088,10 @@ func ingestTargetLevel(
 // the same filesystem as the DB. Sstables can be created for ingestion using
 // sstable.Writer. On success, Ingest removes the input paths.
 //
+// Ingested sstables must have been created with a known KeySchema (when written
+// with columnar blocks) and Comparer. They must not contain any references to
+// external blob files.
+//
 // Two types of sstables are accepted for ingestion(s): one is sstables present
 // in the instance's vfs.FS and can be referenced locally. The other is sstables
 // present in remote.Storage, referred to as shared or foreign sstables. These
@@ -1490,8 +1502,8 @@ func (d *DB) ingest(
 	}
 
 	// Make the new tables durable. We need to do this at some point before we
-	// update the MANIFEST (via logAndApply), otherwise a crash can have the
-	// tables referenced in the MANIFEST, but not present in the provider.
+	// update the MANIFEST (via UpdateVersionLocked), otherwise a crash can have
+	// the tables referenced in the MANIFEST, but not present in the provider.
 	if err := d.objProvider.Sync(); err != nil {
 		return IngestOperationStats{}, err
 	}
@@ -1859,16 +1871,11 @@ func (d *DB) ingestSplit(
 		// as we're guaranteed to not have any data overlap between splitFile and
 		// s.ingestFile. d.excise will return an error if we pass an inclusive user
 		// key bound _and_ we end up seeing data overlap at the end key.
-		added, err := d.excise(ctx, base.UserKeyBoundsFromInternal(s.ingestFile.Smallest, s.ingestFile.Largest), splitFile, ve, s.level)
+		leftTable, rightTable, err := d.exciseTable(ctx, base.UserKeyBoundsFromInternal(s.ingestFile.Smallest, s.ingestFile.Largest), splitFile, s.level)
 		if err != nil {
 			return err
 		}
-		if _, ok := ve.DeletedTables[deletedFileEntry{
-			Level:   s.level,
-			FileNum: splitFile.FileNum,
-		}]; !ok {
-			panic("did not split file that was expected to be split")
-		}
+		added := applyExciseToVersionEdit(ve, splitFile, leftTable, rightTable, s.level)
 		replacedFiles[splitFile.FileNum] = added
 		for i := range added {
 			addedBounds := added[i].Meta.UserKeyBounds()
@@ -1911,255 +1918,244 @@ func (d *DB) ingestApply(
 	if exciseSpan.Valid() || (d.opts.Experimental.IngestSplit != nil && d.opts.Experimental.IngestSplit()) {
 		ve.DeletedTables = map[manifest.DeletedTableEntry]*manifest.TableMetadata{}
 	}
-	metrics := make(map[int]*LevelMetrics)
+	var metrics levelMetricsDelta
 
-	// Lock the manifest for writing before we use the current version to
-	// determine the target level. This prevents two concurrent ingestion jobs
-	// from using the same version to determine the target level, and also
-	// provides serialization with concurrent compaction and flush jobs.
-	// logAndApply unconditionally releases the manifest lock, but any earlier
-	// returns must unlock the manifest.
-	d.mu.versions.logLock()
-
-	if mut != nil {
-		// Unref the mutable memtable to allows its flush to proceed. Now that we've
-		// acquired the manifest lock, we can be certain that if the mutable
-		// memtable has received more recent conflicting writes, the flush won't
-		// beat us to applying to the manifest resulting in sequence number
-		// inversion. Even though we call maybeScheduleFlush right now, this flush
-		// will apply after our ingestion.
-		if mut.writerUnref() {
-			d.maybeScheduleFlush()
-		}
-	}
-
-	current := d.mu.versions.currentVersion()
-	overlapChecker := &overlapChecker{
-		comparer: d.opts.Comparer,
-		newIters: d.newIters,
-		opts: IterOptions{
-			logger:   d.opts.Logger,
-			Category: categoryIngest,
-		},
-		v: current,
-	}
-	shouldIngestSplit := d.opts.Experimental.IngestSplit != nil &&
-		d.opts.Experimental.IngestSplit() && d.FormatMajorVersion() >= FormatVirtualSSTables
-	baseLevel := d.mu.versions.picker.getBaseLevel()
-	// filesToSplit is a list where each element is a pair consisting of a file
-	// being ingested and a file being split to make room for an ingestion into
-	// that level. Each ingested file will appear at most once in this list. It
-	// is possible for split files to appear twice in this list.
-	filesToSplit := make([]ingestSplitFile, 0)
-	checkCompactions := false
-	for i := 0; i < lr.fileCount(); i++ {
-		// Determine the lowest level in the LSM for which the sstable doesn't
-		// overlap any existing files in the level.
-		var m *tableMetadata
-		specifiedLevel := -1
-		isShared := false
-		isExternal := false
-		if i < len(lr.local) {
-			// local file.
-			m = lr.local[i].tableMetadata
-		} else if (i - len(lr.local)) < len(lr.shared) {
-			// shared file.
-			isShared = true
-			sharedIdx := i - len(lr.local)
-			m = lr.shared[sharedIdx].tableMetadata
-			specifiedLevel = int(lr.shared[sharedIdx].shared.Level)
-		} else {
-			// external file.
-			isExternal = true
-			externalIdx := i - (len(lr.local) + len(lr.shared))
-			m = lr.external[externalIdx].tableMetadata
-			if lr.externalFilesHaveLevel {
-				specifiedLevel = int(lr.external[externalIdx].external.Level)
+	// Determine the target level inside UpdateVersionLocked. This prevents two
+	// concurrent ingestion jobs from using the same version to determine the
+	// target level, and also provides serialization with concurrent compaction
+	// and flush jobs.
+	err := d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
+		if mut != nil {
+			// Unref the mutable memtable to allows its flush to proceed. Now that we've
+			// acquired the manifest lock, we can be certain that if the mutable
+			// memtable has received more recent conflicting writes, the flush won't
+			// beat us to applying to the manifest resulting in sequence number
+			// inversion. Even though we call maybeScheduleFlush right now, this flush
+			// will apply after our ingestion.
+			if mut.writerUnref() {
+				d.maybeScheduleFlush()
 			}
 		}
 
-		// Add to CreatedBackingTables if this is a new backing.
-		//
-		// Shared files always have a new backing. External files have new backings
-		// iff the backing disk file num and the file num match (see ingestAttachRemote).
-		if isShared || (isExternal && m.FileBacking.DiskFileNum == base.DiskFileNum(m.FileNum)) {
-			ve.CreatedBackingTables = append(ve.CreatedBackingTables, m.FileBacking)
+		current := d.mu.versions.currentVersion()
+		overlapChecker := &overlapChecker{
+			comparer: d.opts.Comparer,
+			newIters: d.newIters,
+			opts: IterOptions{
+				logger:   d.opts.Logger,
+				Category: categoryIngest,
+			},
+			v: current,
 		}
+		shouldIngestSplit := d.opts.Experimental.IngestSplit != nil &&
+			d.opts.Experimental.IngestSplit() && d.FormatMajorVersion() >= FormatVirtualSSTables
+		baseLevel := d.mu.versions.picker.getBaseLevel()
+		// filesToSplit is a list where each element is a pair consisting of a file
+		// being ingested and a file being split to make room for an ingestion into
+		// that level. Each ingested file will appear at most once in this list. It
+		// is possible for split files to appear twice in this list.
+		filesToSplit := make([]ingestSplitFile, 0)
+		checkCompactions := false
+		for i := 0; i < lr.fileCount(); i++ {
+			// Determine the lowest level in the LSM for which the sstable doesn't
+			// overlap any existing files in the level.
+			var m *tableMetadata
+			specifiedLevel := -1
+			isShared := false
+			isExternal := false
+			if i < len(lr.local) {
+				// local file.
+				m = lr.local[i].tableMetadata
+			} else if (i - len(lr.local)) < len(lr.shared) {
+				// shared file.
+				isShared = true
+				sharedIdx := i - len(lr.local)
+				m = lr.shared[sharedIdx].tableMetadata
+				specifiedLevel = int(lr.shared[sharedIdx].shared.Level)
+			} else {
+				// external file.
+				isExternal = true
+				externalIdx := i - (len(lr.local) + len(lr.shared))
+				m = lr.external[externalIdx].tableMetadata
+				if lr.externalFilesHaveLevel {
+					specifiedLevel = int(lr.external[externalIdx].external.Level)
+				}
+			}
 
-		f := &ve.NewTables[i]
-		var err error
-		if specifiedLevel != -1 {
-			f.Level = specifiedLevel
-		} else {
-			var splitTable *tableMetadata
-			if exciseSpan.Valid() && exciseSpan.Contains(d.cmp, m.Smallest) && exciseSpan.Contains(d.cmp, m.Largest) {
-				// This file fits perfectly within the excise span. We can slot it at
-				// L6, or sharedLevelsStart - 1 if we have shared files.
-				if len(lr.shared) > 0 || lr.externalFilesHaveLevel {
-					f.Level = sharedLevelsStart - 1
-					if baseLevel > f.Level {
-						f.Level = 0
+			// Add to CreatedBackingTables if this is a new backing.
+			//
+			// Shared files always have a new backing. External files have new backings
+			// iff the backing disk file num and the file num match (see ingestAttachRemote).
+			if isShared || (isExternal && m.FileBacking.DiskFileNum == base.DiskFileNum(m.FileNum)) {
+				ve.CreatedBackingTables = append(ve.CreatedBackingTables, m.FileBacking)
+			}
+
+			f := &ve.NewTables[i]
+			var err error
+			if specifiedLevel != -1 {
+				f.Level = specifiedLevel
+			} else {
+				var splitTable *tableMetadata
+				if exciseSpan.Valid() && exciseSpan.Contains(d.cmp, m.Smallest) && exciseSpan.Contains(d.cmp, m.Largest) {
+					// This file fits perfectly within the excise span. We can slot it at
+					// L6, or sharedLevelsStart - 1 if we have shared files.
+					if len(lr.shared) > 0 || lr.externalFilesHaveLevel {
+						f.Level = sharedLevelsStart - 1
+						if baseLevel > f.Level {
+							f.Level = 0
+						}
+					} else {
+						f.Level = 6
 					}
 				} else {
-					f.Level = 6
-				}
-			} else {
-				// We check overlap against the LSM without holding DB.mu. Note that we
-				// are still holding the log lock, so the version cannot change.
-				// TODO(radu): perform this check optimistically outside of the log lock.
-				var lsmOverlap overlap.WithLSM
-				lsmOverlap, err = func() (overlap.WithLSM, error) {
-					d.mu.Unlock()
-					defer d.mu.Lock()
-					return overlapChecker.DetermineLSMOverlap(ctx, m.UserKeyBounds())
-				}()
-				if err == nil {
-					f.Level, splitTable, err = ingestTargetLevel(
-						ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit,
-					)
-				}
-			}
-
-			if splitTable != nil {
-				if invariants.Enabled {
-					if lf := current.Levels[f.Level].Find(d.cmp, splitTable); lf.Empty() {
-						panic("splitFile returned is not in level it should be")
+					// We check overlap against the LSM without holding DB.mu. Note that we
+					// are still holding the log lock, so the version cannot change.
+					// TODO(radu): perform this check optimistically outside of the log lock.
+					var lsmOverlap overlap.WithLSM
+					lsmOverlap, err = func() (overlap.WithLSM, error) {
+						d.mu.Unlock()
+						defer d.mu.Lock()
+						return overlapChecker.DetermineLSMOverlap(ctx, m.UserKeyBounds())
+					}()
+					if err == nil {
+						f.Level, splitTable, err = ingestTargetLevel(
+							ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit,
+						)
 					}
 				}
-				// We take advantage of the fact that we won't drop the db mutex
-				// between now and the call to logAndApply. So, no files should
-				// get added to a new in-progress compaction at this point. We can
-				// avoid having to iterate on in-progress compactions to cancel them
-				// if none of the files being split have a compacting state.
-				if splitTable.IsCompacting() {
-					checkCompactions = true
+
+				if splitTable != nil {
+					if invariants.Enabled {
+						if lf := current.Levels[f.Level].Find(d.cmp, splitTable); lf.Empty() {
+							panic("splitFile returned is not in level it should be")
+						}
+					}
+					// We take advantage of the fact that we won't drop the db mutex
+					// between now and the call to UpdateVersionLocked. So, no files should
+					// get added to a new in-progress compaction at this point. We can
+					// avoid having to iterate on in-progress compactions to cancel them
+					// if none of the files being split have a compacting state.
+					if splitTable.IsCompacting() {
+						checkCompactions = true
+					}
+					filesToSplit = append(filesToSplit, ingestSplitFile{ingestFile: m, splitFile: splitTable, level: f.Level})
 				}
-				filesToSplit = append(filesToSplit, ingestSplitFile{ingestFile: m, splitFile: splitTable, level: f.Level})
+			}
+			if err != nil {
+				return versionUpdate{}, err
+			}
+			if isShared && f.Level < sharedLevelsStart {
+				panic(fmt.Sprintf("cannot slot a shared file higher than the highest shared level: %d < %d",
+					f.Level, sharedLevelsStart))
+			}
+			f.Meta = m
+			levelMetrics := metrics[f.Level]
+			if levelMetrics == nil {
+				levelMetrics = &LevelMetrics{}
+				metrics[f.Level] = levelMetrics
+			}
+			levelMetrics.TablesCount++
+			levelMetrics.TablesSize += int64(m.Size)
+			levelMetrics.BytesIngested += m.Size
+			levelMetrics.TablesIngested++
+		}
+		// replacedFiles maps files excised due to exciseSpan (or splitFiles returned
+		// by ingestTargetLevel), to files that were created to replace it. This map
+		// is used to resolve references to split files in filesToSplit, as it is
+		// possible for a file that we want to split to no longer exist or have a
+		// newer fileMetadata due to a split induced by another ingestion file, or an
+		// excise.
+		replacedFiles := make(map[base.FileNum][]newTableEntry)
+		updateLevelMetricsOnExcise := func(m *tableMetadata, level int, added []newTableEntry) {
+			levelMetrics := metrics[level]
+			if levelMetrics == nil {
+				levelMetrics = &LevelMetrics{}
+				metrics[level] = levelMetrics
+			}
+			levelMetrics.TablesCount--
+			levelMetrics.TablesSize -= int64(m.Size)
+			for i := range added {
+				levelMetrics.TablesCount++
+				levelMetrics.TablesSize += int64(added[i].Meta.Size)
 			}
 		}
-		if err != nil {
-			d.mu.versions.logUnlock()
-			return nil, err
-		}
-		if isShared && f.Level < sharedLevelsStart {
-			panic(fmt.Sprintf("cannot slot a shared file higher than the highest shared level: %d < %d",
-				f.Level, sharedLevelsStart))
-		}
-		f.Meta = m
-		levelMetrics := metrics[f.Level]
-		if levelMetrics == nil {
-			levelMetrics = &LevelMetrics{}
-			metrics[f.Level] = levelMetrics
-		}
-		levelMetrics.NumFiles++
-		levelMetrics.Size += int64(m.Size)
-		levelMetrics.BytesIngested += m.Size
-		levelMetrics.TablesIngested++
-	}
-	// replacedFiles maps files excised due to exciseSpan (or splitFiles returned
-	// by ingestTargetLevel), to files that were created to replace it. This map
-	// is used to resolve references to split files in filesToSplit, as it is
-	// possible for a file that we want to split to no longer exist or have a
-	// newer fileMetadata due to a split induced by another ingestion file, or an
-	// excise.
-	replacedFiles := make(map[base.FileNum][]newTableEntry)
-	updateLevelMetricsOnExcise := func(m *tableMetadata, level int, added []newTableEntry) {
-		levelMetrics := metrics[level]
-		if levelMetrics == nil {
-			levelMetrics = &LevelMetrics{}
-			metrics[level] = levelMetrics
-		}
-		levelMetrics.NumFiles--
-		levelMetrics.Size -= int64(m.Size)
-		for i := range added {
-			levelMetrics.NumFiles++
-			levelMetrics.Size += int64(added[i].Meta.Size)
-		}
-	}
-	if exciseSpan.Valid() {
-		// Iterate through all levels and find files that intersect with exciseSpan.
-		//
-		// TODO(bilal): We could drop the DB mutex here as we don't need it for
-		// excises; we only need to hold the version lock which we already are
-		// holding. However releasing the DB mutex could mess with the
-		// ingestTargetLevel calculation that happened above, as it assumed that it
-		// had a complete view of in-progress compactions that wouldn't change
-		// until logAndApply is called. If we were to drop the mutex now, we could
-		// schedule another in-progress compaction that would go into the chosen target
-		// level and lead to file overlap within level (which would panic in
-		// logAndApply). We should drop the db mutex here, do the excise, then
-		// re-grab the DB mutex and rerun just the in-progress compaction check to
-		// see if any new compactions are conflicting with our chosen target levels
-		// for files, and if they are, we should signal those compactions to error
-		// out.
-		for level := range current.Levels {
-			overlaps := current.Overlaps(level, exciseSpan.UserKeyBounds())
-			iter := overlaps.Iter()
-
-			for m := iter.First(); m != nil; m = iter.Next() {
-				newFiles, err := d.excise(ctx, exciseSpan.UserKeyBounds(), m, ve, level)
-				if err != nil {
-					return nil, err
+		if exciseSpan.Valid() {
+			// Iterate through all levels and find files that intersect with exciseSpan.
+			//
+			// TODO(bilal): We could drop the DB mutex here as we don't need it for
+			// excises; we only need to hold the version lock which we already are
+			// holding. However releasing the DB mutex could mess with the
+			// ingestTargetLevel calculation that happened above, as it assumed that it
+			// had a complete view of in-progress compactions that wouldn't change
+			// until UpdateVersionLocked is called. If we were to drop the mutex now,
+			// we could schedule another in-progress compaction that would go into the
+			// chosen target level and lead to file overlap within level (which would
+			// panic in UpdateVersionLocked). We should drop the db mutex here, do the
+			// excise, then re-grab the DB mutex and rerun just the in-progress
+			// compaction check to see if any new compactions are conflicting with our
+			// chosen target levels for files, and if they are, we should signal those
+			// compactions to error out.
+			for layer, ls := range current.AllLevelsAndSublevels() {
+				for m := range ls.Overlaps(d.cmp, exciseSpan.UserKeyBounds()).All() {
+					leftTable, rightTable, err := d.exciseTable(ctx, exciseSpan.UserKeyBounds(), m, layer.Level())
+					if err != nil {
+						return versionUpdate{}, err
+					}
+					newFiles := applyExciseToVersionEdit(ve, m, leftTable, rightTable, layer.Level())
+					replacedFiles[m.FileNum] = newFiles
+					updateLevelMetricsOnExcise(m, layer.Level(), newFiles)
 				}
-
-				if _, ok := ve.DeletedTables[deletedFileEntry{
-					Level:   level,
-					FileNum: m.FileNum,
-				}]; !ok {
-					// We did not excise this file.
+			}
+		}
+		if len(filesToSplit) > 0 {
+			// For the same reasons as the above call to excise, we hold the db mutex
+			// while calling this method.
+			if err := d.ingestSplit(ctx, ve, updateLevelMetricsOnExcise, filesToSplit, replacedFiles); err != nil {
+				return versionUpdate{}, err
+			}
+		}
+		if len(filesToSplit) > 0 || exciseSpan.Valid() {
+			for c := range d.mu.compact.inProgress {
+				if c.versionEditApplied {
 					continue
 				}
-				replacedFiles[m.FileNum] = newFiles
-				updateLevelMetricsOnExcise(m, level, newFiles)
-			}
-		}
-	}
-	if len(filesToSplit) > 0 {
-		// For the same reasons as the above call to excise, we hold the db mutex
-		// while calling this method.
-		if err := d.ingestSplit(ctx, ve, updateLevelMetricsOnExcise, filesToSplit, replacedFiles); err != nil {
-			return nil, err
-		}
-	}
-	if len(filesToSplit) > 0 || exciseSpan.Valid() {
-		for c := range d.mu.compact.inProgress {
-			if c.versionEditApplied {
-				continue
-			}
-			// Check if this compaction overlaps with the excise span. Note that just
-			// checking if the inputs individually overlap with the excise span
-			// isn't sufficient; for instance, a compaction could have [a,b] and [e,f]
-			// as inputs and write it all out as [a,b,e,f] in one sstable. If we're
-			// doing a [c,d) excise at the same time as this compaction, we will have
-			// to error out the whole compaction as we can't guarantee it hasn't/won't
-			// write a file overlapping with the excise span.
-			if exciseSpan.OverlapsInternalKeyRange(d.cmp, c.smallest, c.largest) {
-				c.cancel.Store(true)
-			}
-			// Check if this compaction's inputs have been replaced due to an
-			// ingest-time split. In that case, cancel the compaction as a newly picked
-			// compaction would need to include any new files that slid in between
-			// previously-existing files. Note that we cancel any compaction that has a
-			// file that was ingest-split as an input, even if it started before this
-			// ingestion.
-			if checkCompactions {
-				for i := range c.inputs {
-					iter := c.inputs[i].files.Iter()
-					for f := iter.First(); f != nil; f = iter.Next() {
-						if _, ok := replacedFiles[f.FileNum]; ok {
-							c.cancel.Store(true)
-							break
+				// Check if this compaction overlaps with the excise span. Note that just
+				// checking if the inputs individually overlap with the excise span
+				// isn't sufficient; for instance, a compaction could have [a,b] and [e,f]
+				// as inputs and write it all out as [a,b,e,f] in one sstable. If we're
+				// doing a [c,d) excise at the same time as this compaction, we will have
+				// to error out the whole compaction as we can't guarantee it hasn't/won't
+				// write a file overlapping with the excise span.
+				if exciseSpan.OverlapsInternalKeyRange(d.cmp, c.smallest, c.largest) {
+					c.cancel.Store(true)
+				}
+				// Check if this compaction's inputs have been replaced due to an
+				// ingest-time split. In that case, cancel the compaction as a newly picked
+				// compaction would need to include any new files that slid in between
+				// previously-existing files. Note that we cancel any compaction that has a
+				// file that was ingest-split as an input, even if it started before this
+				// ingestion.
+				if checkCompactions {
+					for i := range c.inputs {
+						for f := range c.inputs[i].files.All() {
+							if _, ok := replacedFiles[f.FileNum]; ok {
+								c.cancel.Store(true)
+								break
+							}
 						}
 					}
 				}
 			}
 		}
-	}
 
-	if err := d.mu.versions.logAndApply(jobID, ve, metrics, false /* forceRotation */, func() []compactionInfo {
-		return d.getInProgressCompactionInfoLocked(nil)
-	}); err != nil {
-		// Note: any error during logAndApply is fatal; this won't be reachable in production.
+		return versionUpdate{
+			VE:                      ve,
+			JobID:                   jobID,
+			Metrics:                 metrics,
+			InProgressCompactionsFn: func() []compactionInfo { return d.getInProgressCompactionInfoLocked(nil) },
+		}, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -2286,20 +2282,12 @@ func (d *DB) validateSSTables() {
 			}
 		}
 
-		var err error
 		// TOOD(radu): plumb a ReadEnv with a CategoryIngest stats collector through
 		// to ValidateBlockChecksums.
-		if f.Meta.Virtual {
-			err = d.fileCache.withVirtualReader(context.TODO(), block.NoReadEnv,
-				f.Meta.VirtualMeta(), func(v sstable.VirtualReader, _ block.ReadEnv) error {
-					return v.ValidateBlockChecksumsOnBacking()
-				})
-		} else {
-			err = d.fileCache.withReader(context.TODO(), block.NoReadEnv,
-				f.Meta.PhysicalMeta(), func(r *sstable.Reader, _ block.ReadEnv) error {
-					return r.ValidateBlockChecksums()
-				})
-		}
+		err := d.fileCache.withReader(context.TODO(), block.NoReadEnv,
+			f.Meta, func(r *sstable.Reader, _ sstable.ReadEnv) error {
+				return r.ValidateBlockChecksums()
+			})
 
 		if err != nil {
 			if IsCorruptionError(err) {

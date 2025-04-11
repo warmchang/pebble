@@ -10,6 +10,7 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"regexp"
@@ -18,16 +19,23 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
+	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/blobtest"
+	"github.com/cockroachdb/pebble/internal/compact"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
+	"github.com/cockroachdb/pebble/internal/strparse"
 	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
@@ -428,26 +436,51 @@ func parseValue(s string) []byte {
 	return []byte(s)
 }
 
+func splitFields(line string, n int) ([]string, error) {
+	return splitFieldsRange(line, n, n)
+}
+
+func splitFieldsRange(line string, minmum, maximum int) ([]string, error) {
+	fields := strings.Fields(line)
+	if len(fields) < minmum {
+		return nil, errors.Errorf("require at least %d fields, got %d", minmum, len(fields))
+	}
+	if len(fields) > maximum {
+		fields[maximum-1] = strings.Join(fields[maximum-1:], " ")
+		fields = fields[:maximum]
+	}
+	for i := range fields {
+		if fields[i] == `<nil>` {
+			fields[i] = ""
+		}
+	}
+	return fields, nil
+}
+
 func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
-	for _, line := range strings.Split(d.Input, "\n") {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
+	for _, line := range crstrings.Lines(d.Input) {
+		i := strings.IndexFunc(line, unicode.IsSpace)
+		cmd := line
+		if i > 0 {
+			cmd = line[:i]
+		} else if cmd == "" {
 			continue
 		}
-		if parts[1] == `<nil>` {
-			parts[1] = ""
-		}
+
+		var parts []string
 		var err error
-		switch parts[0] {
+		switch cmd {
 		case "set":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			err = b.Set([]byte(parts[1]), parseValue(parts[2]), nil)
 
 		case "set-multiple":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments (n and prefix)", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			n, err := strconv.ParseUint(parts[1], 10, 32)
 			if err != nil {
@@ -462,13 +495,15 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 			}
 
 		case "del":
-			if len(parts) != 2 {
-				return errors.Errorf("%s expects 1 argument", parts[0])
+			parts, err = splitFields(line, 2)
+			if err != nil {
+				return err
 			}
 			err = b.Delete([]byte(parts[1]), nil)
 		case "del-sized":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			var valSize uint64
 			valSize, err = strconv.ParseUint(parts[2], 10, 32)
@@ -477,23 +512,27 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 			}
 			err = b.DeleteSized([]byte(parts[1]), uint32(valSize), nil)
 		case "singledel":
-			if len(parts) != 2 {
-				return errors.Errorf("%s expects 1 argument", parts[0])
+			parts, err = splitFields(line, 2)
+			if err != nil {
+				return err
 			}
 			err = b.SingleDelete([]byte(parts[1]), nil)
 		case "del-range":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			err = b.DeleteRange([]byte(parts[1]), []byte(parts[2]), nil)
 		case "merge":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			err = b.Merge([]byte(parts[1]), parseValue(parts[2]), nil)
 		case "range-key-set":
-			if len(parts) < 4 || len(parts) > 5 {
-				return errors.Errorf("%s expects 3 or 4 arguments", parts[0])
+			parts, err = splitFieldsRange(line, 4, 5)
+			if err != nil {
+				return err
 			}
 			var val []byte
 			if len(parts) == 5 {
@@ -506,8 +545,9 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 				val,
 				nil)
 		case "range-key-unset":
-			if len(parts) != 4 {
-				return errors.Errorf("%s expects 3 arguments", parts[0])
+			parts, err = splitFields(line, 4)
+			if err != nil {
+				return err
 			}
 			err = b.RangeKeyUnset(
 				[]byte(parts[1]),
@@ -515,15 +555,16 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 				[]byte(parts[3]),
 				nil)
 		case "range-key-del":
-			if len(parts) != 3 {
-				return errors.Errorf("%s expects 2 arguments", parts[0])
+			parts, err = splitFields(line, 3)
+			if err != nil {
+				return err
 			}
 			err = b.RangeKeyDelete(
 				[]byte(parts[1]),
 				[]byte(parts[2]),
 				nil)
 		default:
-			return errors.Errorf("unknown op: %s", parts[0])
+			return errors.Errorf("unknown op: %s", cmd)
 		}
 		if err != nil {
 			return err
@@ -533,109 +574,66 @@ func runBatchDefineCmd(d *datadriven.TestData, b *Batch) error {
 }
 
 func runBuildRemoteCmd(td *datadriven.TestData, d *DB, storage remote.Storage) error {
-	b := d.NewIndexedBatch()
-	if err := runBatchDefineCmd(td, b); err != nil {
-		return err
-	}
-
 	if len(td.CmdArgs) < 1 {
 		return errors.New("build <path>: argument missing")
 	}
 	path := td.CmdArgs[0].String()
 
-	// Override table format, if provided.
-	tableFormat := d.TableFormat()
-	var blockSize int64
-	for _, cmdArg := range td.CmdArgs[1:] {
-		switch cmdArg.Key {
-		case "format":
-			switch cmdArg.Vals[0] {
-			case "pebblev1":
-				tableFormat = sstable.TableFormatPebblev1
-			case "pebblev2":
-				tableFormat = sstable.TableFormatPebblev2
-			case "pebblev3":
-				tableFormat = sstable.TableFormatPebblev3
-			case "pebblev4":
-				tableFormat = sstable.TableFormatPebblev4
-			default:
-				return errors.Errorf("unknown format string %s", cmdArg.Vals[0])
-			}
-		case "block-size":
-			var err error
-			blockSize, err = strconv.ParseInt(cmdArg.Vals[0], 10, 64)
-			if err != nil {
-				return errors.Wrap(err, td.Pos)
-			}
-		}
+	// Use TableFormatMax here and downgrade after, if necessary. This ensures
+	// that all fields are set.
+	writeOpts := d.opts.MakeWriterOptions(0 /* level */, d.TableFormat())
+	if rand.IntN(4) == 0 {
+		// If block size is not specified (in which case these fields will be
+		// overridden by ParseWriterOptions), force two-level indexes some of the
+		// time.
+		writeOpts.BlockSize = 5
+		writeOpts.IndexBlockSize = 5
 	}
 
-	writeOpts := d.opts.MakeWriterOptions(0 /* level */, tableFormat)
-	if blockSize == 0 && rand.IntN(4) == 0 {
-		// Force two-level indexes if not already forced on or off.
-		blockSize = 5
+	// Now parse the arguments again against the real options.
+	if err := sstable.ParseWriterOptions(&writeOpts, td.CmdArgs...); err != nil {
+		return err
 	}
-	writeOpts.BlockSize = int(blockSize)
-	writeOpts.IndexBlockSize = int(blockSize)
 
 	f, err := storage.CreateObject(path)
 	if err != nil {
 		return err
 	}
 	w := sstable.NewWriter(objstorageprovider.NewRemoteWritable(f), writeOpts)
-	iter := b.newInternalIter(nil)
-	for kv := iter.First(); kv != nil; kv = iter.Next() {
-		tmp := kv.K
-		tmp.SetSeqNum(0)
-		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
-			return err
-		}
-	}
-	if err := iter.Close(); err != nil {
+	if err := sstable.ParseTestSST(w.Raw(), td.Input, nil /* bv */); err != nil {
 		return err
-	}
-
-	if rdi := b.newRangeDelIter(nil, math.MaxUint64); rdi != nil {
-		s, err := rdi.First()
-		for ; s != nil && err == nil; s, err = rdi.Next() {
-			if err = w.DeleteRange(s.Start, s.End); err != nil {
-				return err
-			}
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	if rki := b.newRangeKeyIter(nil, math.MaxUint64); rki != nil {
-		s, err := rki.First()
-		for ; s != nil; s, err = rki.Next() {
-			for _, k := range s.Keys {
-				var err error
-				switch k.Kind() {
-				case base.InternalKeyKindRangeKeySet:
-					err = w.RangeKeySet(s.Start, s.End, k.Suffix, k.Value)
-				case base.InternalKeyKindRangeKeyUnset:
-					err = w.RangeKeyUnset(s.Start, s.End, k.Suffix)
-				case base.InternalKeyKindRangeKeyDelete:
-					err = w.RangeKeyDelete(s.Start, s.End)
-				default:
-					panic("not a range key")
-				}
-				if err != nil {
-					return err
-				}
-			}
-		}
-		if err != nil {
-			return err
-		}
 	}
 
 	return w.Close()
 }
 
-func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
+type dataDrivenCmdOptions struct {
+	blobValues        *blobtest.Values
+	defaultWriterOpts sstable.WriterOptions
+}
+
+func withBlobValues(bv *blobtest.Values) func(*dataDrivenCmdOptions) {
+	return func(o *dataDrivenCmdOptions) { o.blobValues = bv }
+}
+
+func withDefaultWriterOpts(defaultWriterOpts sstable.WriterOptions) func(*dataDrivenCmdOptions) {
+	return func(o *dataDrivenCmdOptions) { o.defaultWriterOpts = defaultWriterOpts }
+}
+
+func combineDataDrivenOpts(opts ...func(*dataDrivenCmdOptions)) dataDrivenCmdOptions {
+	combined := dataDrivenCmdOptions{}
+	for _, opt := range opts {
+		opt(&combined)
+	}
+	return combined
+}
+
+// TODO(radu): remove this in favor of runBuildSSTCmd.
+func runBuildCmd(
+	td *datadriven.TestData, d *DB, fs vfs.FS, opts ...func(*dataDrivenCmdOptions),
+) error {
+	ddOpts := combineDataDrivenOpts(opts...)
+
 	b := newIndexedBatch(nil, d.opts.Comparer)
 	if err := runBatchDefineCmd(td, b); err != nil {
 		return err
@@ -646,28 +644,10 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	}
 	path := td.CmdArgs[0].String()
 
-	// Override table format, if provided.
-	tableFormat := d.TableFormat()
-	for _, cmdArg := range td.CmdArgs[1:] {
-		switch cmdArg.Key {
-		case "format":
-			switch cmdArg.Vals[0] {
-			case "pebblev1":
-				tableFormat = sstable.TableFormatPebblev1
-			case "pebblev2":
-				tableFormat = sstable.TableFormatPebblev2
-			case "pebblev3":
-				tableFormat = sstable.TableFormatPebblev3
-			case "pebblev4":
-				tableFormat = sstable.TableFormatPebblev4
-			default:
-				return errors.Errorf("unknown format string %s", cmdArg.Vals[0])
-			}
-		}
+	writeOpts := d.opts.MakeWriterOptions(0 /* level */, d.TableFormat())
+	if err := sstable.ParseWriterOptions(&writeOpts, td.CmdArgs[1:]...); err != nil {
+		return err
 	}
-
-	writeOpts := d.opts.MakeWriterOptions(0 /* level */, tableFormat)
-
 	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return err
@@ -677,7 +657,25 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
 		tmp := kv.K
 		tmp.SetSeqNum(0)
-		if err := w.Raw().AddWithForceObsolete(tmp, kv.InPlaceValue(), false); err != nil {
+
+		v := kv.InPlaceValue()
+		// If the value looks like it's a debug blob handle, parse it and add it
+		// to the sstable as a blob handle.
+		if blobtest.IsBlobHandle(string(v)) {
+			if ddOpts.blobValues == nil {
+				return errors.Newf("test not set up to support blob handles")
+			}
+			handle, _, err := ddOpts.blobValues.ParseInlineHandle(string(v))
+			if err != nil {
+				return err
+			}
+			if err := w.Raw().AddWithBlobHandle(tmp, handle, base.ShortAttribute(0), false); err != nil {
+				return err
+			}
+			continue
+		}
+		// Otherwise add it as an ordinary value.
+		if err := w.Raw().Add(tmp, v, false); err != nil {
 			return err
 		}
 	}
@@ -724,6 +722,38 @@ func runBuildCmd(td *datadriven.TestData, d *DB, fs vfs.FS) error {
 	}
 
 	return w.Close()
+}
+
+func runBuildSSTCmd(
+	input string,
+	writerArgs []datadriven.CmdArg,
+	path string,
+	fs vfs.FS,
+	opts ...func(*dataDrivenCmdOptions),
+) (sstable.WriterMetadata, error) {
+	ddOpts := combineDataDrivenOpts(opts...)
+
+	writerOpts := ddOpts.defaultWriterOpts
+	if err := sstable.ParseWriterOptions(&writerOpts, writerArgs...); err != nil {
+		return sstable.WriterMetadata{}, err
+	}
+
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return sstable.WriterMetadata{}, err
+	}
+	w := sstable.NewWriter(objstorageprovider.NewFileWritable(f), writerOpts)
+	if err := sstable.ParseTestSST(w.Raw(), input, nil /* bv */); err != nil {
+		return sstable.WriterMetadata{}, err
+	}
+	if err := w.Close(); err != nil {
+		return sstable.WriterMetadata{}, err
+	}
+	metadata, err := w.Metadata()
+	if err != nil {
+		return sstable.WriterMetadata{}, err
+	}
+	return *metadata, nil
 }
 
 func runCompactCmd(td *datadriven.TestData, d *DB) error {
@@ -795,6 +825,15 @@ func runDBDefineCmd(td *datadriven.TestData, opts *Options) (*DB, error) {
 // runDBDefineCmdReuseFS is like runDBDefineCmd, but does not set opts.FS, expecting
 // the caller to have set an appropriate FS already.
 func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) {
+	// Some tests expect that opts is an in-out parameter in that the changes to
+	// opts made here are used later by the caller. But the
+	// ConcurrencyLimitScheduler cannot be reused after the DB is closed. So we
+	// replace it here.
+	scheduler, ok := opts.Experimental.CompactionScheduler.(*ConcurrencyLimitScheduler)
+	if ok && scheduler.isUnregisteredForTesting() {
+		opts.Experimental.CompactionScheduler =
+			NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
+	}
 	opts.EnsureDefaults()
 	if err := parseDBOptionsArgs(opts, td.CmdArgs); err != nil {
 		return nil, err
@@ -854,6 +893,17 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 	}
 	d.mu.versions.dynamicBaseLevel = false
 
+	// We use a custom compact.ValueSeparation implementation that wraps
+	// preserveBlobReferences. It parses values containing human-readable blob
+	// references (as understood by blobtest.Values) and preserves the
+	// references.  It also accumulates all the handles so that after writing
+	// all the tables, we can construct all the referenced blob files and add
+	// them to the final version edit.
+	valueSeparator := &defineDBValueSeparator{
+		pbr:   &preserveBlobReferences{},
+		metas: make(map[base.DiskFileNum]*manifest.BlobFileMetadata),
+	}
+
 	var mem *memTable
 	var start, end *base.InternalKey
 	ve := &versionEdit{}
@@ -868,10 +918,13 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 			flushable: mem,
 			flushed:   make(chan struct{}),
 		}}
-		c, err := newFlush(d.opts, d.mu.versions.currentVersion(),
+		c, err := newFlush(d.opts, d.mu.versions.currentVersion(), d.mu.versions.l0Organizer,
 			d.mu.versions.picker.getBaseLevel(), toFlush, time.Now())
 		if err != nil {
 			return err
+		}
+		c.getValueSeparation = func(JobID, *compaction, sstable.TableFormat) compact.ValueSeparation {
+			return valueSeparator
 		}
 		// NB: define allows the test to exactly specify which keys go
 		// into which sstables. If the test has a small target file
@@ -886,6 +939,7 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 			return err
 		}
 		largestSeqNum := d.mu.versions.logSeqNum.Load()
+		ve.NewBlobFiles = append(ve.NewBlobFiles, newVE.NewBlobFiles...)
 		for _, f := range newVE.NewTables {
 			if start != nil {
 				f.Meta.SmallestPointKey = *start
@@ -935,7 +989,7 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 
 	// Example, compact: a-c.
 	parseCompaction := func(outputLevel int, s string) (*compaction, error) {
-		m, err := parseMeta(s[len("compact:"):])
+		m, err := parseMeta(s)
 		if err != nil {
 			return nil, err
 		}
@@ -948,7 +1002,7 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 		return c, nil
 	}
 
-	for _, line := range strings.Split(td.Input, "\n") {
+	for _, line := range crstrings.Lines(td.Input) {
 		fields := strings.Fields(line)
 		if len(fields) > 0 {
 			switch fields[0] {
@@ -967,6 +1021,10 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 				mem = d.mu.mem.mutable
 				start, end = nil, nil
 				fields = fields[1:]
+				if len(fields) != 0 {
+					return nil, errors.Errorf("unexpected excess arguments: %s", strings.Join(fields, " "))
+				}
+				continue
 			case "L0", "L1", "L2", "L3", "L4", "L5", "L6":
 				if err := maybeFlush(); err != nil {
 					return nil, err
@@ -997,23 +1055,30 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 					}
 				}
 				fields = fields[boundFields:]
+				if len(fields) != 0 {
+					return nil, errors.Errorf("unexpected excess arguments: %s", strings.Join(fields, " "))
+				}
 				mem = newMemTable(memTableOptions{Options: d.opts})
+				continue
 			}
 		}
 
-		for _, data := range fields {
-			i := strings.Index(data, ":")
-			// Define in-progress compactions.
-			if data[:i] == "compact" {
-				c, err := parseCompaction(level, data)
+		p := strparse.MakeParser(":{}", line)
+		for !p.Done() {
+			field := p.Next()
+			switch field {
+			case "compact":
+				// Define in-progress compactions.
+				p.Expect(":")
+				c, err := parseCompaction(level, p.Remaining())
 				if err != nil {
 					return nil, err
 				}
 				d.mu.compact.inProgress[c] = struct{}{}
 				continue
-			}
-			if data[:i] == "rangekey" {
-				span := keyspan.ParseSpan(data[i:])
+			case "rangekey":
+				p.Expect(":")
+				span := keyspan.ParseSpan(p.Remaining())
 				err := rangekey.Encode(span, func(k base.InternalKey, v []byte) error {
 					return mem.set(k, v)
 				})
@@ -1021,20 +1086,35 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 					return nil, err
 				}
 				continue
-			}
-			key := base.ParseInternalKey(data[:i])
-			valueStr := data[i+1:]
-			value := []byte(valueStr)
-			var randBytes int
-			if n, err := fmt.Sscanf(valueStr, "<rand-bytes=%d>", &randBytes); err == nil && n == 1 {
-				value = make([]byte, randBytes)
-				rnd := rand.New(rand.NewPCG(0, uint64(key.SeqNum())))
-				for j := range value {
-					value[j] = byte(rnd.Uint32())
+			default:
+				key := base.ParseInternalKey(field)
+				p.Expect(":")
+				var value []byte
+				if key.Kind() != base.InternalKeyKindDelete && key.Kind() != base.InternalKeyKindSingleDelete {
+					valueStr := p.Next()
+					// If the value looks like a blob reference, read until the closing brace.
+					if valueStr == "blob" && p.Peek() == "{" {
+						tok := p.Next()
+						valueStr += " " + tok
+						for !p.Done() && tok != "}" {
+							tok = p.Next()
+							valueStr += " " + tok
+						}
+					}
+
+					value = []byte(valueStr)
+					var randBytes int
+					if n, err := fmt.Sscanf(valueStr, "<rand-bytes=%d>", &randBytes); err == nil && n == 1 {
+						value = make([]byte, randBytes)
+						rnd := rand.New(rand.NewPCG(0, uint64(key.SeqNum())))
+						for j := range value {
+							value[j] = byte(rnd.Uint32())
+						}
+					}
 				}
-			}
-			if err := mem.set(key, value); err != nil {
-				return nil, err
+				if err := mem.set(key, value); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -1044,11 +1124,31 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 	}
 
 	if len(ve.NewTables) > 0 {
+		// Collect any blob files created.
+		fileStats, err := valueSeparator.bv.WriteFiles(func(fileNum base.DiskFileNum) (objstorage.Writable, error) {
+			writable, _, err := d.objProvider.Create(context.Background(), base.FileTypeBlob, fileNum, objstorage.CreateOptions{})
+			return writable, err
+		}, d.opts.MakeBlobWriterOptions(0))
+		if err != nil {
+			return nil, err
+		}
+		for f, stats := range fileStats {
+			valueSeparator.metas[f].Size = stats.FileLen
+			valueSeparator.metas[f].ValueSize = stats.UncompressedValueBytes
+		}
+
+		ve.NewBlobFiles = slices.Collect(maps.Values(valueSeparator.metas))
+
 		jobID := d.newJobIDLocked()
-		d.mu.versions.logLock()
-		if err := d.mu.versions.logAndApply(jobID, ve, newFileMetrics(ve.NewTables), false, func() []compactionInfo {
-			return nil
-		}); err != nil {
+		err = d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
+			return versionUpdate{
+				VE:                      ve,
+				JobID:                   jobID,
+				Metrics:                 newFileMetrics(ve.NewTables),
+				InProgressCompactionsFn: func() []compactionInfo { return nil },
+			}, nil
+		})
+		if err != nil {
 			return nil, err
 		}
 		d.updateReadStateLocked(nil)
@@ -1069,8 +1169,7 @@ func runTableStatsCmd(td *datadriven.TestData, d *DB) string {
 	defer d.mu.Unlock()
 	v := d.mu.versions.currentVersion()
 	for _, levelMetadata := range v.Levels {
-		iter := levelMetadata.Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range levelMetadata.All() {
 			if f.FileNum != fileNum {
 				continue
 			}
@@ -1104,8 +1203,7 @@ func runVersionFileSizes(v *version) string {
 			continue
 		}
 		fmt.Fprintf(&buf, "L%d:\n", l)
-		iter := levelMetadata.Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range levelMetadata.All() {
 			fmt.Fprintf(&buf, "  %s: %d bytes (%s)", f, f.Size, humanize.Bytes.Uint64(f.Size))
 			if f.IsCompacting() {
 				fmt.Fprintf(&buf, " (IsCompacting)")
@@ -1125,8 +1223,7 @@ func runMetadataCommand(t *testing.T, td *datadriven.TestData, d *DB) string {
 	d.mu.Lock()
 	currVersion := d.mu.versions.currentVersion()
 	for _, level := range currVersion.Levels {
-		lIter := level.Iter()
-		for f := lIter.First(); f != nil; f = lIter.Next() {
+		for f := range level.All() {
 			if f.FileNum == base.FileNum(uint64(file)) {
 				m = f
 				break
@@ -1150,8 +1247,7 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	d.mu.Lock()
 	currVersion := d.mu.versions.currentVersion()
 	for _, level := range currVersion.Levels {
-		lIter := level.Iter()
-		for f := lIter.First(); f != nil; f = lIter.Next() {
+		for f := range level.All() {
 			if f.FileNum == base.FileNum(uint64(file)) {
 				m = f
 				break
@@ -1190,11 +1286,13 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	}
 	defer r.Close()
 
-	var v sstable.VirtualReader
 	props := r.Properties.String()
-	if m != nil && m.Virtual {
-		v = sstable.MakeVirtualReader(r, m.VirtualMeta().VirtualReaderParams(false /* isShared */))
-		props = v.Properties.String()
+	env := sstable.ReadEnv{}
+	if m != nil && m.Virtual != nil {
+		m.InitVirtual(false /* isShared */)
+		env.Virtual = m.Virtual
+		scaledProps := r.Properties.GetScaledProperties(env.Virtual.BackingSize, env.Virtual.Size)
+		props = scaledProps.String()
 	}
 	if len(td.Input) == 0 {
 		return props
@@ -1325,7 +1423,8 @@ func runIngestExternalCmd(
 		}
 		sz, err := st.Size(objName)
 		if err != nil {
-			return errors.Wrapf(err, "sizeof %s", objName)
+			// Tests can attach files that don't exist. Mock a size.
+			sz = 1024
 		}
 		ef := ExternalFile{
 			Locator:     remote.Locator(locator),

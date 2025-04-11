@@ -368,9 +368,9 @@ func TestReadSampling(t *testing.T) {
 
 			d.mu.Lock()
 			for _, l := range d.mu.versions.currentVersion().Levels {
-				l.Slice().Each(func(f *tableMetadata) {
+				for f := range l.All() {
 					f.AllowedSeeks.Store(allowedSeeks)
-				})
+				}
 			}
 			d.mu.Unlock()
 			return ""
@@ -398,12 +398,12 @@ func TestReadSampling(t *testing.T) {
 			var foundAllowedSeeks int64 = -1
 			d.mu.Lock()
 			for _, l := range d.mu.versions.currentVersion().Levels {
-				l.Slice().Each(func(f *tableMetadata) {
+				for f := range l.All() {
 					if f.FileNum == base.FileNum(fileNum) {
 						actualAllowedSeeks := f.AllowedSeeks.Load()
 						foundAllowedSeeks = actualAllowedSeeks
 					}
-				})
+				}
 			}
 			d.mu.Unlock()
 
@@ -2764,7 +2764,7 @@ func BenchmarkSeekPrefixTombstones(b *testing.B) {
 	}
 
 	d.mu.Lock()
-	require.Equal(b, int64(ks.Count()-1), d.mu.versions.metrics.Levels[numLevels-1].NumFiles)
+	require.Equal(b, int64(ks.Count()-1), d.mu.versions.metrics.Levels[numLevels-1].TablesCount)
 	d.mu.Unlock()
 
 	seekKey := testkeys.Key(ks, 1)
@@ -3053,7 +3053,7 @@ func runBenchmarkQueueWorkload(b *testing.B, deleteRatio float32, initOps int, v
 	for i := 0; i < numLevels; i++ {
 		numTombstones := stats.Levels[i].KindsCount[base.InternalKeyKindDelete]
 		numSets := stats.Levels[i].KindsCount[base.InternalKeyKindSet]
-		numTables := metrics.Levels[i].NumFiles
+		numTables := metrics.Levels[i].TablesCount
 		if numSets > 0 {
 			b.Logf("L%d: %d tombstones, %d sets, %d sstables\n", i, numTombstones, numSets, numTables)
 		}

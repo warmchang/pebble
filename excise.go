@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/sstable/virtual"
 )
 
 // Excise atomically deletes all data overlapping with the provided span. All
@@ -44,49 +45,40 @@ func (d *DB) Excise(ctx context.Context, span KeyRange) error {
 	return err
 }
 
-// excise updates ve to include a replacement of the file m with new virtual
-// sstables that exclude exciseSpan, returning a slice of newly-created files if
-// any. If the entirety of m is deleted by exciseSpan, no new sstables are added
-// and m is deleted. Note that ve is updated in-place.
+// exciseTable initializes up to two virtual tables for what is left over after
+// excising the given span from the table.
+//
+// Returns the left and/or right tables, if they exist.
+//
+// The file bounds must overlap with the excise span.
 //
 // This method is agnostic to whether d.mu is held or not. Some cases call it with
 // the db mutex held (eg. ingest-time excises), while in the case of compactions
 // the mutex is not held.
-func (d *DB) excise(
-	ctx context.Context, exciseSpan base.UserKeyBounds, m *tableMetadata, ve *versionEdit, level int,
-) ([]manifest.NewTableEntry, error) {
-	numCreatedFiles := 0
+func (d *DB) exciseTable(
+	ctx context.Context, exciseSpan base.UserKeyBounds, m *tableMetadata, level int,
+) (leftTable, rightTable *tableMetadata, _ error) {
 	// Check if there's actually an overlap between m and exciseSpan.
-	mBounds := base.UserKeyBoundsFromInternal(m.Smallest, m.Largest)
+	mBounds := m.UserKeyBounds()
 	if !exciseSpan.Overlaps(d.cmp, &mBounds) {
-		return nil, nil
+		return nil, nil, base.AssertionFailedf("excise span does not overlap table")
 	}
-	ve.DeletedTables[deletedFileEntry{
-		Level:   level,
-		FileNum: m.FileNum,
-	}] = m
 	// Fast path: m sits entirely within the exciseSpan, so just delete it.
 	if exciseSpan.ContainsInternalKey(d.cmp, m.Smallest) && exciseSpan.ContainsInternalKey(d.cmp, m.Largest) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	var iters iterSet
-	var itersLoaded bool
-	defer iters.CloseAll()
-	loadItersIfNecessary := func() error {
-		if itersLoaded {
-			return nil
-		}
-		var err error
-		iters, err = d.newIters(ctx, m, &IterOptions{
-			Category: categoryIngest,
-			layer:    manifest.Level(level),
-		}, internalIterOpts{}, iterPointKeys|iterRangeDeletions|iterRangeKeys)
-		itersLoaded = true
-		return err
+	// The file partially overlaps the excise span; we will need to open it to
+	// determine tight bounds for the left-over table(s).
+	iters, err := d.newIters(ctx, m, &IterOptions{
+		Category: categoryIngest,
+		layer:    manifest.Level(level),
+	}, internalIterOpts{}, iterPointKeys|iterRangeDeletions|iterRangeKeys)
+	if err != nil {
+		return nil, nil, err
 	}
+	defer func() { _ = iters.CloseAll() }()
 
-	needsBacking := false
 	// Create a file to the left of the excise span, if necessary.
 	// The bounds of this file will be [m.Smallest, lastKeyBefore(exciseSpan.Start)].
 	//
@@ -110,8 +102,8 @@ func (d *DB) excise(
 	// have changed since our previous calculation. Do this optimiaztino as part of
 	// https://github.com/cockroachdb/pebble/issues/2112 .
 	if d.cmp(m.Smallest.UserKey, exciseSpan.Start) < 0 {
-		leftFile := &tableMetadata{
-			Virtual:     true,
+		leftTable = &tableMetadata{
+			Virtual:     &virtual.VirtualReaderParams{},
 			FileBacking: m.FileBacking,
 			FileNum:     d.mu.versions.getNextFileNum(),
 			// Note that these are loose bounds for smallest/largest seqnums, but they're
@@ -121,198 +113,55 @@ func (d *DB) excise(
 			LargestSeqNumAbsolute:    m.LargestSeqNumAbsolute,
 			SyntheticPrefixAndSuffix: m.SyntheticPrefixAndSuffix,
 		}
-		if m.HasPointKeys && !exciseSpan.ContainsInternalKey(d.cmp, m.SmallestPointKey) {
-			// This file will probably contain point keys.
-			if err := loadItersIfNecessary(); err != nil {
-				return nil, err
-			}
-			smallestPointKey := m.SmallestPointKey
-			if kv := iters.Point().SeekLT(exciseSpan.Start, base.SeekLTFlagsNone); kv != nil {
-				leftFile.ExtendPointKeyBounds(d.cmp, smallestPointKey, kv.K.Clone())
-			}
-			// Store the min of (exciseSpan.Start, rdel.End) in lastRangeDel. This
-			// needs to be a copy if the key is owned by the range del iter.
-			var lastRangeDel []byte
-			if rdel, err := iters.RangeDeletion().SeekLT(exciseSpan.Start); err != nil {
-				return nil, err
-			} else if rdel != nil {
-				lastRangeDel = append(lastRangeDel[:0], rdel.End...)
-				if d.cmp(lastRangeDel, exciseSpan.Start) > 0 {
-					lastRangeDel = exciseSpan.Start
-				}
-			}
-			if lastRangeDel != nil {
-				leftFile.ExtendPointKeyBounds(d.cmp, smallestPointKey, base.MakeExclusiveSentinelKey(InternalKeyKindRangeDelete, lastRangeDel))
-			}
+		if err := determineLeftTableBounds(d.cmp, m, leftTable, exciseSpan.Start, iters); err != nil {
+			return nil, nil, err
 		}
-		if m.HasRangeKeys && !exciseSpan.ContainsInternalKey(d.cmp, m.SmallestRangeKey) {
-			// This file will probably contain range keys.
-			if err := loadItersIfNecessary(); err != nil {
-				return nil, err
+
+		if leftTable.HasRangeKeys || leftTable.HasPointKeys {
+			if err := determineExcisedTableSize(d.fileCache, m, leftTable); err != nil {
+				return nil, nil, err
 			}
-			smallestRangeKey := m.SmallestRangeKey
-			// Store the min of (exciseSpan.Start, rkey.End) in lastRangeKey. This
-			// needs to be a copy if the key is owned by the range key iter.
-			var lastRangeKey []byte
-			var lastRangeKeyKind InternalKeyKind
-			if rkey, err := iters.RangeKey().SeekLT(exciseSpan.Start); err != nil {
-				return nil, err
-			} else if rkey != nil {
-				lastRangeKey = append(lastRangeKey[:0], rkey.End...)
-				if d.cmp(lastRangeKey, exciseSpan.Start) > 0 {
-					lastRangeKey = exciseSpan.Start
-				}
-				lastRangeKeyKind = rkey.Keys[0].Kind()
+			if err := leftTable.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+				return nil, nil, err
 			}
-			if lastRangeKey != nil {
-				leftFile.ExtendRangeKeyBounds(d.cmp, smallestRangeKey, base.MakeExclusiveSentinelKey(lastRangeKeyKind, lastRangeKey))
-			}
-		}
-		if leftFile.HasRangeKeys || leftFile.HasPointKeys {
-			var err error
-			leftFile.Size, err = d.fileCache.estimateSize(m, leftFile.Smallest.UserKey, leftFile.Largest.UserKey)
-			if err != nil {
-				return nil, err
-			}
-			if leftFile.Size == 0 {
-				// On occasion, estimateSize gives us a low estimate, i.e. a 0 file size,
-				// such as if the excised file only has range keys/dels and no point
-				// keys. This can cause panics in places where we divide by file sizes.
-				// Correct for it here.
-				leftFile.Size = 1
-			}
-			if err := leftFile.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
-				return nil, err
-			}
-			leftFile.ValidateVirtual(m)
-			ve.NewTables = append(ve.NewTables, newTableEntry{Level: level, Meta: leftFile})
-			needsBacking = true
-			numCreatedFiles++
+			leftTable.ValidateVirtual(m)
+		} else {
+			leftTable = nil
 		}
 	}
 	// Create a file to the right, if necessary.
-	if exciseSpan.ContainsInternalKey(d.cmp, m.Largest) {
-		// No key exists to the right of the excise span in this file.
-		if needsBacking && !m.Virtual {
-			// If m is virtual, then its file backing is already known to the manifest.
-			// We don't need to create another file backing. Note that there must be
-			// only one CreatedBackingTables entry per backing sstable. This is
-			// indicated by the VersionEdit.CreatedBackingTables invariant.
-			ve.CreatedBackingTables = append(ve.CreatedBackingTables, m.FileBacking)
+	if !exciseSpan.End.IsUpperBoundForInternalKey(d.cmp, m.Largest) {
+		// Create a new file, rightFile, between [firstKeyAfter(exciseSpan.End), m.Largest].
+		//
+		// See comment before the definition of leftFile for the motivation behind
+		// calculating tight user-key bounds.
+		rightTable = &tableMetadata{
+			Virtual:     &virtual.VirtualReaderParams{},
+			FileBacking: m.FileBacking,
+			FileNum:     d.mu.versions.getNextFileNum(),
+			// Note that these are loose bounds for smallest/largest seqnums, but they're
+			// sufficient for maintaining correctness.
+			SmallestSeqNum:           m.SmallestSeqNum,
+			LargestSeqNum:            m.LargestSeqNum,
+			LargestSeqNumAbsolute:    m.LargestSeqNumAbsolute,
+			SyntheticPrefixAndSuffix: m.SyntheticPrefixAndSuffix,
 		}
-		return ve.NewTables[len(ve.NewTables)-numCreatedFiles:], nil
-	}
-	// Create a new file, rightFile, between [firstKeyAfter(exciseSpan.End), m.Largest].
-	//
-	// See comment before the definition of leftFile for the motivation behind
-	// calculating tight user-key bounds.
-	rightFile := &tableMetadata{
-		Virtual:     true,
-		FileBacking: m.FileBacking,
-		FileNum:     d.mu.versions.getNextFileNum(),
-		// Note that these are loose bounds for smallest/largest seqnums, but they're
-		// sufficient for maintaining correctness.
-		SmallestSeqNum:           m.SmallestSeqNum,
-		LargestSeqNum:            m.LargestSeqNum,
-		LargestSeqNumAbsolute:    m.LargestSeqNumAbsolute,
-		SyntheticPrefixAndSuffix: m.SyntheticPrefixAndSuffix,
-	}
-	if m.HasPointKeys && !exciseSpan.ContainsInternalKey(d.cmp, m.LargestPointKey) {
-		// This file will probably contain point keys
-		if err := loadItersIfNecessary(); err != nil {
-			return nil, err
+		if err := determineRightTableBounds(d.cmp, m, rightTable, exciseSpan.End, iters); err != nil {
+			return nil, nil, err
 		}
-		largestPointKey := m.LargestPointKey
-		if kv := iters.Point().SeekGE(exciseSpan.End.Key, base.SeekGEFlagsNone); kv != nil {
-			if exciseSpan.End.Kind == base.Inclusive && d.equal(exciseSpan.End.Key, kv.K.UserKey) {
-				return nil, base.AssertionFailedf("cannot excise with an inclusive end key and data overlap at end key")
+		if rightTable.HasRangeKeys || rightTable.HasPointKeys {
+			if err := determineExcisedTableSize(d.fileCache, m, rightTable); err != nil {
+				return nil, nil, err
 			}
-			rightFile.ExtendPointKeyBounds(d.cmp, kv.K.Clone(), largestPointKey)
-		}
-		// Store the max of (exciseSpan.End, rdel.Start) in firstRangeDel. This
-		// needs to be a copy if the key is owned by the range del iter.
-		var firstRangeDel []byte
-		rdel, err := iters.RangeDeletion().SeekGE(exciseSpan.End.Key)
-		if err != nil {
-			return nil, err
-		} else if rdel != nil {
-			firstRangeDel = append(firstRangeDel[:0], rdel.Start...)
-			if d.cmp(firstRangeDel, exciseSpan.End.Key) < 0 {
-				// NB: This can only be done if the end bound is exclusive.
-				if exciseSpan.End.Kind != base.Exclusive {
-					return nil, base.AssertionFailedf("cannot truncate rangedel during excise with an inclusive upper bound")
-				}
-				firstRangeDel = exciseSpan.End.Key
+			if err := rightTable.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+				return nil, nil, err
 			}
-		}
-		if firstRangeDel != nil {
-			smallestPointKey := rdel.SmallestKey()
-			smallestPointKey.UserKey = firstRangeDel
-			rightFile.ExtendPointKeyBounds(d.cmp, smallestPointKey, largestPointKey)
+			rightTable.ValidateVirtual(m)
+		} else {
+			rightTable = nil
 		}
 	}
-	if m.HasRangeKeys && !exciseSpan.ContainsInternalKey(d.cmp, m.LargestRangeKey) {
-		// This file will probably contain range keys.
-		if err := loadItersIfNecessary(); err != nil {
-			return nil, err
-		}
-		largestRangeKey := m.LargestRangeKey
-		// Store the max of (exciseSpan.End, rkey.Start) in firstRangeKey. This
-		// needs to be a copy if the key is owned by the range key iter.
-		var firstRangeKey []byte
-		rkey, err := iters.RangeKey().SeekGE(exciseSpan.End.Key)
-		if err != nil {
-			return nil, err
-		} else if rkey != nil {
-			firstRangeKey = append(firstRangeKey[:0], rkey.Start...)
-			if d.cmp(firstRangeKey, exciseSpan.End.Key) < 0 {
-				if exciseSpan.End.Kind != base.Exclusive {
-					return nil, base.AssertionFailedf("cannot truncate range key during excise with an inclusive upper bound")
-				}
-				firstRangeKey = exciseSpan.End.Key
-			}
-		}
-		if firstRangeKey != nil {
-			smallestRangeKey := rkey.SmallestKey()
-			smallestRangeKey.UserKey = firstRangeKey
-			// We call ExtendRangeKeyBounds so any internal boundType fields are
-			// set correctly. Note that this is mildly wasteful as we'll be comparing
-			// rightFile.{Smallest,Largest}RangeKey with themselves, which can be
-			// avoided if we exported ExtendOverallKeyBounds or so.
-			rightFile.ExtendRangeKeyBounds(d.cmp, smallestRangeKey, largestRangeKey)
-		}
-	}
-	if rightFile.HasRangeKeys || rightFile.HasPointKeys {
-		var err error
-		rightFile.Size, err = d.fileCache.estimateSize(m, rightFile.Smallest.UserKey, rightFile.Largest.UserKey)
-		if err != nil {
-			return nil, err
-		}
-		if rightFile.Size == 0 {
-			// On occasion, estimateSize gives us a low estimate, i.e. a 0 file size,
-			// such as if the excised file only has range keys/dels and no point keys.
-			// This can cause panics in places where we divide by file sizes. Correct
-			// for it here.
-			rightFile.Size = 1
-		}
-		if err := rightFile.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
-			return nil, err
-		}
-		rightFile.ValidateVirtual(m)
-		ve.NewTables = append(ve.NewTables, newTableEntry{Level: level, Meta: rightFile})
-		needsBacking = true
-		numCreatedFiles++
-	}
-
-	if needsBacking && !m.Virtual {
-		// If m is virtual, then its file backing is already known to the manifest.
-		// We don't need to create another file backing. Note that there must be
-		// only one CreatedBackingTables entry per backing sstable. This is
-		// indicated by the VersionEdit.CreatedBackingTables invariant.
-		ve.CreatedBackingTables = append(ve.CreatedBackingTables, m.FileBacking)
-	}
-
-	return ve.NewTables[len(ve.NewTables)-numCreatedFiles:], nil
+	return leftTable, rightTable, nil
 }
 
 // exciseOverlapBounds examines the provided list of snapshots, examining each
@@ -357,4 +206,165 @@ func exciseOverlapBounds(
 		}
 	}
 	return extended
+}
+
+// determineLeftTableBounds calculates the bounds for the table that remains to
+// the left of the excise span after excising originalFile.
+//
+// Sets the smallest and largest keys, as well as HasPointKeys/HasRangeKeys in
+// the leftFile.
+func determineLeftTableBounds(
+	cmp Compare, originalTable, leftTable *tableMetadata, exciseSpanStart []byte, iters iterSet,
+) error {
+	if originalTable.HasPointKeys && cmp(originalTable.SmallestPointKey.UserKey, exciseSpanStart) < 0 {
+		// This file will probably contain point keys.
+		if kv := iters.Point().SeekLT(exciseSpanStart, base.SeekLTFlagsNone); kv != nil {
+			leftTable.ExtendPointKeyBounds(cmp, originalTable.SmallestPointKey, kv.K.Clone())
+		}
+		rdel, err := iters.RangeDeletion().SeekLT(exciseSpanStart)
+		if err != nil {
+			return err
+		}
+		if rdel != nil {
+			// Use the smaller of exciseSpanStart and rdel.End.
+			lastRangeDel := exciseSpanStart
+			if cmp(rdel.End, exciseSpanStart) < 0 {
+				// The key is owned by the range del iter, so we need to copy it.
+				lastRangeDel = slices.Clone(rdel.End)
+			}
+			leftTable.ExtendPointKeyBounds(cmp, originalTable.SmallestPointKey,
+				base.MakeExclusiveSentinelKey(InternalKeyKindRangeDelete, lastRangeDel))
+		}
+	}
+
+	if originalTable.HasRangeKeys && cmp(originalTable.SmallestRangeKey.UserKey, exciseSpanStart) < 0 {
+		rkey, err := iters.RangeKey().SeekLT(exciseSpanStart)
+		if err != nil {
+			return err
+		}
+		if rkey != nil {
+			// Use the smaller of exciseSpanStart and rkey.End.
+			lastRangeKey := exciseSpanStart
+			if cmp(rkey.End, exciseSpanStart) < 0 {
+				// The key is owned by the range key iter, so we need to copy it.
+				lastRangeKey = slices.Clone(rkey.End)
+			}
+			leftTable.ExtendRangeKeyBounds(cmp, originalTable.SmallestRangeKey,
+				base.MakeExclusiveSentinelKey(rkey.LargestKey().Kind(), lastRangeKey))
+		}
+	}
+	return nil
+}
+
+// determineRightTableBounds calculates the bounds for the table that remains to
+// the right of the excise span after excising originalFile.
+//
+// Sets the smallest and largest keys, as well as HasPointKeys/HasRangeKeys in
+// the right.
+//
+// Note that the case where exciseSpanEnd is Inclusive is very restrictive; we
+// are only allowed to excise if the original table has no keys or ranges
+// overlapping exciseSpanEnd.Key.
+func determineRightTableBounds(
+	cmp Compare,
+	originalTable, rightTable *tableMetadata,
+	exciseSpanEnd base.UserKeyBoundary,
+	iters iterSet,
+) error {
+	if originalTable.HasPointKeys && !exciseSpanEnd.IsUpperBoundForInternalKey(cmp, originalTable.LargestPointKey) {
+		if kv := iters.Point().SeekGE(exciseSpanEnd.Key, base.SeekGEFlagsNone); kv != nil {
+			if exciseSpanEnd.Kind == base.Inclusive && cmp(exciseSpanEnd.Key, kv.K.UserKey) == 0 {
+				return base.AssertionFailedf("cannot excise with an inclusive end key and data overlap at end key")
+			}
+			rightTable.ExtendPointKeyBounds(cmp, kv.K.Clone(), originalTable.LargestPointKey)
+		}
+		rdel, err := iters.RangeDeletion().SeekGE(exciseSpanEnd.Key)
+		if err != nil {
+			return err
+		}
+		if rdel != nil {
+			// Use the larger of exciseSpanEnd.Key and rdel.Start.
+			firstRangeDel := exciseSpanEnd.Key
+			if cmp(rdel.Start, exciseSpanEnd.Key) > 0 {
+				// The key is owned by the range del iter, so we need to copy it.
+				firstRangeDel = slices.Clone(rdel.Start)
+			} else if exciseSpanEnd.Kind != base.Exclusive {
+				return base.AssertionFailedf("cannot truncate rangedel during excise with an inclusive upper bound")
+			}
+			rightTable.ExtendPointKeyBounds(cmp, base.InternalKey{
+				UserKey: firstRangeDel,
+				Trailer: rdel.SmallestKey().Trailer,
+			}, originalTable.LargestPointKey)
+		}
+	}
+	if originalTable.HasRangeKeys && !exciseSpanEnd.IsUpperBoundForInternalKey(cmp, originalTable.LargestRangeKey) {
+		rkey, err := iters.RangeKey().SeekGE(exciseSpanEnd.Key)
+		if err != nil {
+			return err
+		}
+		if rkey != nil {
+			// Use the larger of exciseSpanEnd.Key and rkey.Start.
+			firstRangeKey := exciseSpanEnd.Key
+			if cmp(rkey.Start, exciseSpanEnd.Key) > 0 {
+				// The key is owned by the range key iter, so we need to copy it.
+				firstRangeKey = slices.Clone(rkey.Start)
+			} else if exciseSpanEnd.Kind != base.Exclusive {
+				return base.AssertionFailedf("cannot truncate range key during excise with an inclusive upper bound")
+			}
+			rightTable.ExtendRangeKeyBounds(cmp, base.InternalKey{
+				UserKey: firstRangeKey,
+				Trailer: rkey.SmallestKey().Trailer,
+			}, originalTable.LargestRangeKey)
+		}
+	}
+	return nil
+}
+
+func determineExcisedTableSize(
+	fc *fileCacheHandle, originalTable, excisedTable *tableMetadata,
+) error {
+	size, err := fc.estimateSize(originalTable, excisedTable.Smallest.UserKey, excisedTable.Largest.UserKey)
+	if err != nil {
+		return err
+	}
+	excisedTable.Size = size
+	if size == 0 {
+		// On occasion, estimateSize gives us a low estimate, i.e. a 0 file size,
+		// such as if the excised file only has range keys/dels and no point
+		// keys. This can cause panics in places where we divide by file sizes.
+		// Correct for it here.
+		excisedTable.Size = 1
+	}
+	return nil
+}
+
+// applyExciseToVersionEdit updates ve with a table deletion for the original
+// table and table additions for the left and/or right table.
+//
+// Either or both of leftTable/rightTable can be nil.
+func applyExciseToVersionEdit(
+	ve *versionEdit, originalTable, leftTable, rightTable *tableMetadata, level int,
+) (newFiles []manifest.NewTableEntry) {
+	ve.DeletedTables[deletedFileEntry{
+		Level:   level,
+		FileNum: originalTable.FileNum,
+	}] = originalTable
+	if leftTable == nil && rightTable == nil {
+		return
+	}
+	if originalTable.Virtual == nil {
+		// If the original table was virtual, then its file backing is already known
+		// to the manifest; we don't need to create another file backing. Note that
+		// there must be only one CreatedBackingTables entry per backing sstable.
+		// This is indicated by the VersionEdit.CreatedBackingTables invariant.
+		ve.CreatedBackingTables = append(ve.CreatedBackingTables, originalTable.FileBacking)
+	}
+	originalLen := len(ve.NewTables)
+	if leftTable != nil {
+		ve.NewTables = append(ve.NewTables, newTableEntry{Level: level, Meta: leftTable})
+	}
+	if rightTable != nil {
+		ve.NewTables = append(ve.NewTables, newTableEntry{Level: level, Meta: rightTable})
+	}
+	return ve.NewTables[originalLen:]
 }

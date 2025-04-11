@@ -33,7 +33,8 @@ func TestDownloadCursor(t *testing.T) {
 		case "define":
 			var err error
 			const flushSplitBytes = 10 * 1024 * 1024
-			vers, err = manifest.ParseVersionDebug(base.DefaultComparer, flushSplitBytes, td.Input)
+			l0Organizer := manifest.NewL0Organizer(base.DefaultComparer, flushSplitBytes)
+			vers, err = manifest.ParseVersionDebug(base.DefaultComparer, l0Organizer, td.Input)
 			if err != nil {
 				td.Fatalf(t, "%v", err)
 			}
@@ -106,6 +107,7 @@ func TestDownloadTask(t *testing.T) {
 	}
 
 	var vers *manifest.Version
+	var l0Organizer *manifest.L0Organizer
 	var task *downloadSpanTask
 	printTask := func(b *strings.Builder) {
 		for i := range task.bookmarks {
@@ -118,7 +120,8 @@ func TestDownloadTask(t *testing.T) {
 		case "define":
 			var err error
 			const flushSplitBytes = 10 * 1024 * 1024
-			vers, err = manifest.ParseVersionDebug(base.DefaultComparer, flushSplitBytes, td.Input)
+			l0Organizer = manifest.NewL0Organizer(base.DefaultComparer, flushSplitBytes)
+			vers, err = manifest.ParseVersionDebug(base.DefaultComparer, l0Organizer, td.Input)
 			if err != nil {
 				td.Fatalf(t, "%v", err)
 			}
@@ -134,8 +137,7 @@ func TestDownloadTask(t *testing.T) {
 				compacting[base.FileNum(n)] = struct{}{}
 			}
 			for _, lm := range vers.Levels {
-				iter := lm.Iter()
-				for f := iter.First(); f != nil; f = iter.Next() {
+				for f := range lm.All() {
 					if _, ok := compacting[f.FileNum]; ok {
 						f.CompactionState = manifest.CompactionStateCompacting
 						delete(compacting, f.FileNum)
@@ -179,13 +181,13 @@ func TestDownloadTask(t *testing.T) {
 					ch <- ErrCancelledCompaction
 				} else {
 					fmt.Fprintf(&buf, "downloading %s\n", f.FileNum)
-					f.Virtual = false
+					f.Virtual = nil
 					f.FileBacking.DiskFileNum = base.DiskFileNum(f.FileNum)
 					ch <- nil
 				}
 				return ch, true
 			}
-			res := d.tryLaunchDownloadCompaction(task, vers, compactionEnv{}, maxConcurrentDownloads)
+			res := d.tryLaunchDownloadCompaction(task, vers, l0Organizer, compactionEnv{}, maxConcurrentDownloads)
 			printTask(&buf)
 			if res == downloadTaskCompleted {
 				fmt.Fprintf(&buf, "task completed")

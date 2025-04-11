@@ -78,12 +78,12 @@ func (r *ValueFetcher) Init(rp ReaderProvider, env block.ReadEnv) {
 func (r *ValueFetcher) Fetch(
 	ctx context.Context, handle []byte, fileNum base.DiskFileNum, valLen uint32, buf []byte,
 ) (val []byte, callerOwned bool, err error) {
-	vblkHandle := valblk.DecodeRemainingHandle(handle)
+	handleSuffix := DecodeHandleSuffix(handle)
 	vh := Handle{
 		FileNum:       fileNum,
-		BlockNum:      vblkHandle.BlockNum,
-		OffsetInBlock: vblkHandle.OffsetInBlock,
 		ValueLen:      valLen,
+		BlockNum:      handleSuffix.BlockNum,
+		OffsetInBlock: handleSuffix.OffsetInBlock,
 	}
 	v, err := r.retrieve(ctx, vh)
 	return v, false, err
@@ -96,6 +96,7 @@ func (r *ValueFetcher) retrieve(ctx context.Context, vh Handle) (val []byte, err
 	// vh.FileNum.
 	var cr *cachedReader
 	var oldestFetchIndex int
+	// TODO(jackson): Reconsider this O(len(readers)) scan.
 	for i := range r.readers {
 		if r.readers[i].fileNum == vh.FileNum && r.readers[i].r != nil {
 			cr = &r.readers[i]
@@ -119,6 +120,10 @@ func (r *ValueFetcher) retrieve(ctx context.Context, vh Handle) (val []byte, err
 		}
 		cr.fileNum = vh.FileNum
 		cr.rh = cr.r.InitReadHandle(&cr.preallocRH)
+	}
+
+	if r.env.Stats != nil {
+		r.env.Stats.SeparatedPointValue.ValueBytesFetched += uint64(vh.ValueLen)
 	}
 
 	r.fetchCount++
@@ -190,8 +195,8 @@ func (cr *cachedReader) GetUnsafeValue(
 	}
 	data := cr.currentBlockBuf.BlockData()
 	if len(data) < int(vh.OffsetInBlock+vh.ValueLen) {
-		return nil, base.CorruptionErrorf("blob file %s: block %d: expected block length %d, got %d",
-			vh.FileNum, vh.BlockNum, vh.OffsetInBlock+vh.ValueLen, len(data))
+		return nil, base.CorruptionErrorf("blob file %s: block %d: value offset %d plus len %d exceeds block length %d",
+			vh.FileNum, vh.BlockNum, vh.OffsetInBlock, vh.ValueLen, len(data))
 	}
 	return data[vh.OffsetInBlock : vh.OffsetInBlock+vh.ValueLen], nil
 }

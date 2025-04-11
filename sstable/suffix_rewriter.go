@@ -76,7 +76,7 @@ func RewriteKeySuffixesAndReturnFormat(
 	if err != nil {
 		return nil, TableFormatUnspecified, err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	return rewriteKeySuffixesInBlocks(r, sst, out, o, from, to, concurrency)
 }
 
@@ -101,7 +101,7 @@ func rewriteKeySuffixesInBlocks(
 	w := NewRawWriter(out, o)
 	defer func() {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}()
 
@@ -210,7 +210,7 @@ func rewriteDataBlocksInParallel(
 }
 
 func rewriteRangeKeyBlockToWriter(r *Reader, w RawWriter, from, to []byte) error {
-	iter, err := r.NewRawRangeKeyIter(context.TODO(), NoFragmentTransforms, block.NoReadEnv)
+	iter, err := r.NewRawRangeKeyIter(context.TODO(), NoFragmentTransforms, NoReadEnv)
 	if err != nil {
 		return err
 	}
@@ -308,19 +308,22 @@ func RewriteKeySuffixesViaWriter(
 	if o.Comparer == nil || o.Comparer.Split == nil {
 		return nil, errors.New("a valid splitter is required to rewrite suffixes")
 	}
+	if r.Properties.NumValuesInBlobFiles > 0 {
+		return nil, errors.New("cannot rewrite suffixes of sstable with blob values")
+	}
 
 	o.IsStrictObsolete = false
 	w := NewRawWriter(out, o)
 	defer func() {
 		if w != nil {
-			w.Close()
+			_ = w.Close()
 		}
 	}()
-	i, err := r.NewIter(NoTransforms, nil, nil)
+	i, err := r.NewIter(NoTransforms, nil, nil, AssertNoBlobHandles)
 	if err != nil {
 		return nil, err
 	}
-	defer i.Close()
+	defer func() { _ = i.Close() }()
 
 	kv := i.First()
 	var scratch InternalKey
@@ -336,14 +339,15 @@ func RewriteKeySuffixesViaWriter(
 		scratch.UserKey = append(scratch.UserKey, to...)
 		scratch.Trailer = kv.K.Trailer
 
+		if invariants.Enabled && invariants.Sometimes(10) {
+			r.Comparer.ValidateKey.MustValidate(scratch.UserKey)
+		}
+
 		val, _, err := kv.Value(nil)
 		if err != nil {
 			return nil, err
 		}
-		if invariants.Enabled && invariants.Sometimes(10) {
-			r.Comparer.ValidateKey.MustValidate(scratch.UserKey)
-		}
-		if err := w.AddWithForceObsolete(scratch, val, false); err != nil {
+		if err := w.Add(scratch, val, false); err != nil {
 			return nil, err
 		}
 		kv = i.Next()
@@ -387,7 +391,7 @@ func readBlockBuf(
 		}
 	}
 
-	decompressedLen, prefix, err := block.DecompressedLen(algo, raw)
+	decompressedLen, err := block.DecompressedLen(algo, raw)
 	if err != nil {
 		return nil, buf, err
 	}
@@ -399,7 +403,7 @@ func readBlockBuf(
 		}
 	}
 	dst := buf[:decompressedLen]
-	err = block.DecompressInto(algo, raw[prefix:], dst)
+	err = block.DecompressInto(algo, raw, dst)
 	return dst, buf, err
 }
 

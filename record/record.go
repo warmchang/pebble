@@ -112,6 +112,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/bitflip"
 	"github.com/cockroachdb/pebble/internal/crc"
 )
 
@@ -250,6 +251,13 @@ type Reader struct {
 	// that had garbage values. It is used to clarify whether or not a garbage chunk
 	// encountered during WAL replay was the logical EOF or confirmed corruption.
 	invalidOffset uint64
+
+	// loggerForTesting is a logging helper used by the Reader to accumulate log messages.
+	loggerForTesting loggerForTesting
+}
+
+type loggerForTesting interface {
+	logf(format string, args ...interface{})
 }
 
 // NewReader returns a new reader. If the file contains records encoded using
@@ -352,9 +360,19 @@ func (r *Reader) nextChunk(wantFirst bool) error {
 				r.invalidOffset = uint64(r.blockNum)*blockSize + uint64(r.begin)
 				return ErrInvalidChunk
 			}
-			if checksum != crc.New(r.buf[r.begin-headerSize+6:r.end]).Value() {
+			data := r.buf[r.begin-headerSize+6 : r.end]
+			if checksum != crc.New(data).Value() {
+				computeChecksum := func(data []byte) uint32 { return crc.New(data).Value() }
+				// Check if there was a bit flip.
+				found, indexFound, bitFound := bitflip.CheckSliceForBitFlip(data, computeChecksum, checksum)
+				err := ErrInvalidChunk
+				if found {
+					err = errors.WithSafeDetails(err, ". bit flip found: block num %d. wal offset %d. byte index %d. got: 0x%x. want: 0x%x.",
+						errors.Safe(r.blockNum), errors.Safe(r.invalidOffset), errors.Safe(indexFound), errors.Safe(data[indexFound]), errors.Safe(data[indexFound]^(1<<bitFound)))
+				}
+
 				r.invalidOffset = uint64(r.blockNum)*blockSize + uint64(r.begin)
-				return ErrInvalidChunk
+				return err
 			}
 			if wantFirst {
 				if chunkPosition != fullChunkPosition && chunkPosition != firstChunkPosition {
@@ -422,11 +440,18 @@ func (r *Reader) Next() (io.Reader, error) {
 // if there is confirmation of a corruption, otherwise ErrUnexpectedEOF is
 // returned after reading all the blocks without corruption confirmation.
 func (r *Reader) readAheadForCorruption() error {
+	if r.loggerForTesting != nil {
+		r.loggerForTesting.logf("Starting read ahead for corruption. Block corrupted %d.\n", r.blockNum)
+	}
+
 	for {
 		// Load the next block into r.buf.
 		n, err := io.ReadFull(r.r, r.buf[:])
 		r.begin, r.end, r.n = 0, 0, n
 		r.blockNum++
+		if r.loggerForTesting != nil {
+			r.loggerForTesting.logf("Read block %d with %d bytes\n", r.blockNum, n)
+		}
 
 		if errors.Is(err, io.EOF) {
 			// io.ErrUnexpectedEOF is returned instead of
@@ -439,6 +464,9 @@ func (r *Reader) readAheadForCorruption() error {
 			// invalid chunk should have been valid, the chunk represents
 			// an abrupt, unclean termination of the logical log. This
 			// abrupt end of file represented by io.ErrUnexpectedEOF.
+			if r.loggerForTesting != nil {
+				r.loggerForTesting.logf("\tEncountered io.EOF; returning io.ErrUnexpectedEOF since no sync offset found.\n")
+			}
 			return io.ErrUnexpectedEOF
 		}
 		// The last block of a log can be less than 32KiB, which is
@@ -447,6 +475,9 @@ func (r *Reader) readAheadForCorruption() error {
 		// However, if the error is not ErrUnexpectedEOF, then this
 		// error should be surfaced.
 		if err != nil && err != io.ErrUnexpectedEOF {
+			if r.loggerForTesting != nil {
+				r.loggerForTesting.logf("\tError reading block %d: %v", r.blockNum, err)
+			}
 			return err
 		}
 
@@ -454,24 +485,44 @@ func (r *Reader) readAheadForCorruption() error {
 			checksum := binary.LittleEndian.Uint32(r.buf[r.end+0 : r.end+4])
 			length := binary.LittleEndian.Uint16(r.buf[r.end+4 : r.end+6])
 			chunkEncoding := r.buf[r.end+6]
+
+			if r.loggerForTesting != nil {
+				r.loggerForTesting.logf("\tBlock %d: Processing chunk at offset %d, checksum=%d, length=%d, encoding=%d\n", r.blockNum, r.end, checksum, length, chunkEncoding)
+			}
+
 			if int(chunkEncoding) >= len(headerFormatMappings) {
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tInvalid chunk encoding encountered (value: %d); stopping chunk scan in block %d\n", chunkEncoding, r.blockNum)
+				}
 				break
 			}
 
 			headerFormat := headerFormatMappings[chunkEncoding]
 			chunkPosition, wireFormat, headerSize := headerFormat.chunkPosition, headerFormat.wireFormat, headerFormat.headerSize
 			if checksum == 0 && length == 0 && chunkPosition == invalidChunkPosition {
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tFound invalid chunk marker at block %d offset %d; aborting this block scan\n", r.blockNum, r.end)
+				}
 				break
 			}
 			if wireFormat == invalidWireFormat {
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tInvalid wire format detected in block %d at offset %d\n", r.blockNum, r.end)
+				}
 				break
 			}
 			if wireFormat == recyclableWireFormat || wireFormat == walSyncWireFormat {
 				if r.end+headerSize > r.n {
+					if r.loggerForTesting != nil {
+						r.loggerForTesting.logf("\tIncomplete header in block %d at offset %d; breaking out\n", r.blockNum, r.end)
+					}
 					break
 				}
 				logNum := binary.LittleEndian.Uint32(r.buf[r.end+7 : r.end+11])
 				if logNum != r.logNum {
+					if r.loggerForTesting != nil {
+						r.loggerForTesting.logf("\tMismatch log number in block %d at offset %d (expected %d, got %d)\n", r.blockNum, r.end, r.logNum, logNum)
+					}
 					break
 				}
 			}
@@ -480,18 +531,30 @@ func (r *Reader) readAheadForCorruption() error {
 			r.end = r.begin + int(length)
 			if r.end > r.n {
 				// The chunk straddles a 32KB boundary (or the end of file).
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tChunk in block %d spans beyond block boundaries (begin=%d, end=%d, n=%d)\n", r.blockNum, r.begin, r.end, r.n)
+				}
 				break
 			}
 			if checksum != crc.New(r.buf[r.begin-headerSize+6:r.end]).Value() {
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tChecksum mismatch in block %d at offset %d; potential corruption\n", r.blockNum, r.end)
+				}
 				break
 			}
 
 			// Decode offset in header when chunk has the WAL Sync wire format.
 			if wireFormat == walSyncWireFormat {
 				syncedOffset := binary.LittleEndian.Uint64(r.buf[r.begin-headerSize+11 : r.begin-headerSize+19])
+				if r.loggerForTesting != nil {
+					r.loggerForTesting.logf("\tBlock %d: Found WAL sync chunk with syncedOffset=%d (invalidOffset=%d)\n", r.blockNum, syncedOffset, r.invalidOffset)
+				}
 				// If the encountered chunk offset promises durability beyond the invalid offset,
 				// the invalid offset must have been corruption.
 				if syncedOffset > r.invalidOffset {
+					if r.loggerForTesting != nil {
+						r.loggerForTesting.logf("\tCorruption confirmed: syncedOffset %d exceeds invalidOffset %d\n", syncedOffset, r.invalidOffset)
+					}
 					return r.err
 				}
 			}

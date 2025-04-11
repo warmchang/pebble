@@ -5,6 +5,7 @@
 package sstable
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/bytealloc"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
@@ -24,6 +26,7 @@ import (
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/sstable/valblk"
+	"github.com/cockroachdb/pebble/sstable/virtual"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -64,7 +67,12 @@ type Reader struct {
 	tableFormat TableFormat
 }
 
-var _ CommonReader = (*Reader)(nil)
+type ReadEnv struct {
+	Virtual *virtual.VirtualReaderParams
+	Block   block.ReadEnv
+}
+
+var NoReadEnv = ReadEnv{}
 
 // Close the reader and the underlying objstorage.Readable.
 func (r *Reader) Close() error {
@@ -77,23 +85,24 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+// IterOptions defines options for configuring a sstable pointer iterator.
+type IterOptions struct {
+	Lower, Upper         []byte
+	Transforms           IterTransforms
+	Filterer             *BlockPropertiesFilterer
+	FilterBlockSizeLimit FilterBlockSizeLimit
+	Env                  ReadEnv
+	ReaderProvider       valblk.ReaderProvider
+	BlobContext          TableBlobContext
+}
+
 // NewPointIter returns an iterator for the point keys in the table.
 //
 // If transform.HideObsoletePoints is set, the callee assumes that filterer
 // already includes obsoleteKeyBlockPropertyFilter. The caller can satisfy this
 // contract by first calling TryAddBlockPropertyFilterForHideObsoletePoints.
-func (r *Reader) NewPointIter(
-	ctx context.Context,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-) (Iterator, error) {
-	return r.newPointIter(
-		ctx, transforms, lower, upper, filterer, filterBlockSizeLimit,
-		env, rp, nil)
+func (r *Reader) NewPointIter(ctx context.Context, opts IterOptions) (Iterator, error) {
+	return r.newPointIter(ctx, opts)
 }
 
 // TryAddBlockPropertyFilterForHideObsoletePoints is expected to be called
@@ -112,16 +121,7 @@ func (r *Reader) TryAddBlockPropertyFilterForHideObsoletePoints(
 	return hideObsoletePoints, pointKeyFilters
 }
 
-func (r *Reader) newPointIter(
-	ctx context.Context,
-	transforms IterTransforms,
-	lower, upper []byte,
-	filterer *BlockPropertiesFilterer,
-	filterBlockSizeLimit FilterBlockSizeLimit,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-	vState *virtualState,
-) (Iterator, error) {
+func (r *Reader) newPointIter(ctx context.Context, opts IterOptions) (Iterator, error) {
 	// NB: pebble.fileCache wraps the returned iterator with one which performs
 	// reference counting on the Reader, preventing the Reader from being closed
 	// until the final iterator closes.
@@ -130,22 +130,18 @@ func (r *Reader) newPointIter(
 	if r.Properties.IndexType == twoLevelIndex {
 		if r.tableFormat.BlockColumnar() {
 			res, err = newColumnBlockTwoLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, opts)
 		} else {
 			res, err = newRowBlockTwoLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, opts)
 		}
 	} else {
 		if r.tableFormat.BlockColumnar() {
 			res, err = newColumnBlockSingleLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, opts)
 		} else {
 			res, err = newRowBlockSingleLevelIterator(
-				ctx, r, vState, transforms, lower, upper, filterer, filterBlockSizeLimit,
-				env, rp)
+				ctx, r, opts)
 		}
 	}
 	if err != nil {
@@ -162,46 +158,59 @@ func (r *Reader) newPointIter(
 //
 // NewIter must only be used when the Reader is guaranteed to outlive any
 // LazyValues returned from the iter.
-func (r *Reader) NewIter(transforms IterTransforms, lower, upper []byte) (Iterator, error) {
+func (r *Reader) NewIter(
+	transforms IterTransforms, lower, upper []byte, blobContext TableBlobContext,
+) (Iterator, error) {
 	// TODO(radu): we should probably not use bloom filters in this case, as there
 	// likely isn't a cache set up.
-	return r.NewPointIter(
-		context.TODO(), transforms, lower, upper, nil, AlwaysUseFilterBlock,
-		block.NoReadEnv, MakeTrivialReaderProvider(r))
+	opts := IterOptions{
+		Lower:                lower,
+		Upper:                upper,
+		Transforms:           transforms,
+		Filterer:             nil,
+		FilterBlockSizeLimit: AlwaysUseFilterBlock,
+		Env:                  NoReadEnv,
+		ReaderProvider:       MakeTrivialReaderProvider(r),
+		BlobContext:          blobContext,
+	}
+	return r.NewPointIter(context.TODO(), opts)
 }
 
 // NewCompactionIter returns an iterator similar to NewIter but it also increments
 // the number of bytes iterated. If an error occurs, NewCompactionIter cleans up
 // after itself and returns a nil iterator.
 func (r *Reader) NewCompactionIter(
-	transforms IterTransforms, env block.ReadEnv, rp valblk.ReaderProvider,
+	transforms IterTransforms, env ReadEnv, rp valblk.ReaderProvider, blobContext TableBlobContext,
 ) (Iterator, error) {
-	return r.newCompactionIter(transforms, env, rp, nil)
+	return r.newCompactionIter(transforms, env, rp, blobContext)
 }
 
 func (r *Reader) newCompactionIter(
-	transforms IterTransforms, env block.ReadEnv, rp valblk.ReaderProvider, vState *virtualState,
+	transforms IterTransforms, env ReadEnv, rp valblk.ReaderProvider, blobContext TableBlobContext,
 ) (Iterator, error) {
-	if vState != nil && vState.isSharedIngested {
+	if env.Virtual != nil && env.Virtual.IsSharedIngested {
 		transforms.HideObsoletePoints = true
+	}
+	ctx := context.Background()
+	opts := IterOptions{
+		Transforms:           transforms,
+		Filterer:             nil,
+		FilterBlockSizeLimit: NeverUseFilterBlock,
+		Env:                  env,
+		ReaderProvider:       rp,
+		BlobContext:          blobContext,
 	}
 
 	if r.Properties.IndexType == twoLevelIndex {
 		if !r.tableFormat.BlockColumnar() {
-			i, err := newRowBlockTwoLevelIterator(
-				context.Background(),
-				r, vState, transforms, nil /* lower */, nil /* upper */, nil,
-				NeverUseFilterBlock, env, rp)
+			i, err := newRowBlockTwoLevelIterator(ctx, r, opts)
 			if err != nil {
 				return nil, err
 			}
 			i.SetupForCompaction()
 			return i, nil
 		}
-		i, err := newColumnBlockTwoLevelIterator(
-			context.Background(),
-			r, vState, transforms, nil /* lower */, nil /* upper */, nil,
-			NeverUseFilterBlock, env, rp)
+		i, err := newColumnBlockTwoLevelIterator(ctx, r, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -209,18 +218,14 @@ func (r *Reader) newCompactionIter(
 		return i, nil
 	}
 	if !r.tableFormat.BlockColumnar() {
-		i, err := newRowBlockSingleLevelIterator(
-			context.Background(), r, vState, transforms, nil /* lower */, nil, /* upper */
-			nil, NeverUseFilterBlock, env, rp)
+		i, err := newRowBlockSingleLevelIterator(ctx, r, opts)
 		if err != nil {
 			return nil, err
 		}
 		i.SetupForCompaction()
 		return i, nil
 	}
-	i, err := newColumnBlockSingleLevelIterator(
-		context.Background(), r, vState, transforms, nil /* lower */, nil, /* upper */
-		nil, NeverUseFilterBlock, env, rp)
+	i, err := newColumnBlockSingleLevelIterator(ctx, r, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -232,13 +237,12 @@ func (r *Reader) newCompactionIter(
 // range-del block for the table. Returns nil if the table does not contain
 // any range deletions.
 func (r *Reader) NewRawRangeDelIter(
-	ctx context.Context, transforms FragmentIterTransforms, env block.ReadEnv,
+	ctx context.Context, transforms FragmentIterTransforms, env ReadEnv,
 ) (iter keyspan.FragmentIterator, err error) {
 	if r.rangeDelBH.Length == 0 {
 		return nil, nil
 	}
-	// TODO(radu): plumb stats here.
-	h, err := r.readRangeDelBlock(ctx, env, noReadHandle, r.rangeDelBH)
+	h, err := r.readRangeDelBlock(ctx, env.Block, noReadHandle, r.rangeDelBH)
 	if err != nil {
 		return nil, err
 	}
@@ -250,20 +254,35 @@ func (r *Reader) NewRawRangeDelIter(
 			return nil, err
 		}
 	}
-	return keyspan.MaybeAssert(iter, r.Comparer.Compare), nil
+
+	i := keyspan.MaybeAssert(iter, r.Comparer.Compare)
+	if env.Virtual != nil {
+		i = keyspan.Truncate(
+			r.Comparer.Compare, i,
+			base.UserKeyBoundsFromInternal(env.Virtual.Lower, env.Virtual.Upper),
+		)
+	}
+	return i, nil
 }
 
 // NewRawRangeKeyIter returns an internal iterator for the contents of the
 // range-key block for the table. Returns nil if the table does not contain any
 // range keys.
 func (r *Reader) NewRawRangeKeyIter(
-	ctx context.Context, transforms FragmentIterTransforms, env block.ReadEnv,
+	ctx context.Context, transforms FragmentIterTransforms, env ReadEnv,
 ) (iter keyspan.FragmentIterator, err error) {
+	syntheticSeqNum := transforms.SyntheticSeqNum
+	if env.Virtual != nil && env.Virtual.IsSharedIngested {
+		// Don't pass a synthetic sequence number for shared ingested sstables. We
+		// need to know the materialized sequence numbers, and we will set up the
+		// appropriate sequence number substitution below.
+		transforms.SyntheticSeqNum = 0
+	}
+
 	if r.rangeKeyBH.Length == 0 {
 		return nil, nil
 	}
-	// TODO(radu): plumb stats here.
-	h, err := r.readRangeKeyBlock(ctx, env, noReadHandle, r.rangeKeyBH)
+	h, err := r.readRangeKeyBlock(ctx, env.Block, noReadHandle, r.rangeKeyBH)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +294,32 @@ func (r *Reader) NewRawRangeKeyIter(
 			return nil, err
 		}
 	}
-	return keyspan.MaybeAssert(iter, r.Comparer.Compare), nil
+	i := keyspan.MaybeAssert(iter, r.Comparer.Compare)
+
+	if env.Virtual != nil {
+		// We need to coalesce range keys within each sstable, and then apply the
+		// synthetic sequence number. For this, we use ForeignSSTTransformer.
+		//
+		// TODO(bilal): Avoid these allocations by hoisting the transformer and
+		// transform iter up.
+		if env.Virtual.IsSharedIngested {
+			transform := &rangekey.ForeignSSTTransformer{
+				Equal:  r.Comparer.Equal,
+				SeqNum: base.SeqNum(syntheticSeqNum),
+			}
+			transformIter := &keyspan.TransformerIter{
+				FragmentIterator: i,
+				Transformer:      transform,
+				SuffixCmp:        r.Comparer.CompareRangeSuffixes,
+			}
+			i = transformIter
+		}
+		i = keyspan.Truncate(
+			r.Comparer.Compare, i,
+			base.UserKeyBoundsFromInternal(env.Virtual.Lower, env.Virtual.Upper),
+		)
+	}
+	return i, nil
 }
 
 // noReadHandle is used when we don't want to pass a ReadHandle to one of the
@@ -424,7 +468,11 @@ func (r *Reader) readMetaindex(
 	}
 
 	var meta map[string]block.Handle
-	meta, r.valueBIH, err = decodeMetaindex(data)
+	if r.tableFormat >= TableFormatPebblev6 {
+		meta, r.valueBIH, err = decodeColumnarMetaIndex(data)
+	} else {
+		meta, r.valueBIH, err = decodeMetaindex(data)
+	}
 	if err != nil {
 		return err
 	}
@@ -435,11 +483,24 @@ func (r *Reader) readMetaindex(
 			return err
 		}
 		r.propertiesBH = bh
-		err := r.Properties.load(b.BlockData(), deniedUserProperties)
-		b.Release()
-		if err != nil {
-			return err
+		if r.tableFormat >= TableFormatPebblev6 {
+			var decoder colblk.KeyValueBlockDecoder
+			decoder.Init(b.BlockData())
+			if err := r.Properties.load(decoder.All(), deniedUserProperties); err != nil {
+				return err
+			}
+		} else {
+			i, err := rowblk.NewRawIter(bytes.Compare, b.BlockData())
+			if err != nil {
+				return err
+			}
+			if err := r.Properties.load(i.All(), deniedUserProperties); err != nil {
+				return err
+			}
 		}
+		b.Release()
+	} else {
+		return errors.New("did not read any value for the properties block in the meta index")
 	}
 
 	if bh, ok := meta[metaRangeDelV2Name]; ok {
@@ -651,11 +712,6 @@ func (r *Reader) ValidateBlockChecksums() error {
 	return nil
 }
 
-// CommonProperties implemented the CommonReader interface.
-func (r *Reader) CommonProperties() *CommonProperties {
-	return &r.Properties.CommonProperties
-}
-
 // EstimateDiskUsage returns the total size of data blocks overlapping the range
 // `[start, end]`. Even if a data block partially overlaps, or we cannot
 // determine overlap due to abbreviated index keys, the full data block size is
@@ -671,7 +727,11 @@ func (r *Reader) CommonProperties() *CommonProperties {
 // TODO(ajkr): account for metablock space usage. Perhaps look at the fraction of
 // data blocks overlapped and add that same fraction of the metadata blocks to the
 // estimate.
-func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
+func (r *Reader) EstimateDiskUsage(start []byte, end []byte, env ReadEnv) (uint64, error) {
+	if env.Virtual != nil {
+		_, start, end = env.Virtual.ConstrainBounds(start, end, false, r.Comparer.Compare)
+	}
+
 	if !r.tableFormat.BlockColumnar() {
 		return estimateDiskUsage[rowblk.IndexIter, *rowblk.IndexIter](r, start, end)
 	}
@@ -816,7 +876,7 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 	var preallocRH objstorageprovider.PreallocatedReadHandle
 	rh := objstorageprovider.UsePreallocatedReadHandle(
 		f, objstorage.ReadBeforeForNewReader, &preallocRH)
-	defer rh.Close()
+	defer func() { _ = rh.Close() }()
 
 	footer, err := readFooter(ctx, f, rh, o.LoggerAndTracer, o.CacheOpts.FileNum)
 	if err != nil {

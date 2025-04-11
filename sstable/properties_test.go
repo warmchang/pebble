@@ -5,6 +5,7 @@
 package sstable
 
 import (
+	"bytes"
 	randv1 "math/rand"
 	"path/filepath"
 	"reflect"
@@ -103,10 +104,12 @@ func TestPropertiesSave(t *testing.T) {
 		// Check that we can save properties and read them back.
 		var w rowblk.Writer
 		w.RestartInterval = propertiesBlockRestartInterval
-		e.save(TableFormatPebblev2, &w)
+		require.NoError(t, e.saveToRowWriter(TableFormatPebblev2, &w))
 		var props Properties
 
-		require.NoError(t, props.load(w.Finish(), make(map[string]struct{})))
+		i, err := rowblk.NewRawIter(bytes.Compare, w.Finish())
+		require.NoError(t, err)
+		require.NoError(t, props.load(i.All(), make(map[string]struct{})))
 		props.Loaded = nil
 		if diff := pretty.Diff(*e, props); diff != nil {
 			t.Fatalf("%s", strings.Join(diff, "\n"))
@@ -130,13 +133,15 @@ func TestPropertiesSave(t *testing.T) {
 func BenchmarkPropertiesLoad(b *testing.B) {
 	var w rowblk.Writer
 	w.RestartInterval = propertiesBlockRestartInterval
-	testProps.save(TableFormatPebblev2, &w)
+	require.NoError(b, testProps.saveToRowWriter(TableFormatPebblev2, &w))
 	block := w.Finish()
 
 	b.ResetTimer()
 	p := &Properties{}
 	for i := 0; i < b.N; i++ {
 		*p = Properties{}
-		require.NoError(b, p.load(block, nil))
+		it, err := rowblk.NewRawIter(bytes.Compare, block)
+		require.NoError(b, err)
+		require.NoError(b, p.load(it.All(), nil))
 	}
 }

@@ -527,7 +527,13 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 	iter, _ := db.NewIter(&pebble.IterOptions{
 		UpperBound: d.end,
 	})
-	for valid := iter.SeekGE(d.start); valid; valid = iter.Next() {
+	var valid bool
+	if len(d.start) == 0 {
+		valid = iter.First()
+	} else {
+		valid = iter.SeekGE(d.start)
+	}
+	for ; valid; valid = iter.Next() {
 		if fmtKeys || fmtValues {
 			needDelimiter := false
 			if fmtKeys {
@@ -536,11 +542,11 @@ func (d *dbT) runScan(cmd *cobra.Command, args []string) {
 			}
 			if fmtValues {
 				if needDelimiter {
-					stdout.Write([]byte{' '})
+					_, _ = stdout.Write([]byte{' '})
 				}
 				fmt.Fprintf(stdout, "%s", d.fmtValue.fn(iter.Key(), iter.Value()))
 			}
-			stdout.Write([]byte{'\n'})
+			_, _ = stdout.Write([]byte{'\n'})
 		}
 
 		count++
@@ -645,7 +651,7 @@ This command will remove all keys in this range!`
 	// the database directory so that the command works against any FS.
 	// TODO(radu): remove this if we add a separate DB.Excise method.
 	path := dbOpts.FS.PathJoin(dbDir, fmt.Sprintf("excise-%0x.sst", rand.Uint32()))
-	defer dbOpts.FS.Remove(path)
+	defer func() { _ = dbOpts.FS.Remove(path) }()
 	f, err := dbOpts.FS.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error creating temporary sst file %q: %s\n", path, err)
@@ -715,29 +721,28 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 				d.fmtValue.setForComparer(ve.ComparerName, d.comparers)
 			}
 		}
-		v, err := bve.Apply(
-			nil /* version */, cmp, d.opts.FlushSplitBytes,
-			d.opts.Experimental.ReadCompactionRate,
-		)
+		l0Organizer := manifest.NewL0Organizer(cmp, d.opts.FlushSplitBytes)
+		emptyVersion := manifest.NewInitialVersion(cmp)
+		v, err := bve.Apply(emptyVersion, d.opts.Experimental.ReadCompactionRate)
 		if err != nil {
 			return err
 		}
+		l0Organizer.PerformUpdate(l0Organizer.PrepareUpdate(&bve, v), v)
 
 		objProvider, err := objstorageprovider.Open(objstorageprovider.DefaultSettings(d.opts.FS, dirname))
 		if err != nil {
 			return err
 		}
-		defer objProvider.Close()
+		defer func() { _ = objProvider.Close() }()
 
 		// Load and aggregate sstable properties.
 		tw := tabwriter.NewWriter(stdout, 2, 1, 4, ' ', 0)
 		var total props
 		var all []props
 		for _, l := range v.Levels {
-			iter := l.Iter()
 			var level props
-			for t := iter.First(); t != nil; t = iter.Next() {
-				if t.Virtual {
+			for t := range l.All() {
+				if t.Virtual != nil {
 					// TODO(bananabrick): Handle virtual sstables here. We don't
 					// really have any stats or properties at this point. Maybe
 					// we could approximate some of these properties for virtual
@@ -953,9 +958,7 @@ func (p *props) update(o props) {
 	p.TopLevelIndexSize += o.TopLevelIndexSize
 }
 
-func (d *dbT) addProps(
-	objProvider objstorage.Provider, m manifest.PhysicalTableMeta, p *props,
-) error {
+func (d *dbT) addProps(objProvider objstorage.Provider, m *manifest.TableMetadata, p *props) error {
 	ctx := context.Background()
 	f, err := objProvider.OpenForReading(ctx, base.FileTypeTable, m.FileBacking.DiskFileNum, objstorage.OpenOptions{})
 	if err != nil {

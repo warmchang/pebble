@@ -15,8 +15,8 @@ import (
 	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/blobtest"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
@@ -28,43 +28,8 @@ import (
 )
 
 func optsFromArgs(td *datadriven.TestData, writerOpts *WriterOptions) error {
-	for _, arg := range td.CmdArgs {
-		switch arg.Key {
-		case "leveldb":
-			if len(arg.Vals) != 0 {
-				return errors.Errorf("%s: arg %s expects 0 values", td.Cmd, arg.Key)
-			}
-			writerOpts.TableFormat = TableFormatLevelDB
-		case "block-size":
-			if len(arg.Vals) != 1 {
-				return errors.Errorf("%s: arg %s expects 1 value", td.Cmd, arg.Key)
-			}
-			var err error
-			writerOpts.BlockSize, err = strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return err
-			}
-		case "index-block-size":
-			if len(arg.Vals) != 1 {
-				return errors.Errorf("%s: arg %s expects 1 value", td.Cmd, arg.Key)
-			}
-			var err error
-			writerOpts.IndexBlockSize, err = strconv.Atoi(arg.Vals[0])
-			if err != nil {
-				return err
-			}
-		case "filter":
-			writerOpts.FilterPolicy = bloom.FilterPolicy(10)
-		case "comparer":
-			var err error
-			if writerOpts.Comparer, err = comparerFromCmdArg(arg); err != nil {
-				return err
-			}
-		case "writing-to-lowest-level":
-			writerOpts.WritingToLowestLevel = true
-		case "is-strict-obsolete":
-			writerOpts.IsStrictObsolete = true
-		}
+	if err := ParseWriterOptions(writerOpts, td.CmdArgs...); err != nil {
+		return err
 	}
 	if writerOpts.Comparer == nil {
 		writerOpts.Comparer = testkeys.Comparer
@@ -74,19 +39,6 @@ func optsFromArgs(td *datadriven.TestData, writerOpts *WriterOptions) error {
 		writerOpts.KeySchema = &s
 	}
 	return nil
-}
-
-func comparerFromCmdArg(arg datadriven.CmdArg) (*Comparer, error) {
-	switch arg.Vals[0] {
-	case "split-4b-suffix":
-		return test4bSuffixComparer, nil
-	case "testkeys":
-		return testkeys.Comparer, nil
-	case "default":
-		return base.DefaultComparer, nil
-	default:
-		return nil, errors.Errorf("unknown comparer: %s", arg.Vals[0])
-	}
 }
 
 func runBuildMemObjCmd(
@@ -103,7 +55,8 @@ func runBuildMemObjCmd(
 			_ = w.Close()
 		}
 	}()
-	if err := writeKVs(w, td.Input); err != nil {
+	var bv blobtest.Values
+	if err := ParseTestSST(w, td.Input, &bv); err != nil {
 		return nil, nil, err
 	}
 	if err := w.Close(); err != nil {
@@ -115,41 +68,6 @@ func runBuildMemObjCmd(
 		return nil, nil, err
 	}
 	return meta, obj, nil
-}
-
-func writeKVs(w RawWriter, input string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.Errorf("%v", r)
-		}
-	}()
-	for _, data := range strings.Split(input, "\n") {
-		switch {
-		case strings.HasPrefix(data, "EncodeSpan:"):
-			err = w.EncodeSpan(keyspan.ParseSpan(strings.TrimPrefix(data, "EncodeSpan:")))
-		default:
-			forceObsolete := strings.HasPrefix(data, "force-obsolete:")
-			if forceObsolete {
-				data = strings.TrimSpace(strings.TrimPrefix(data, "force-obsolete:"))
-			}
-			j := strings.Index(data, ":")
-			key := base.ParseInternalKey(data[:j])
-			value := []byte(data[j+1:])
-			switch key.Kind() {
-			case InternalKeyKindRangeDelete:
-				if forceObsolete {
-					return errors.Errorf("force-obsolete is not allowed for RANGEDEL")
-				}
-				err = w.AddWithForceObsolete(key, value, false /* forceObsolete */)
-			default:
-				err = w.AddWithForceObsolete(key, value, forceObsolete)
-			}
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return err
 }
 
 func runBuildCmd(
@@ -212,8 +130,8 @@ func runBuildRawCmd(
 		}
 	}()
 	for _, data := range strings.Split(td.Input, "\n") {
-		if strings.HasPrefix(data, "EncodeSpan:") {
-			data = strings.TrimPrefix(data, "EncodeSpan:")
+		if strings.HasPrefix(data, "Span:") {
+			data = strings.TrimPrefix(data, "Span:")
 			if err := w.EncodeSpan(keyspan.ParseSpan(data)); err != nil {
 				return nil, nil, err
 			}
@@ -223,7 +141,7 @@ func runBuildRawCmd(
 		j := strings.Index(data, ":")
 		key := base.ParseInternalKey(data[:j])
 		value := []byte(data[j+1:])
-		if err := w.AddWithForceObsolete(key, value, false); err != nil {
+		if err := w.Add(key, value, false); err != nil {
 			return nil, nil, err
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -332,7 +333,7 @@ func TestNewDBFilenames(t *testing.T) {
 			"LOCK",
 			"MANIFEST-000001",
 			"OPTIONS-000003",
-			"marker.format-version.000007.020",
+			"marker.format-version.000008.021",
 			"marker.manifest.000001.MANIFEST-000001",
 		},
 	}
@@ -1457,7 +1458,8 @@ func TestCheckConsistency(t *testing.T) {
 					}
 				}
 
-				v := manifest.NewVersion(base.DefaultComparer, 0, filesByLevel)
+				l0Organizer := manifest.NewL0Organizer(base.DefaultComparer, 0 /* flushSplitBytes */)
+				v := manifest.NewVersionForTesting(base.DefaultComparer, l0Organizer, filesByLevel)
 				err := checkConsistency(v, provider)
 				if err != nil {
 					if redactErr {
@@ -1746,4 +1748,110 @@ func TestWALFailoverRandomized(t *testing.T) {
 	for o := 0; o < 1000; o++ {
 		nextRandomOp()()
 	}
+}
+
+func TestWALCorruption(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open("", testingRandomized(t, &Options{
+		FS:                 fs,
+		FormatMajorVersion: FormatWALSyncChunks,
+	}))
+	require.NoError(t, err)
+	require.NoError(t, d.Flush())
+
+	fourKiBValue := bytes.Repeat([]byte{'a'}, 4096)
+	for i := 1; i <= 32; i++ {
+		require.NoError(t, d.Set([]byte(fmt.Sprintf("key-%d", i)), fourKiBValue, Sync))
+	}
+	require.NoError(t, d.Close())
+
+	// We should have two WALs.
+	logs, err := fs.List("")
+	require.NoError(t, err)
+	logs = slices.DeleteFunc(logs, func(s string) bool { return filepath.Ext(s) != ".log" })
+	sort.Slice(logs, func(i, j int) bool {
+		return logs[i] < logs[j]
+	})
+	lastLog := logs[len(logs)-1]
+
+	// Corrupt the WAL by zeroing four bytes, 100 bytes from the end
+	// of the file.
+	f, err := fs.OpenReadWrite(lastLog, vfs.WriteCategoryUnspecified)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0, 0, 0, 0}, 100)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	t.Logf("zeroed four bytes in %s at offset %d\n", lastLog, 100)
+
+	// Re-opening the database should detect and report the corruption.
+	_, err = Open("", &Options{
+		FS:                 fs,
+		FormatMajorVersion: FormatWALSyncChunks,
+	})
+	require.True(t, errors.Is(err, ErrCorruption))
+}
+
+func TestWALCorruptionBitFlip(t *testing.T) {
+	fs := vfs.NewMem()
+	d, err := Open("", testingRandomized(t, &Options{
+		FS:                 fs,
+		FormatMajorVersion: FormatWALSyncChunks,
+	}))
+	require.NoError(t, err)
+	require.NoError(t, d.Flush())
+
+	fourKiBValue := bytes.Repeat([]byte{'a'}, 4096)
+	for i := 1; i <= 32; i++ {
+		require.NoError(t, d.Set([]byte(fmt.Sprintf("key-%d", i)), fourKiBValue, Sync))
+	}
+	require.NoError(t, d.Close())
+
+	// We should have two WALs.
+	logs, err := fs.List("")
+	require.NoError(t, err)
+	logs = slices.DeleteFunc(logs, func(s string) bool { return filepath.Ext(s) != ".log" })
+	sort.Slice(logs, func(i, j int) bool {
+		return logs[i] < logs[j]
+	})
+	lastLog := logs[len(logs)-1]
+
+	// Corrupt the WAL by flipping one byte, 100 bytes from the end
+	// of the file.
+	f, err := fs.OpenReadWrite(lastLog, vfs.WriteCategoryUnspecified)
+	require.NoError(t, err)
+
+	buf := []byte{0}
+	_, err = f.ReadAt(buf, 100)
+	require.NoError(t, err)
+
+	bitToFlip := byte(1 << rand.IntN(8))
+	buf[0] ^= bitToFlip
+	_, err = f.WriteAt(buf, 100)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	t.Logf("zeroed one byte in %s at offset %d\n", lastLog, 100)
+
+	// Re-opening the database should detect and report the corruption and bit flip.
+	_, err = Open("", &Options{
+		FS:                 fs,
+		FormatMajorVersion: FormatWALSyncChunks,
+	})
+	require.True(t, errors.Is(err, ErrCorruption))
+
+	checkBitFlipErr := func(err error, t *testing.T) bool {
+		if err != nil {
+			details := errors.GetAllSafeDetails(err)
+			re := regexp.MustCompile(`bit flip found.+byte index \d+\. got: 0x[0-9A-Fa-f]{1,2}\. want: 0x[0-9A-Fa-f]{1,2}\.`)
+			for _, d := range details {
+				for _, s := range d.SafeDetails {
+					if re.MatchString(s) {
+						return true
+					}
+				}
+			}
+			require.Fail(t, "expected at least one detail to match bit flip found pattern", err)
+		}
+		return false
+	}
+	checkBitFlipErr(err, t)
 }

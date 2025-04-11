@@ -78,8 +78,8 @@ func (c *Checker) LSMOverlap(
 ) (WithLSM, error) {
 	var result WithLSM
 	result[0].Result = None
-	for sublevel := 0; sublevel < len(v.L0Sublevels.Levels); sublevel++ {
-		res, err := c.LevelOverlap(ctx, region, v.L0Sublevels.Levels[sublevel])
+	for sublevel := 0; sublevel < len(v.L0SublevelFiles); sublevel++ {
+		res, err := c.LevelOverlap(ctx, region, v.L0SublevelFiles[sublevel])
 		if err != nil {
 			return WithLSM{}, err
 		}
@@ -177,7 +177,7 @@ func (c *Checker) emptyRegionPointsAndRangeDels(
 		return false, err
 	}
 	if points != nil {
-		defer points.Close()
+		defer func() { _ = points.Close() }()
 		var kv *base.InternalKV
 		if c.cmp(region.Start, pointBounds.Start) <= 0 {
 			kv = points.First()

@@ -165,22 +165,30 @@ func TestMergingIterDataDriven(t *testing.T) {
 		fileNum        base.FileNum
 	)
 	newIters :=
-		func(_ context.Context, file *manifest.TableMetadata, opts *IterOptions, iio internalIterOpts, kinds iterKinds,
+		func(ctx context.Context, file *manifest.TableMetadata, opts *IterOptions, iio internalIterOpts, kinds iterKinds,
 		) (iterSet, error) {
 			var set iterSet
 			var err error
 			r := readers[file.FileNum]
 			if kinds.RangeDeletion() {
-				set.rangeDeletion, err = r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, iio.readEnv)
+				set.rangeDeletion, err = r.NewRawRangeDelIter(ctx, sstable.NoFragmentTransforms, iio.readEnv)
 				if err != nil {
 					return iterSet{}, errors.CombineErrors(err, set.CloseAll())
 				}
 			}
 			if kinds.Point() {
-				set.point, err = r.NewPointIter(
-					context.Background(),
-					sstable.NoTransforms,
-					opts.GetLowerBound(), opts.GetUpperBound(), nil, sstable.AlwaysUseFilterBlock, iio.readEnv, sstable.MakeTrivialReaderProvider(r))
+				set.point, err = r.NewPointIter(ctx, sstable.IterOptions{
+					Lower:                opts.GetLowerBound(),
+					Upper:                opts.GetUpperBound(),
+					Transforms:           sstable.NoTransforms,
+					FilterBlockSizeLimit: sstable.AlwaysUseFilterBlock,
+					Env:                  iio.readEnv,
+					ReaderProvider:       sstable.MakeTrivialReaderProvider(r),
+					BlobContext: sstable.TableBlobContext{
+						ValueFetcher: iio.blobValueFetcher,
+						References:   file.BlobReferences,
+					},
+				})
 				if err != nil {
 					return iterSet{}, errors.CombineErrors(err, set.CloseAll())
 				}
@@ -234,7 +242,7 @@ func TestMergingIterDataDriven(t *testing.T) {
 							case InternalKeyKindRangeDelete:
 								frag.Add(keyspan.Span{Start: ikey.UserKey, End: value, Keys: []keyspan.Key{{Trailer: ikey.Trailer}}})
 							default:
-								if err := w.AddWithForceObsolete(ikey, value, false /* forceObsolete */); err != nil {
+								if err := w.Add(ikey, value, false /* forceObsolete */); err != nil {
 									return err.Error()
 								}
 							}
@@ -292,7 +300,7 @@ func TestMergingIterDataDriven(t *testing.T) {
 
 			levelIters := make([]mergingIterLevel, 0, len(v.Levels))
 			var stats base.InternalIteratorStats
-			iio := internalIterOpts{readEnv: block.ReadEnv{Stats: &stats}}
+			iio := internalIterOpts{readEnv: sstable.ReadEnv{Block: block.ReadEnv{Stats: &stats}}}
 			for i, l := range v.Levels {
 				slice := l.Slice()
 				if slice.Empty() {
@@ -362,7 +370,7 @@ func buildMergingIterTables(
 		ikey.UserKey = key
 		j := rand.IntN(len(writers))
 		w := writers[j]
-		w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */)
+		w.Add(ikey, nil, false /* forceObsolete */)
 	}
 
 	for _, w := range writers {
@@ -414,7 +422,7 @@ func BenchmarkMergingIterSeekGE(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
@@ -447,7 +455,7 @@ func BenchmarkMergingIterNext(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
@@ -483,7 +491,7 @@ func BenchmarkMergingIterPrev(b *testing.B) {
 							iters := make([]internalIterator, len(readers))
 							for i := range readers {
 								var err error
-								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+								iters[i], err = readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 								require.NoError(b, err)
 							}
 							var stats base.InternalIteratorStats
@@ -580,7 +588,7 @@ func buildLevelsForMergingIterSeqSeek(
 		key := []byte(fmt.Sprintf("%08d", i))
 		keys = append(keys, key)
 		ikey := base.MakeInternalKey(key, 0, InternalKeyKindSet)
-		require.NoError(b, w.AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
+		require.NoError(b, w.Add(ikey, nil, false /* forceObsolete */))
 	}
 	if writeRangeTombstoneToLowestLevel {
 		require.NoError(b, w.EncodeSpan(keyspan.Span{
@@ -594,14 +602,14 @@ func buildLevelsForMergingIterSeqSeek(
 	for j := 1; j < len(files); j++ {
 		for _, k := range []int{0, len(keys) - 1} {
 			ikey := base.MakeInternalKey(keys[k], base.SeqNum(j), InternalKeyKindSet)
-			require.NoError(b, writers[j][0].AddWithForceObsolete(ikey, nil, false /* forceObsolete */))
+			require.NoError(b, writers[j][0].Add(ikey, nil, false /* forceObsolete */))
 		}
 	}
 	lastKey := []byte(fmt.Sprintf("%08d", i))
 	keys = append(keys, lastKey)
 	for j := 0; j < len(files); j++ {
 		lastIKey := base.MakeInternalKey(lastKey, base.SeqNum(j), InternalKeyKindSet)
-		require.NoError(b, writers[j][1].AddWithForceObsolete(lastIKey, nil, false /* forceObsolete */))
+		require.NoError(b, writers[j][1].Add(lastIKey, nil, false /* forceObsolete */))
 	}
 	for _, levelWriters := range writers {
 		for j, w := range levelWriters {
@@ -646,7 +654,7 @@ func buildLevelsForMergingIterSeqSeek(
 	for i := range readers {
 		meta := make([]*tableMetadata, len(readers[i]))
 		for j := range readers[i] {
-			iter, err := readers[i][j].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */)
+			iter, err := readers[i][j].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 			require.NoError(b, err)
 			smallest := iter.First()
 			meta[j] = &tableMetadata{}
@@ -672,7 +680,7 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 			_ context.Context, file *manifest.TableMetadata, opts *IterOptions, iio internalIterOpts, _ iterKinds,
 		) (iterSet, error) {
 			iter, err := readers[levelIndex][file.FileNum].NewIter(
-				sstable.NoTransforms, opts.LowerBound, opts.UpperBound)
+				sstable.NoTransforms, opts.LowerBound, opts.UpperBound, sstable.AssertNoBlobHandles)
 			if err != nil {
 				return iterSet{}, err
 			}

@@ -8,13 +8,17 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"iter"
+	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/intern"
+	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
@@ -68,7 +72,7 @@ func init() {
 // and virtual sstables properties.
 //
 // For virtual sstables, fields are constructed through extrapolation upon virtual
-// reader construction. See MakeVirtualReader for implementation details.
+// reader construction.
 //
 // NB: The values of these properties can affect correctness. For example,
 // if NumRangeKeySets == 0, but the sstable actually contains range keys, then
@@ -169,6 +173,8 @@ type Properties struct {
 	NumValueBlocks uint64 `prop:"pebble.num.value-blocks"`
 	// The number of values stored in value blocks. Only serialized if > 0.
 	NumValuesInValueBlocks uint64 `prop:"pebble.num.values.in.value-blocks"`
+	// The number of values stored in blob files. Only serialized if > 0.
+	NumValuesInBlobFiles uint64 `prop:"pebble.num.values.in.blob-files"`
 	// A comma separated list of names of the property collectors used in this
 	// table.
 	PropertyCollectorNames string `prop:"rocksdb.property.collectors"`
@@ -246,6 +252,29 @@ func writeProperties(loaded map[uintptr]struct{}, v reflect.Value, buf *bytes.Bu
 	}
 }
 
+func (p *Properties) GetScaledProperties(backingSize, size uint64) Properties {
+	scale := func(a uint64) uint64 {
+		return (a*size + backingSize - 1) / backingSize
+	}
+
+	props := *p
+	props.RawKeySize = scale(p.RawKeySize)
+	props.RawValueSize = scale(p.RawValueSize)
+	props.NumEntries = scale(p.NumEntries)
+	props.NumDeletions = scale(p.NumDeletions)
+	props.NumRangeDeletions = scale(p.NumRangeDeletions)
+	props.NumRangeKeyDels = scale(p.NumRangeKeyDels)
+	props.NumDataBlocks = scale(p.NumDataBlocks)
+	props.NumTombstoneDenseBlocks = scale(p.NumTombstoneDenseBlocks)
+	props.NumRangeKeySets = scale(p.NumRangeKeySets)
+	props.ValueBlocksSize = scale(p.ValueBlocksSize)
+	props.NumSizedDeletions = scale(p.NumSizedDeletions)
+	props.RawPointTombstoneKeySize = scale(p.RawPointTombstoneKeySize)
+	props.RawPointTombstoneValueSize = scale(p.RawPointTombstoneValueSize)
+
+	return props
+}
+
 func (p *Properties) String() string {
 	var buf bytes.Buffer
 	v := reflect.ValueOf(*p)
@@ -269,28 +298,26 @@ func (p *Properties) String() string {
 	return buf.String()
 }
 
-func (p *Properties) load(b []byte, deniedUserProperties map[string]struct{}) error {
-	i, err := rowblk.NewRawIter(bytes.Compare, b)
-	if err != nil {
-		return err
-	}
+func (p *Properties) load(
+	i iter.Seq2[[]byte, []byte], deniedUserProperties map[string]struct{},
+) error {
 	p.Loaded = make(map[uintptr]struct{})
 	v := reflect.ValueOf(p).Elem()
 
-	for valid := i.First(); valid; valid = i.Next() {
-		if f, ok := propTagMap[string(i.Key().UserKey)]; ok {
+	for key, val := range i {
+		if f, ok := propTagMap[string(key)]; ok {
 			p.Loaded[f.Offset] = struct{}{}
 			field := v.FieldByIndex(f.Index)
 			switch f.Type.Kind() {
 			case reflect.Bool:
-				field.SetBool(bytes.Equal(i.Value(), propBoolTrue))
+				field.SetBool(bytes.Equal(val, propBoolTrue))
 			case reflect.Uint32:
-				field.SetUint(uint64(binary.LittleEndian.Uint32(i.Value())))
+				field.SetUint(uint64(binary.LittleEndian.Uint32(val)))
 			case reflect.Uint64:
-				n, _ := binary.Uvarint(i.Value())
+				n, _ := binary.Uvarint(val)
 				field.SetUint(n)
 			case reflect.String:
-				field.SetString(intern.Bytes(i.Value()))
+				field.SetString(intern.Bytes(val))
 			default:
 				panic("not reached")
 			}
@@ -300,8 +327,8 @@ func (p *Properties) load(b []byte, deniedUserProperties map[string]struct{}) er
 			p.UserProperties = make(map[string]string)
 		}
 
-		if _, denied := deniedUserProperties[string(i.Key().UserKey)]; !denied {
-			p.UserProperties[intern.Bytes(i.Key().UserKey)] = string(i.Value())
+		if _, denied := deniedUserProperties[string(key)]; !denied {
+			p.UserProperties[intern.Bytes(key)] = string(val)
 		}
 	}
 	return nil
@@ -340,7 +367,7 @@ func (p *Properties) saveString(m map[string][]byte, offset uintptr, value strin
 	m[propOffsetTagMap[offset]] = []byte(value)
 }
 
-func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) {
+func (p *Properties) accumulateProps(tblFormat TableFormat) ([]string, map[string][]byte) {
 	m := make(map[string][]byte)
 	for k, v := range p.UserProperties {
 		m[k] = []byte(v)
@@ -406,6 +433,9 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) {
 	if p.NumValuesInValueBlocks > 0 {
 		p.saveUvarint(m, unsafe.Offsetof(p.NumValuesInValueBlocks), p.NumValuesInValueBlocks)
 	}
+	if p.NumValuesInBlobFiles > 0 {
+		p.saveUvarint(m, unsafe.Offsetof(p.NumValuesInBlobFiles), p.NumValuesInBlobFiles)
+	}
 	if p.PropertyCollectorNames != "" {
 		p.saveString(m, unsafe.Offsetof(p.PropertyCollectorNames), p.PropertyCollectorNames)
 	}
@@ -424,21 +454,48 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) {
 	}
 
 	if tblFormat < TableFormatPebblev1 {
-		m["rocksdb.column.family.id"] = binary.AppendUvarint([]byte(nil), math.MaxInt32)
-		m["rocksdb.fixed.key.length"] = []byte{0x00}
-		m["rocksdb.index.key.is.user.key"] = []byte{0x00}
-		m["rocksdb.index.value.is.delta.encoded"] = []byte{0x00}
-		m["rocksdb.oldest.key.time"] = []byte{0x00}
-		m["rocksdb.creation.time"] = []byte{0x00}
-		m["rocksdb.format.version"] = []byte{0x00}
+		m["rocksdb.column.family.id"] = maxInt32Slice
+		m["rocksdb.fixed.key.length"] = singleZeroSlice
+		m["rocksdb.index.key.is.user.key"] = singleZeroSlice
+		m["rocksdb.index.value.is.delta.encoded"] = singleZeroSlice
+		m["rocksdb.oldest.key.time"] = singleZeroSlice
+		m["rocksdb.creation.time"] = singleZeroSlice
+		m["rocksdb.format.version"] = singleZeroSlice
 	}
 
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
+	keys := slices.Collect(maps.Keys(m))
 	sort.Strings(keys)
+
+	return keys, m
+}
+
+func (p *Properties) saveToRowWriter(tblFormat TableFormat, w *rowblk.Writer) error {
+	keys, m := p.accumulateProps(tblFormat)
 	for _, key := range keys {
-		w.AddRawString(key, m[key])
+		if err := w.AddRawString(key, m[key]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *Properties) saveToColWriter(tblFormat TableFormat, w *colblk.KeyValueBlockWriter) {
+	keys, m := p.accumulateProps(tblFormat)
+	for _, key := range keys {
+		// Zero-length keys are unsupported. See below about StringData.
+		if len(key) == 0 {
+			continue
+		}
+		// Use an unsafe conversion to avoid allocating. AddKV is not
+		// supposed to modify the given slice, so the unsafe conversion
+		// is okay. Note that unsafe.StringData panics if len(key) == 0,
+		// so we explicitly skip zero-length keys above. They shouldn't
+		// occur in practice.
+		w.AddKV(unsafe.Slice(unsafe.StringData(key), len(key)), m[key])
 	}
 }
+
+var (
+	singleZeroSlice = []byte{0x00}
+	maxInt32Slice   = binary.AppendUvarint([]byte(nil), math.MaxInt32)
+)

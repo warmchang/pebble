@@ -69,9 +69,9 @@ func (b *lsmViewBuilder) InitLevels(v *version) {
 	var levels [][]*tableMetadata
 	for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
 		var files []*tableMetadata
-		v.L0SublevelFiles[sublevel].Each(func(f *tableMetadata) {
+		for f := range v.L0SublevelFiles[sublevel].All() {
 			files = append(files, f)
-		})
+		}
 
 		levelNames = append(levelNames, fmt.Sprintf("L0.%d", sublevel))
 		levels = append(levels, files)
@@ -82,9 +82,9 @@ func (b *lsmViewBuilder) InitLevels(v *version) {
 	}
 	for level := 1; level < len(v.Levels); level++ {
 		var files []*tableMetadata
-		v.Levels[level].Slice().Each(func(f *tableMetadata) {
+		for f := range v.Levels[level].All() {
 			files = append(files, f)
-		})
+		}
 		levelNames = append(levelNames, fmt.Sprintf("L%d", level))
 		levels = append(levels, files)
 	}
@@ -142,7 +142,7 @@ func (b *lsmViewBuilder) Build(
 		l.Tables = make([]lsmview.Table, len(files))
 		for j, f := range files {
 			t := &l.Tables[j]
-			if !f.Virtual {
+			if f.Virtual == nil {
 				t.Label = fmt.Sprintf("%d", f.FileNum)
 			} else {
 				t.Label = fmt.Sprintf("%d (%d)", f.FileNum, f.FileBacking.DiskFileNum)
@@ -167,7 +167,7 @@ func (b *lsmViewBuilder) tableDetails(
 
 	outf("%s: %s - %s", m.FileNum, m.Smallest.Pretty(b.fmtKey), m.Largest.Pretty(b.fmtKey))
 	outf("size: %s", humanize.Bytes.Uint64(m.Size))
-	if m.Virtual {
+	if m.Virtual != nil {
 		meta, err := objProvider.Lookup(base.FileTypeTable, m.FileBacking.DiskFileNum)
 		var backingInfo string
 		switch {
@@ -196,7 +196,7 @@ func (b *lsmViewBuilder) tableDetails(
 		if err != nil {
 			outf("error opening table: %v", err)
 		} else {
-			defer iters.CloseAll()
+			defer func() { _ = iters.CloseAll() }()
 		}
 	}
 	const maxPoints = 14

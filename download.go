@@ -248,13 +248,14 @@ func (d *DB) newDownloadSpanTask(vers *version, sp DownloadSpan) (_ *downloadSpa
 	// [sp.StartKey, sp.EndKey). Expand the bounds to the left so that we
 	// include the start keys of any external sstables that overlap with
 	// sp.StartKey.
-	vers.IterAllLevelsAndSublevels(func(iter manifest.LevelIterator, level manifest.Layer) {
+	for _, ls := range vers.AllLevelsAndSublevels() {
+		iter := ls.Iter()
 		if f := iter.SeekGE(d.cmp, sp.StartKey); f != nil &&
 			objstorage.IsExternalTable(d.objProvider, f.FileBacking.DiskFileNum) &&
 			d.cmp(f.Smallest.UserKey, bounds.Start) < 0 {
 			bounds.Start = f.Smallest.UserKey
 		}
-	})
+	}
 	startCursor := downloadCursor{
 		level:  0,
 		key:    bounds.Start,
@@ -402,7 +403,7 @@ func firstExternalFileInLevelIter(
 		f = it.Next()
 	}
 	for ; f != nil && endBound.IsUpperBoundFor(cmp, f.Smallest.UserKey); f = it.Next() {
-		if f.Virtual && objstorage.IsExternalTable(objProvider, f.FileBacking.DiskFileNum) {
+		if f.Virtual != nil && objstorage.IsExternalTable(objProvider, f.FileBacking.DiskFileNum) {
 			return f
 		}
 	}
@@ -413,7 +414,12 @@ func firstExternalFileInLevelIter(
 // given file. Returns true on success, or false if the file is already
 // involved in a compaction.
 func (d *DB) tryLaunchDownloadForFile(
-	vers *version, env compactionEnv, download *downloadSpanTask, level int, f *tableMetadata,
+	vers *version,
+	l0Organizer *manifest.L0Organizer,
+	env compactionEnv,
+	download *downloadSpanTask,
+	level int,
+	f *tableMetadata,
 ) (doneCh chan error, ok bool) {
 	if f.IsCompacting() {
 		return nil, false
@@ -425,7 +431,7 @@ func (d *DB) tryLaunchDownloadForFile(
 	if download.downloadSpan.ViaBackingFileDownload {
 		kind = compactionKindCopy
 	}
-	pc := pickDownloadCompaction(vers, d.opts, env, d.mu.versions.picker.getBaseLevel(), kind, level, f)
+	pc := pickDownloadCompaction(vers, l0Organizer, d.opts, env, d.mu.versions.picker.getBaseLevel(), kind, level, f)
 	if pc == nil {
 		// We are not able to run this download compaction at this time.
 		return nil, false
@@ -433,7 +439,7 @@ func (d *DB) tryLaunchDownloadForFile(
 
 	download.numLaunchedDownloads++
 	doneCh = make(chan error, 1)
-	c := newCompaction(pc, d.opts, d.timeNow(), d.objProvider, nil /* slot */)
+	c := newCompaction(pc, d.opts, d.timeNow(), d.objProvider, noopGrantHandle{})
 	c.isDownload = true
 	d.mu.compact.downloadingCount++
 	d.addInProgressCompaction(c)
@@ -450,7 +456,11 @@ const (
 )
 
 func (d *DB) tryLaunchDownloadCompaction(
-	download *downloadSpanTask, vers *manifest.Version, env compactionEnv, maxConcurrentDownloads int,
+	download *downloadSpanTask,
+	vers *manifest.Version,
+	l0Organizer *manifest.L0Organizer,
+	env compactionEnv,
+	maxConcurrentDownloads int,
 ) launchDownloadResult {
 	// First, check the bookmarks.
 	for i := 0; i < len(download.bookmarks); i++ {
@@ -497,7 +507,7 @@ func (d *DB) tryLaunchDownloadCompaction(
 
 		// Move up the bookmark position to point at this file.
 		b.start = makeCursorAtFile(f, b.start.level)
-		doneCh, ok := d.tryLaunchDownloadForFile(vers, env, download, b.start.level, f)
+		doneCh, ok := d.tryLaunchDownloadForFile(vers, l0Organizer, env, download, b.start.level, f)
 		if ok {
 			b.downloadDoneCh = doneCh
 			return launchedCompaction
@@ -524,7 +534,7 @@ func (d *DB) tryLaunchDownloadCompaction(
 			start:    makeCursorAtFile(f, level),
 			endBound: base.UserKeyInclusive(f.Largest.UserKey),
 		})
-		doneCh, ok := d.tryLaunchDownloadForFile(vers, env, download, level, f)
+		doneCh, ok := d.tryLaunchDownloadForFile(vers, l0Organizer, env, download, level, f)
 		if ok {
 			// We launched a download for this file.
 			download.bookmarks[len(download.bookmarks)-1].downloadDoneCh = doneCh

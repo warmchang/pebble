@@ -75,11 +75,11 @@ sync: db/MANIFEST-000001
 mkdir-all: db_wal/archive 0755
 rename: db_wal/000004.log -> db_wal/archive/000004.log
 open: db/000005.sst (options: *vfs.randomReadsOption)
-read-at(535, 53): db/000005.sst
+read-at(531, 57): db/000005.sst
 read-at(498, 37): db/000005.sst
 read-at(79, 419): db/000005.sst
 open: db/000007.sst (options: *vfs.randomReadsOption)
-read-at(509, 53): db/000007.sst
+read-at(505, 57): db/000007.sst
 read-at(472, 37): db/000007.sst
 read-at(53, 419): db/000007.sst
 read-at(52, 27): db/000005.sst
@@ -260,11 +260,11 @@ sync: db1/temporary.000460.dbtmp
 close: db1/temporary.000460.dbtmp
 rename: db1/temporary.000460.dbtmp -> db1/OPTIONS-000460
 sync: db1
+remove: db1/OPTIONS-000003
 remove: db1/000123.sst
 remove: db1/000456.sst
 remove: db1/000234.blob
 remove: db1/000345.blob
-remove: db1/OPTIONS-000003
 
 list db1
 ----

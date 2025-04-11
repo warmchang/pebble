@@ -54,8 +54,20 @@ func BenchmarkRandSeekInSST(b *testing.B) {
 			valueLen: 128,        // ~200 KVs per data block
 			version:  sstable.TableFormatPebblev5,
 		},
+		{
+			name:     "v6/single-level",
+			numKeys:  200 * 100, // ~100 data blocks.
+			valueLen: 128,       // ~200 KVs per data block
+			version:  sstable.TableFormatPebblev6,
+		},
+		{
+			name:     "v6/two-level",
+			numKeys:  200 * 5000, // ~5000 data blocks
+			valueLen: 128,        // ~200 KVs per data block
+			version:  sstable.TableFormatPebblev6,
+		},
 	}
-	keyCfg := keyGenConfig{
+	keyCfg := KeyGenConfig{
 		PrefixAlphabetLen: 26,
 		RoachKeyLen:       12,
 		PrefixLenShared:   4,
@@ -83,11 +95,11 @@ func benchmarkRandSeekInSST(
 	b *testing.B,
 	rng *rand.Rand,
 	numKeys int,
-	keyCfg keyGenConfig,
+	keyCfg KeyGenConfig,
 	valueLen int,
 	writerOpts sstable.WriterOptions,
 ) {
-	keys, values := randomKVs(rng, numKeys, keyCfg, valueLen)
+	keys, values := RandomKVs(rng, numKeys, keyCfg, valueLen)
 	obj := &objstorage.MemObj{}
 	w := sstable.NewWriter(obj, writerOpts)
 	for i := range keys {
@@ -118,9 +130,11 @@ func benchmarkRandSeekInSST(
 	// Iterate through the entire table to warm up the cache.
 	var stats base.InternalIteratorStats
 	rp := sstable.MakeTrivialReaderProvider(reader)
-	iter, err := reader.NewPointIter(
-		ctx, sstable.NoTransforms, nil, nil, nil, sstable.NeverUseFilterBlock,
-		block.ReadEnv{Stats: &stats, IterStats: nil}, rp)
+	iter, err := reader.NewPointIter(ctx, sstable.IterOptions{
+		FilterBlockSizeLimit: sstable.NeverUseFilterBlock,
+		Env:                  sstable.ReadEnv{Block: block.ReadEnv{Stats: &stats, IterStats: nil}},
+		ReaderProvider:       rp,
+	})
 	require.NoError(b, err)
 	n := 0
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
@@ -134,9 +148,11 @@ func benchmarkRandSeekInSST(
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := queryKeys[i%numQueryKeys]
-		iter, err := reader.NewPointIter(
-			ctx, sstable.NoTransforms, nil, nil, nil, sstable.NeverUseFilterBlock,
-			block.ReadEnv{Stats: &stats, IterStats: nil}, rp)
+		iter, err := reader.NewPointIter(ctx, sstable.IterOptions{
+			FilterBlockSizeLimit: sstable.NeverUseFilterBlock,
+			Env:                  sstable.ReadEnv{Block: block.ReadEnv{Stats: &stats, IterStats: nil}},
+			ReaderProvider:       rp,
+		})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -152,12 +168,12 @@ func benchmarkRandSeekInSST(
 func BenchmarkCockroachDataColBlockWriter(b *testing.B) {
 	for _, cfg := range benchConfigs {
 		b.Run(cfg.String(), func(b *testing.B) {
-			benchmarkCockroachDataColBlockWriter(b, cfg.keyGenConfig, cfg.ValueLen)
+			benchmarkCockroachDataColBlockWriter(b, cfg.KeyGenConfig, cfg.ValueLen)
 		})
 	}
 }
 
-func benchmarkCockroachDataColBlockWriter(b *testing.B, keyConfig keyGenConfig, valueLen int) {
+func benchmarkCockroachDataColBlockWriter(b *testing.B, keyConfig KeyGenConfig, valueLen int) {
 	const targetBlockSize = 32 << 10
 	seed := uint64(time.Now().UnixNano())
 	rng := rand.New(rand.NewPCG(0, seed))
@@ -182,7 +198,7 @@ func benchmarkCockroachDataColBlockWriter(b *testing.B, keyConfig keyGenConfig, 
 
 var benchConfigs = []benchConfig{
 	{
-		keyGenConfig: keyGenConfig{
+		KeyGenConfig: KeyGenConfig{
 			PrefixAlphabetLen: 8,
 			RoachKeyLen:       8,
 			PrefixLenShared:   4,
@@ -192,7 +208,7 @@ var benchConfigs = []benchConfig{
 		ValueLen: 8,
 	},
 	{
-		keyGenConfig: keyGenConfig{
+		KeyGenConfig: KeyGenConfig{
 			PrefixAlphabetLen: 8,
 			RoachKeyLen:       128,
 			PrefixLenShared:   64,
@@ -202,7 +218,7 @@ var benchConfigs = []benchConfig{
 		ValueLen: 128,
 	},
 	{
-		keyGenConfig: keyGenConfig{
+		KeyGenConfig: KeyGenConfig{
 			PrefixAlphabetLen: 26,
 			RoachKeyLen:       1024,
 			PrefixLenShared:   512,
@@ -266,12 +282,12 @@ func BenchmarkCockroachDataColBlockIterTransforms(b *testing.B) {
 }
 
 type benchConfig struct {
-	keyGenConfig
+	KeyGenConfig
 	ValueLen int
 }
 
 func (cfg benchConfig) String() string {
-	return fmt.Sprintf("%s,ValueLen=%d", cfg.keyGenConfig, cfg.ValueLen)
+	return fmt.Sprintf("%s,ValueLen=%d", cfg.KeyGenConfig, cfg.ValueLen)
 }
 
 func benchmarkCockroachDataColBlockIter(
@@ -282,7 +298,7 @@ func benchmarkCockroachDataColBlockIter(
 	rng := rand.New(rand.NewPCG(0, seed))
 	cfg.BaseWallTime = seed
 
-	serializedBlock, keys, _ := generateDataBlock(rng, targetBlockSize, cfg.keyGenConfig, cfg.ValueLen)
+	serializedBlock, keys, _ := generateDataBlock(rng, targetBlockSize, cfg.KeyGenConfig, cfg.ValueLen)
 
 	var decoder colblk.DataBlockDecoder
 	var it colblk.DataBlockIter

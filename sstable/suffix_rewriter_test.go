@@ -193,7 +193,7 @@ func makeTestkeySSTable(
 	for i := 0; i < keys; i++ {
 		n := testkeys.WriteKey(keyBuf[len(sharedPrefix):], alphabet, int64(i))
 		key := append(keyBuf[:len(sharedPrefix)+n], suffix...)
-		err := w.Raw().AddWithForceObsolete(
+		err := w.Raw().Add(
 			base.MakeInternalKey(key, 0, InternalKeyKindSet), key, false)
 		if err != nil {
 			t.Fatal(err)
@@ -278,16 +278,3 @@ func BenchmarkRewriteSST(b *testing.B) {
 		})
 	}
 }
-
-var test4bSuffixComparer = func() *base.Comparer {
-	c := new(base.Comparer)
-	*c = *base.DefaultComparer
-	c.Split = func(key []byte) int {
-		if len(key) > 4 {
-			return len(key) - 4
-		}
-		return len(key)
-	}
-	c.Name = "comparer-split-4b-suffix"
-	return c
-}()

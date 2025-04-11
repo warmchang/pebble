@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/buildtags"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/vfs"
@@ -88,7 +89,7 @@ func TestCommitPipeline(t *testing.T) {
 	p := newCommitPipeline(e.env())
 
 	n := 10000
-	if invariants.RaceEnabled {
+	if buildtags.SlowBuild {
 		// Under race builds we have to limit the concurrency or we hit the
 		// following error:
 		//
@@ -252,8 +253,9 @@ func TestCommitPipelineWALClose(t *testing.T) {
 	}
 	p := newCommitPipeline(testEnv)
 	wal = record.NewLogWriter(sf, 0 /* logNum */, record.LogWriterConfig{
-		WALFsyncLatency: prometheus.NewHistogram(prometheus.HistogramOpts{}),
-		QueueSemChan:    p.logSyncQSem,
+		WALFsyncLatency:     prometheus.NewHistogram(prometheus.HistogramOpts{}),
+		QueueSemChan:        p.logSyncQSem,
+		WriteWALSyncOffsets: func() bool { return false },
 	})
 
 	// Launch N (commitConcurrency) goroutines which each create a batch and
@@ -393,8 +395,9 @@ func BenchmarkCommitPipeline(b *testing.B) {
 					p := newCommitPipeline(nullCommitEnv)
 					wal = record.NewLogWriter(io.Discard, 0, /* logNum */
 						record.LogWriterConfig{
-							WALFsyncLatency: prometheus.NewHistogram(prometheus.HistogramOpts{}),
-							QueueSemChan:    p.logSyncQSem,
+							WALFsyncLatency:     prometheus.NewHistogram(prometheus.HistogramOpts{}),
+							QueueSemChan:        p.logSyncQSem,
+							WriteWALSyncOffsets: func() bool { return false },
 						})
 					const keySize = 8
 					b.SetBytes(2 * keySize)

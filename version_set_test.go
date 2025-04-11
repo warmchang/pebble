@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -32,7 +33,7 @@ func writeAndIngest(t *testing.T, mem vfs.FS, d *DB, k InternalKey, v []byte, fi
 	f, err := mem.Create(path, vfs.WriteCategoryUnspecified)
 	require.NoError(t, err)
 	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{})
-	require.NoError(t, w.AddWithForceObsolete(k, v, false /* forceObsolete */))
+	require.NoError(t, w.Add(k, v, false /* forceObsolete */))
 	require.NoError(t, w.Close())
 	require.NoError(t, d.Ingest(context.Background(), []string{path}))
 }
@@ -93,7 +94,7 @@ func TestVersionSet(t *testing.T) {
 				nf.Meta.Size = uint64(nf.Meta.FileNum) * 100
 				nf.Meta.FileBacking = dedupBacking(nf.Meta.FileBacking)
 				metas[nf.Meta.FileNum] = nf.Meta
-				if !nf.Meta.Virtual {
+				if nf.Meta.Virtual == nil {
 					createFile(nf.Meta.FileBacking.DiskFileNum)
 				}
 			}
@@ -116,18 +117,19 @@ func TestVersionSet(t *testing.T) {
 					lm = &LevelMetrics{}
 					fileMetrics[de.Level] = lm
 				}
-				lm.NumFiles--
-				lm.Size -= int64(f.Size)
+				lm.TablesCount--
+				lm.TablesSize -= int64(f.Size)
 			}
 
 			mu.Lock()
-			vs.logLock()
-
-			forceRotation := rand.IntN(3) == 0
-			err = vs.logAndApply(
-				0 /* jobID */, ve, fileMetrics, forceRotation,
-				func() []compactionInfo { return nil },
-			)
+			err = vs.UpdateVersionLocked(func() (versionUpdate, error) {
+				return versionUpdate{
+					VE:                      ve,
+					Metrics:                 fileMetrics,
+					ForceManifestRotation:   rand.IntN(3) == 0,
+					InProgressCompactionsFn: func() []compactionInfo { return nil },
+				}, nil
+			})
 			mu.Unlock()
 			if err != nil {
 				td.Fatalf(t, "%v", err)
@@ -180,8 +182,7 @@ func TestVersionSet(t *testing.T) {
 			backings = make(map[base.DiskFileNum]*manifest.FileBacking)
 			v := vs.currentVersion()
 			for _, l := range v.Levels {
-				it := l.Iter()
-				for f := it.First(); f != nil; f = it.Next() {
+				for f := range l.All() {
 					metas[f.FileNum] = f
 					dedupBacking(f.FileBacking)
 				}
@@ -198,15 +199,12 @@ func TestVersionSet(t *testing.T) {
 			}
 		}
 		buf.WriteString(vs.virtualBackings.String())
-		if len(vs.zombieTables) == 0 {
+		if vs.zombieTables.Count() == 0 {
 			buf.WriteString("no zombie tables\n")
 		} else {
-			var nums []base.DiskFileNum
-			for k := range vs.zombieTables {
-				nums = append(nums, k)
-			}
-			buf.WriteString("zombie tables:")
+			nums := slices.Collect(maps.Keys(vs.zombieTables.objs))
 			slices.Sort(nums)
+			buf.WriteString("zombie tables:")
 			for _, n := range nums {
 				fmt.Fprintf(&buf, " %s", n)
 			}

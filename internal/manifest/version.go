@@ -8,6 +8,7 @@ import (
 	"bytes"
 	stdcmp "cmp"
 	"fmt"
+	"iter"
 	"slices"
 	"sort"
 	"strings"
@@ -17,8 +18,10 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/strparse"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/virtual"
 )
 
 // Compare exports the base.Compare type.
@@ -165,6 +168,35 @@ func (s CompactionState) String() string {
 // maintain the table metadata associated with it. We will still maintain the
 // FileBacking associated with the physical sst if the backing sst is required
 // by any virtual ssts in any version.
+//
+// When using these fields in the context of a Virtual Table, These fields
+// have additional invariants imposed on them, and/or slightly varying meanings:
+//   - Smallest and Largest (and their counterparts
+//     {Smallest, Largest}{Point,Range}Key) remain tight bounds that represent a
+//     key at that exact bound. We make the effort to determine the next smallest
+//     or largest key in an sstable after virtualizing it, to maintain this
+//     tightness. If the largest is a sentinel key (IsExclusiveSentinel()), it
+//     could mean that a rangedel or range key ends at that user key, or has been
+//     truncated to that user key.
+//   - One invariant is that if a rangedel or range key is truncated on its
+//     upper bound, the virtual sstable *must* have a rangedel or range key
+//     sentinel key as its upper bound. This is because truncation yields
+//     an exclusive upper bound for the rangedel/rangekey, and if there are
+//     any points at that exclusive upper bound within the same virtual
+//     sstable, those could get uncovered by this truncation. We enforce this
+//     invariant in calls to keyspan.Truncate.
+//   - Size is an estimate of the size of the virtualized portion of this sstable.
+//     The underlying file's size is stored in FileBacking.Size, though it could
+//     also be estimated or could correspond to just the referenced portion of
+//     a file (eg. if the file originated on another node).
+//   - Size must be > 0.
+//   - SmallestSeqNum and LargestSeqNum are loose bounds for virtual sstables.
+//     This means that all keys in the virtual sstable must have seqnums within
+//     [SmallestSeqNum, LargestSeqNum], however there's no guarantee that there's
+//     a key with a seqnum at either of the bounds. Calculating tight seqnum
+//     bounds would be too expensive and deliver little value.
+//   - Note: These properties do not apply to external sstables, whose bounds are
+//     loose rather than tight, as we do not open them on ingest.
 type TableMetadata struct {
 	// AllowedSeeks is used to determine if a file should be picked for
 	// a read triggered compaction. It is decremented when read sampling
@@ -236,45 +268,13 @@ type TableMetadata struct {
 	Largest  InternalKey
 	// BlobReferences is a list of blob files containing values that are
 	// referenced by this sstable.
-	BlobReferences []BlobReference
-	// BlobReferenceDepth is an upper bound on the number of blob files that a
-	// reader scanning the table would need to keep open if they only open and
-	// close referenced blob files once. In other words, it's the stack depth of
-	// blob files referenced by this sstable. If a flush or compaction rewrites
-	// an sstable's values to a new blob file, the resulting sstable has a blob
-	// reference depth of 1. When a compaction reuses blob references, the max
-	// blob reference depth of the files in each level is used, and then the
-	// depth is summed, and assigned to the output. This is a loose upper bound
-	// (assuming worst case distribution of keys in all inputs) but avoids
-	// tracking key spans for references and using key comparisons.
-	//
-	// Because the blob reference depth is the size of the working set of blob
-	// files referenced by the table, it cannot exceed the count of distinct
-	// blob file references.
-	//
-	// Example: Consider a compaction of file f0 from L0 and files f1, f2, f3
-	// from L1, where the former has blob reference depth of 1 and files f1, f2,
-	// f3 all happen to have a blob-reference-depth of 1. Say we produce many
-	// output files, one of which is f4. We are assuming here that the blobs
-	// referenced by f0 whose keys happened to be written to f4 are spread all
-	// across the key span of f4. Say keys from f1 and f2 also made their way to
-	// f4. Then we will first have keys that refer to blobs referenced by f1,f0
-	// and at some point once we move past the keys of f1, we will have keys
-	// that refer to blobs referenced by f2,f0. In some sense, we have a working
-	// set of 2 blob files at any point in time, and this is similar to the idea
-	// of level stack depth for reads -- hence we adopt the depth terminology.
-	// We want to keep this stack depth in check, since locality is important,
-	// while allowing it to be higher than 1, since otherwise we will need to
-	// rewrite blob files in every compaction (defeating the write amp benefit
-	// we are looking for). Similar to the level depth, this simplistic analysis
-	// does not take into account distribution of keys involved in the
-	// compaction and which of them have blob references. Also the locality is
-	// actually better than in this analysis because more of the keys will be
-	// from the lower level.
+	BlobReferences BlobReferences
+	// BlobReferenceDepth is the stack depth of blob files referenced by this
+	// sstable. See the comment on the BlobReferenceDepth type for more details.
 	//
 	// INVARIANT: BlobReferenceDepth == 0 iff len(BlobReferences) == 0
 	// INVARIANT: BlobReferenceDepth <= len(BlobReferences)
-	BlobReferenceDepth int
+	BlobReferenceDepth BlobReferenceDepth
 
 	// refs is the reference count for the table, used to determine when a table
 	// is obsolete. When a table's reference count falls to zero, the table is
@@ -297,6 +297,8 @@ type TableMetadata struct {
 
 	// For L0 files only. Protected by DB.mu. Used to generate L0 sublevels and
 	// pick L0 compactions. Only accurate for the most recent Version.
+	// TODO(radu): this is very hacky and fragile. This information should live
+	// inside l0Sublevels.
 	SubLevel         int
 	L0Index          int
 	minIntervalIndex int
@@ -340,12 +342,21 @@ type TableMetadata struct {
 	// key type (point or range) corresponds to the smallest and largest overall
 	// table bounds.
 	boundTypeSmallest, boundTypeLargest boundType
-	// Virtual is true if the TableMetadata belongs to a virtual sstable.
-	Virtual bool
+	// Virtual is not nil if the TableMetadata belongs to a virtual sstable.
+	Virtual *virtual.VirtualReaderParams
 
 	// SyntheticPrefix is used to prepend a prefix to all keys and/or override all
 	// suffixes in a table; used for some virtual tables.
 	SyntheticPrefixAndSuffix sstable.SyntheticPrefixAndSuffix
+}
+
+func (m *TableMetadata) InitVirtual(isShared bool) {
+	m.Virtual.Lower = m.Smallest
+	m.Virtual.Upper = m.Largest
+	m.Virtual.FileNum = m.FileNum
+	m.Virtual.Size = m.Size
+	m.Virtual.IsSharedIngested = isShared && m.SyntheticSeqNum() != 0
+	m.Virtual.BackingSize = m.FileBacking.Size
 }
 
 // Ref increments the table's ref count. If this is the table's first reference,
@@ -443,84 +454,18 @@ func (m *TableMetadata) FragmentIterTransforms() sstable.FragmentIterTransforms 
 	}
 }
 
-// PhysicalTableMeta is used by functions which want a guarantee that their input
-// belongs to a physical sst and not a virtual sst.
-//
-// NB: This type should only be constructed by calling
-// TableMetadata.PhysicalMeta.
-type PhysicalTableMeta struct {
-	*TableMetadata
-}
-
-// VirtualTableMeta is used by functions which want a guarantee that their input
-// belongs to a virtual sst and not a physical sst.
-//
-// A VirtualTableMeta inherits all the same fields as a TableMetadata. These
-// fields have additional invariants imposed on them, and/or slightly varying
-// meanings:
-//   - Smallest and Largest (and their counterparts
-//     {Smallest, Largest}{Point,Range}Key) remain tight bounds that represent a
-//     key at that exact bound. We make the effort to determine the next smallest
-//     or largest key in an sstable after virtualizing it, to maintain this
-//     tightness. If the largest is a sentinel key (IsExclusiveSentinel()), it
-//     could mean that a rangedel or range key ends at that user key, or has been
-//     truncated to that user key.
-//   - One invariant is that if a rangedel or range key is truncated on its
-//     upper bound, the virtual sstable *must* have a rangedel or range key
-//     sentinel key as its upper bound. This is because truncation yields
-//     an exclusive upper bound for the rangedel/rangekey, and if there are
-//     any points at that exclusive upper bound within the same virtual
-//     sstable, those could get uncovered by this truncation. We enforce this
-//     invariant in calls to keyspan.Truncate.
-//   - Size is an estimate of the size of the virtualized portion of this sstable.
-//     The underlying file's size is stored in FileBacking.Size, though it could
-//     also be estimated or could correspond to just the referenced portion of
-//     a file (eg. if the file originated on another node).
-//   - Size must be > 0.
-//   - SmallestSeqNum and LargestSeqNum are loose bounds for virtual sstables.
-//     This means that all keys in the virtual sstable must have seqnums within
-//     [SmallestSeqNum, LargestSeqNum], however there's no guarantee that there's
-//     a key with a seqnum at either of the bounds. Calculating tight seqnum
-//     bounds would be too expensive and deliver little value.
-//
-// NB: This type should only be constructed by calling TableMetadata.VirtualMeta.
-type VirtualTableMeta struct {
-	*TableMetadata
-}
-
-// VirtualReaderParams fills in the parameters necessary to create a virtual
-// sstable reader.
-func (m VirtualTableMeta) VirtualReaderParams(isShared bool) sstable.VirtualReaderParams {
-	return sstable.VirtualReaderParams{
-		Lower:            m.Smallest,
-		Upper:            m.Largest,
-		FileNum:          m.FileNum,
-		IsSharedIngested: isShared && m.SyntheticSeqNum() != 0,
-		Size:             m.Size,
-		BackingSize:      m.FileBacking.Size,
-	}
-}
-
-// PhysicalMeta should be the only source of creating the PhysicalFileMeta
-// wrapper type.
-func (m *TableMetadata) PhysicalMeta() PhysicalTableMeta {
-	if m.Virtual {
+func (m *TableMetadata) PhysicalMeta() *TableMetadata {
+	if m.Virtual != nil {
 		panic("pebble: table metadata does not belong to a physical sstable")
 	}
-	return PhysicalTableMeta{
-		m,
-	}
+	return m
 }
 
-// VirtualMeta should be the only source of creating the VirtualFileMeta wrapper
-// type.
-func (m *TableMetadata) VirtualMeta() VirtualTableMeta {
-	if !m.Virtual {
+func (m *TableMetadata) VirtualMeta() *TableMetadata {
+	if m.Virtual == nil {
 		panic("pebble: table metadata does not belong to a virtual sstable")
 	}
-	return VirtualTableMeta{
-		m,
-	}
+	return m
 }
 
 // FileBacking either backs a single physical sstable, or one or more virtual
@@ -580,7 +525,7 @@ func (b *FileBacking) Unref() int32 {
 // Calling InitPhysicalBacking only after the relevant state has been set in the
 // TableMetadata is not necessary in tests which don't rely on FileBacking.
 func (m *TableMetadata) InitPhysicalBacking() {
-	if m.Virtual {
+	if m.Virtual != nil {
 		panic("pebble: virtual sstables should use a pre-existing FileBacking")
 	}
 	if m.FileBacking == nil {
@@ -594,7 +539,7 @@ func (m *TableMetadata) InitPhysicalBacking() {
 // InitProviderBacking creates a new FileBacking for a file backed by
 // an objstorage.Provider.
 func (m *TableMetadata) InitProviderBacking(fileNum base.DiskFileNum, size uint64) {
-	if !m.Virtual {
+	if m.Virtual == nil {
 		panic("pebble: provider-backed sstables must be virtual")
 	}
 	if m.FileBacking == nil {
@@ -607,7 +552,7 @@ func (m *TableMetadata) InitProviderBacking(fileNum base.DiskFileNum, size uint6
 // is created to verify that the fields of the virtual sstable are sound.
 func (m *TableMetadata) ValidateVirtual(createdFrom *TableMetadata) {
 	switch {
-	case !m.Virtual:
+	case m.Virtual == nil:
 		panic("pebble: invalid virtual sstable")
 	case createdFrom.SmallestSeqNum != m.SmallestSeqNum:
 		panic("pebble: invalid smallest sequence number for virtual sstable")
@@ -847,7 +792,7 @@ func (m *TableMetadata) String() string {
 // and overall bounds for the table.
 func (m *TableMetadata) DebugString(format base.FormatKey, verbose bool) string {
 	var b bytes.Buffer
-	if m.Virtual {
+	if m.Virtual != nil {
 		fmt.Fprintf(&b, "%s(%s):[%s-%s]",
 			m.FileNum, m.FileBacking.DiskFileNum, m.Smallest.Pretty(format), m.Largest.Pretty(format))
 	} else {
@@ -882,6 +827,16 @@ func (m *TableMetadata) DebugString(format base.FormatKey, verbose bool) string 
 	return b.String()
 }
 
+const debugParserSeparators = ":-[]();"
+
+// errFromPanic can be used in a recover block to convert panics into errors.
+func errFromPanic(r any) error {
+	if err, ok := r.(error); ok {
+		return err
+	}
+	return errors.Errorf("%v", r)
+}
+
 // ParseTableMetadataDebug parses a TableMetadata from its DebugString
 // representation.
 func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
@@ -894,7 +849,7 @@ func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
 	// Input format:
 	//	000000:[a#0,SET-z#0,SET] seqnums:[5-5] points:[...] ranges:[...] size:5
 	m := &TableMetadata{}
-	p := makeDebugParser(s)
+	p := strparse.MakeParser(debugParserSeparators, s)
 	m.FileNum = p.FileNum()
 	var backingNum base.DiskFileNum
 	if p.Peek() == "(" {
@@ -956,7 +911,7 @@ func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
 			p.Expect(";")
 			p.Expect("depth")
 			p.Expect(":")
-			m.BlobReferenceDepth = int(p.Uint64())
+			m.BlobReferenceDepth = BlobReferenceDepth(p.Uint64())
 			p.Expect("]")
 
 		default:
@@ -974,7 +929,7 @@ func ParseTableMetadataDebug(s string) (_ *TableMetadata, err error) {
 	if backingNum == 0 {
 		m.InitPhysicalBacking()
 	} else {
-		m.Virtual = true
+		m.Virtual = &virtual.VirtualReaderParams{}
 		m.InitProviderBacking(backingNum, 0 /* size */)
 	}
 	return m, nil
@@ -1062,12 +1017,12 @@ func (m *TableMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
 	// Assert that there's a nonzero blob reference depth if and only if the
 	// table has a nonzero count of blob references. Additionally, the file's
 	// blob reference depth should be bounded by the number of blob references.
-	if (len(m.BlobReferences) == 0) != (m.BlobReferenceDepth == 0) || m.BlobReferenceDepth > len(m.BlobReferences) {
+	if (len(m.BlobReferences) == 0) != (m.BlobReferenceDepth == 0) || m.BlobReferenceDepth > BlobReferenceDepth(len(m.BlobReferences)) {
 		return base.CorruptionErrorf("table %s with %d blob refs but %d blob ref depth",
 			m.FileNum, len(m.BlobReferences), m.BlobReferenceDepth)
 	}
 	if m.SyntheticPrefixAndSuffix.HasPrefix() {
-		if !m.Virtual {
+		if m.Virtual == nil {
 			return base.CorruptionErrorf("non-virtual file with synthetic prefix")
 		}
 		if !bytes.HasPrefix(m.Smallest.UserKey, m.SyntheticPrefixAndSuffix.Prefix()) {
@@ -1078,7 +1033,7 @@ func (m *TableMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
 		}
 	}
 	if m.SyntheticPrefixAndSuffix.HasSuffix() {
-		if !m.Virtual {
+		if m.Virtual == nil {
 			return base.CorruptionErrorf("non-virtual file with synthetic suffix")
 		}
 	}
@@ -1141,10 +1096,10 @@ func (m *TableMetadata) cmpSmallestKey(b *TableMetadata, cmp Compare) int {
 
 // KeyRange returns the minimum smallest and maximum largest internalKey for
 // all the TableMetadata in iters.
-func KeyRange(ucmp Compare, iters ...LevelIterator) (smallest, largest InternalKey) {
+func KeyRange(ucmp Compare, iters ...iter.Seq[*TableMetadata]) (smallest, largest InternalKey) {
 	first := true
 	for _, iter := range iters {
-		for meta := iter.First(); meta != nil; meta = iter.Next() {
+		for meta := range iter {
 			if first {
 				first = false
 				smallest, largest = meta.Smallest, meta.Largest
@@ -1194,10 +1149,23 @@ func SortBySmallest(files []*TableMetadata, cmp Compare) {
 // NumLevels is the number of levels a Version contains.
 const NumLevels = 7
 
-// NewVersion constructs a new Version with the provided files. It requires
-// the provided files are already well-ordered. It's intended for testing.
-func NewVersion(
-	comparer *base.Comparer, flushSplitBytes int64, files [NumLevels][]*TableMetadata,
+// NewInitialVersion creates a version with no files. The L0Organizer should be freshly created.
+func NewInitialVersion(comparer *base.Comparer) *Version {
+	v := &Version{
+		cmp: comparer,
+	}
+	for level := range v.Levels {
+		v.Levels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
+		v.RangeKeyLevels[level] = MakeLevelMetadata(comparer.Compare, level, nil /* files */)
+	}
+	return v
+}
+
+// NewVersionForTesting constructs a new Version with the provided files. It
+// requires the provided files are already well-ordered. The L0Organizer should
+// be freshly created.
+func NewVersionForTesting(
+	comparer *base.Comparer, l0Organizer *L0Organizer, files [7][]*TableMetadata,
 ) *Version {
 	v := &Version{
 		cmp: comparer,
@@ -1208,7 +1176,7 @@ func NewVersion(
 		// order to test consistency checking, etc. Once we've constructed the
 		// initial B-Tree, we swap out the btreeCmp for the correct one.
 		// TODO(jackson): Adjust or remove the tests and remove this.
-		v.Levels[l].tree, _ = makeBTree(comparer.Compare, btreeCmpSpecificOrder(files[l]), files[l])
+		v.Levels[l].tree = makeBTree(comparer.Compare, btreeCmpSpecificOrder(files[l]), files[l])
 		v.Levels[l].level = l
 		if l == 0 {
 			v.Levels[l].tree.bcmp = btreeCmpSeqNum
@@ -1219,17 +1187,8 @@ func NewVersion(
 			v.Levels[l].totalSize += f.Size
 		}
 	}
-	if err := v.InitL0Sublevels(flushSplitBytes); err != nil {
-		panic(err)
-	}
+	l0Organizer.ResetForTesting(v)
 	return v
-}
-
-// TestingNewVersion returns a blank Version, used for tests.
-func TestingNewVersion(comparer *base.Comparer) *Version {
-	return &Version{
-		cmp: comparer,
-	}
 }
 
 // Version is a collection of table metadata for on-disk tables at various
@@ -1259,25 +1218,7 @@ func TestingNewVersion(comparer *base.Comparer) *Version {
 type Version struct {
 	refs atomic.Int32
 
-	// The level 0 sstables are organized in a series of sublevels. Similar to
-	// the seqnum invariant in normal levels, there is no internal key in a
-	// higher level table that has both the same user key and a higher sequence
-	// number. Within a sublevel, tables are sorted by their internal key range
-	// and any two tables at the same sublevel do not overlap. Unlike the normal
-	// levels, sublevel n contains older tables (lower sequence numbers) than
-	// sublevel n+1.
-	//
-	// The L0Sublevels struct is mostly used for compaction picking. As most
-	// internal data structures in it are only necessary for compaction picking
-	// and not for iterator creation, the reference to L0Sublevels is nil'd
-	// after this version becomes the non-newest version, to reduce memory
-	// usage.
-	//
-	// L0Sublevels.Levels contains L0 files ordered by sublevels. All the files
-	// in Levels[0] are in L0Sublevels.Levels. L0SublevelFiles is also set to
-	// a reference to that slice, as that slice is necessary for iterator
-	// creation and needs to outlast L0Sublevels.
-	L0Sublevels     *L0Sublevels
+	// L0SublevelFiles contains the L0 sublevels.
 	L0SublevelFiles []LevelSlice
 
 	Levels [NumLevels]LevelMetadata
@@ -1324,9 +1265,9 @@ func describeSublevels(format base.FormatKey, verbose bool, sublevels []LevelSli
 	var buf bytes.Buffer
 	for sublevel := len(sublevels) - 1; sublevel >= 0; sublevel-- {
 		fmt.Fprintf(&buf, "L0.%d:\n", sublevel)
-		sublevels[sublevel].Each(func(f *TableMetadata) {
+		for f := range sublevels[sublevel].All() {
 			fmt.Fprintf(&buf, "  %s\n", f.DebugString(format, verbose))
-		})
+		}
 	}
 	return buf.String()
 }
@@ -1341,8 +1282,7 @@ func (v *Version) string(verbose bool) string {
 			continue
 		}
 		fmt.Fprintf(&buf, "L%d:\n", level)
-		iter := v.Levels[level].Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range v.Levels[level].All() {
 			fmt.Fprintf(&buf, "  %s\n", f.DebugString(v.cmp.FormatKey, verbose))
 		}
 	}
@@ -1350,14 +1290,16 @@ func (v *Version) string(verbose bool) string {
 }
 
 // ParseVersionDebug parses a Version from its DebugString output.
-func ParseVersionDebug(comparer *base.Comparer, flushSplitBytes int64, s string) (*Version, error) {
+func ParseVersionDebug(
+	comparer *base.Comparer, l0Organizer *L0Organizer, s string,
+) (*Version, error) {
 	var files [NumLevels][]*TableMetadata
 	level := -1
 	for _, l := range strings.Split(s, "\n") {
 		if l == "" {
 			continue
 		}
-		p := makeDebugParser(l)
+		p := strparse.MakeParser(debugParserSeparators, l)
 		if l, ok := p.TryLevel(); ok {
 			level = l
 			continue
@@ -1376,7 +1318,7 @@ func ParseVersionDebug(comparer *base.Comparer, flushSplitBytes int64, s string)
 	// partial order that represents newest to oldest. Reverse the order of L0
 	// files to ensure we construct the same sublevels.
 	slices.Reverse(files[0])
-	v := NewVersion(comparer, flushSplitBytes, files)
+	v := NewVersionForTesting(comparer, l0Organizer, files)
 	if err := v.CheckOrdering(); err != nil {
 		return nil, err
 	}
@@ -1459,22 +1401,12 @@ func (v *Version) Next() *Version {
 	return v.next
 }
 
-// InitL0Sublevels initializes the L0Sublevels
-func (v *Version) InitL0Sublevels(flushSplitBytes int64) error {
-	var err error
-	v.L0Sublevels, err = NewL0Sublevels(&v.Levels[0], v.cmp.Compare, v.cmp.FormatKey, flushSplitBytes)
-	if err == nil && v.L0Sublevels != nil {
-		v.L0SublevelFiles = v.L0Sublevels.Levels
-	}
-	return err
-}
-
 // CalculateInuseKeyRanges examines table metadata in levels [level, maxLevel]
 // within bounds [smallest,largest], returning an ordered slice of key ranges
 // that include all keys that exist within levels [level, maxLevel] and within
 // [smallest,largest].
 func (v *Version) CalculateInuseKeyRanges(
-	level, maxLevel int, smallest, largest []byte,
+	l0Organizer *L0Organizer, level, maxLevel int, smallest, largest []byte,
 ) []base.UserKeyBounds {
 	// Use two slices, alternating which one is input and which one is output
 	// as we descend the LSM.
@@ -1484,7 +1416,7 @@ func (v *Version) CalculateInuseKeyRanges(
 	// We use the L0 Sublevels structure to efficiently calculate the merged
 	// in-use key ranges.
 	if level == 0 {
-		output = v.L0Sublevels.InUseKeyRanges(smallest, largest)
+		output = l0Organizer.InUseKeyRanges(smallest, largest)
 		level++
 	}
 
@@ -1605,12 +1537,15 @@ func seekGT(iter *LevelIterator, cmp base.Compare, boundary base.UserKeyBoundary
 // searches among the files. If level is zero, Contains scans the entire
 // level.
 func (v *Version) Contains(level int, m *TableMetadata) bool {
-	iter := v.Levels[level].Iter()
-	if level > 0 {
-		overlaps := v.Overlaps(level, m.UserKeyBounds())
-		iter = overlaps.Iter()
+	if level == 0 {
+		for f := range v.Levels[0].All() {
+			if f == m {
+				return true
+			}
+		}
+		return false
 	}
-	for f := iter.First(); f != nil; f = iter.Next() {
+	for f := range v.Overlaps(level, m.UserKeyBounds()).All() {
 		if f == m {
 			return true
 		}
@@ -1690,14 +1625,20 @@ func (v *Version) Overlaps(level int, bounds base.UserKeyBounds) LevelSlice {
 	return v.Levels[level].Slice().Overlaps(v.cmp.Compare, bounds)
 }
 
-// IterAllLevelsAndSublevels calls fn with an iterator for each L0 sublevel
-// (from top to bottom), then once for each level below L0.
-func (v *Version) IterAllLevelsAndSublevels(fn func(it LevelIterator, level Layer)) {
-	for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
-		fn(v.L0SublevelFiles[sublevel].Iter(), L0Sublevel(sublevel))
-	}
-	for level := 1; level < NumLevels; level++ {
-		fn(v.Levels[level].Iter(), Level(level))
+// AllLevelsAndSublevels returns an iterator that produces a Layer, LevelSlice
+// pair for each L0 sublevel (from top to bottom) and each level below L0.
+func (v *Version) AllLevelsAndSublevels() iter.Seq2[Layer, LevelSlice] {
+	return func(yield func(Layer, LevelSlice) bool) {
+		for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
+			if !yield(L0Sublevel(sublevel), v.L0SublevelFiles[sublevel]) {
+				return
+			}
+		}
+		for level := 1; level < NumLevels; level++ {
+			if !yield(Level(level), v.Levels[level].Slice()) {
+				return
+			}
+		}
 	}
 }
 
@@ -1762,9 +1703,6 @@ func (l *VersionList) PushBack(v *Version) {
 	v.next = &l.root
 	v.next.prev = v
 	v.list = l
-	// Let L0Sublevels on the second newest version get GC'd, as it is no longer
-	// necessary. See the comment in Version.
-	v.prev.L0Sublevels = nil
 }
 
 // Remove removes the specified version from the list.

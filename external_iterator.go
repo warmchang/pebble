@@ -26,7 +26,8 @@ import (
 // sorted in internal key order, where lower index files contain keys that sort
 // left of files with higher indexes.
 //
-// Input sstables must only contain keys with the zero sequence number.
+// Input sstables must only contain keys with the zero sequence number and must
+// not contain references to values in external blob files.
 //
 // Iterators constructed through NewExternalIter do not support all iterator
 // options, including block-property and table filters. NewExternalIter errors
@@ -98,7 +99,7 @@ func NewExternalIterWithContext(
 		dbi.processBounds(iterOpts.LowerBound, iterOpts.UpperBound)
 	}
 	if err := finishInitializingExternal(ctx, dbi); err != nil {
-		dbi.Close()
+		_ = dbi.Close()
 		return nil, err
 	}
 	return dbi, nil
@@ -138,7 +139,7 @@ func validateExternalIterOpts(iterOpts *IterOptions) error {
 }
 
 func createExternalPointIter(
-	ctx context.Context, it *Iterator, readEnv block.ReadEnv,
+	ctx context.Context, it *Iterator, readEnv sstable.ReadEnv,
 ) (topLevelIterator, error) {
 	// TODO(jackson): In some instances we could generate fewer levels by using
 	// L0Sublevels code to organize nonoverlapping files into the same level.
@@ -175,16 +176,29 @@ func createExternalPointIter(
 			// BlockPropertiesFilterer that includes obsoleteKeyBlockPropertyFilter.
 			transforms := sstable.IterTransforms{SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum)}
 			seqNum--
-			pointIter, err = r.NewPointIter(
-				ctx, transforms, it.opts.LowerBound, it.opts.UpperBound, nil, /* BlockPropertiesFilterer */
-				sstable.NeverUseFilterBlock, readEnv, sstable.MakeTrivialReaderProvider(r))
-			if err != nil {
-				return nil, err
+			pointIter, err = r.NewPointIter(ctx, sstable.IterOptions{
+				Lower:                it.opts.LowerBound,
+				Upper:                it.opts.UpperBound,
+				Transforms:           transforms,
+				FilterBlockSizeLimit: sstable.NeverUseFilterBlock,
+				Env:                  readEnv,
+				ReaderProvider:       sstable.MakeTrivialReaderProvider(r),
+			})
+			if err == nil {
+				rangeDelIter, err = r.NewRawRangeDelIter(ctx, sstable.FragmentIterTransforms{
+					SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum),
+				}, readEnv)
 			}
-			rangeDelIter, err = r.NewRawRangeDelIter(ctx, sstable.FragmentIterTransforms{
-				SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum),
-			}, readEnv)
 			if err != nil {
+				if pointIter != nil {
+					_ = pointIter.Close()
+				}
+				for i := range mlevels {
+					_ = mlevels[i].iter.Close()
+					if mlevels[i].rangeDelIter != nil {
+						mlevels[i].rangeDelIter.Close()
+					}
+				}
 				return nil, err
 			}
 			mlevels = append(mlevels, mergingIterLevel{
@@ -203,14 +217,16 @@ func createExternalPointIter(
 }
 
 func finishInitializingExternal(ctx context.Context, it *Iterator) error {
-	readEnv := block.ReadEnv{
-		Stats: &it.stats.InternalStats,
-		// TODO(jackson): External iterators never provide categorized iterator
-		// stats today because they exist outside the context of a *DB. If the
-		// sstables being read are on the physical filesystem, we may still want to
-		// thread a CategoryStatsCollector through so that we collect their stats.
-		IterStats:  nil,
-		BufferPool: &it.externalIter.bufferPool,
+	readEnv := sstable.ReadEnv{
+		Block: block.ReadEnv{
+			Stats: &it.stats.InternalStats,
+			// TODO(jackson): External iterators never provide categorized iterator
+			// stats today because they exist outside the context of a *DB. If the
+			// sstables being read are on the physical filesystem, we may still want to
+			// thread a CategoryStatsCollector through so that we collect their stats.
+			IterStats:  nil,
+			BufferPool: &it.externalIter.bufferPool,
+		},
 	}
 	pointIter, err := createExternalPointIter(ctx, it, readEnv)
 	if err != nil {
@@ -241,9 +257,14 @@ func finishInitializingExternal(ctx context.Context, it *Iterator) error {
 				for _, r := range readers {
 					transforms := sstable.FragmentIterTransforms{SyntheticSeqNum: sstable.SyntheticSeqNum(seqNum)}
 					seqNum--
-					if rki, err := r.NewRawRangeKeyIter(ctx, transforms, readEnv); err != nil {
+					rki, err := r.NewRawRangeKeyIter(ctx, transforms, readEnv)
+					if err != nil {
+						for _, iter := range rangeKeyIters {
+							iter.Close()
+						}
 						return err
-					} else if rki != nil {
+					}
+					if rki != nil {
 						rangeKeyIters = append(rangeKeyIters, rki)
 					}
 				}
@@ -288,6 +309,9 @@ func openExternalTables(
 		r, err := sstable.NewReader(ctx, readable, readerOpts)
 		if err != nil {
 			return readers, err
+		}
+		if r.Properties.NumValuesInBlobFiles > 0 {
+			return readers, errors.Newf("pebble: NewExternalIter does not support blob references")
 		}
 		readers = append(readers, r)
 	}

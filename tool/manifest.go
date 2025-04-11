@@ -105,31 +105,30 @@ func (m *manifestT) printLevels(cmp base.Compare, stdout io.Writer, v *manifest.
 		if level == 0 && len(v.L0SublevelFiles) > 0 && !v.Levels[level].Empty() {
 			for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
 				fmt.Fprintf(stdout, "--- L0.%d ---\n", sublevel)
-				v.L0SublevelFiles[sublevel].Each(func(f *manifest.TableMetadata) {
+				for f := range v.L0SublevelFiles[sublevel].All() {
 					if !anyOverlapFile(cmp, f, m.filterStart, m.filterEnd) {
-						return
+						continue
 					}
 					fmt.Fprintf(stdout, "  %s:%d", f.FileNum, f.Size)
 					formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
 					formatKeyRange(stdout, m.fmtKey, &f.Smallest, &f.Largest)
-					if f.Virtual {
+					if f.Virtual != nil {
 						fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.FileBacking.DiskFileNum)
 					}
 					fmt.Fprintf(stdout, "\n")
-				})
+				}
 			}
 			continue
 		}
 		fmt.Fprintf(stdout, "--- L%d ---\n", level)
-		iter := v.Levels[level].Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range v.Levels[level].All() {
 			if !anyOverlapFile(cmp, f, m.filterStart, m.filterEnd) {
 				continue
 			}
 			fmt.Fprintf(stdout, "  %s:%d", f.FileNum, f.Size)
 			formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
 			formatKeyRange(stdout, m.fmtKey, &f.Smallest, &f.Largest)
-			if f.Virtual {
+			if f.Virtual != nil {
 				fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.FileBacking.DiskFileNum)
 			}
 			fmt.Fprintf(stdout, "\n")
@@ -242,14 +241,14 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 			}
 
 			if comparer != nil {
-				v, err := bve.Apply(
-					nil /* version */, comparer, 0,
-					m.opts.Experimental.ReadCompactionRate,
-				)
+				l0Organizer := manifest.NewL0Organizer(comparer, 0 /* flushSplitBytes */)
+				emptyVersion := manifest.NewInitialVersion(comparer)
+				v, err := bve.Apply(emptyVersion, m.opts.Experimental.ReadCompactionRate)
 				if err != nil {
 					fmt.Fprintf(stdout, "%s\n", err)
 					return
 				}
+				l0Organizer.PerformUpdate(l0Organizer.PrepareUpdate(&bve, v), v)
 				m.printLevels(comparer.Compare, stdout, v)
 			}
 		}()
@@ -571,6 +570,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 			}
 			defer f.Close()
 
+			var l0Organizer *manifest.L0Organizer
 			var v *manifest.Version
 			var cmp *base.Comparer
 			rr := record.NewReader(f, 0 /* logNum */)
@@ -625,7 +625,11 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 				}
 				// TODO(sbhola): add option to Apply that reports all errors instead of
 				// one error.
-				newv, err := bve.Apply(v, cmp, 0, m.opts.Experimental.ReadCompactionRate)
+				if v == nil {
+					l0Organizer = manifest.NewL0Organizer(cmp, 0 /* flushSplitBytes */)
+					v = manifest.NewInitialVersion(cmp)
+				}
+				newv, err := bve.Apply(v, m.opts.Experimental.ReadCompactionRate)
 				if err != nil {
 					fmt.Fprintf(stdout, "%s: offset: %d err: %s\n",
 						arg, offset, err)
@@ -645,6 +649,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 					ok = false
 					break
 				}
+				l0Organizer.PerformUpdate(l0Organizer.PrepareUpdate(&bve, newv), newv)
 				v = newv
 			}
 		}()

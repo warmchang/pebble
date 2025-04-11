@@ -765,7 +765,7 @@ func closeIters(
 	rangeKeyIter keyspan.FragmentIterator,
 ) {
 	if pointIter != nil {
-		pointIter.Close()
+		_ = pointIter.Close()
 	}
 	if rangeDelIter != nil {
 		rangeDelIter.Close()
@@ -2003,7 +2003,7 @@ func (r *replicateOp) runSharedReplicate(
 			if err != nil {
 				panic(err)
 			}
-			return w.Raw().AddWithForceObsolete(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false)
+			return w.Raw().Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false)
 		},
 		func(start, end []byte, seqNum base.SeqNum) error {
 			return w.DeleteRange(start, end)
@@ -2067,7 +2067,7 @@ func (r *replicateOp) runExternalReplicate(
 				panic(err)
 			}
 			t.opts.Comparer.ValidateKey.MustValidate(key.UserKey)
-			return w.Raw().AddWithForceObsolete(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false)
+			return w.Raw().Add(base.MakeInternalKey(key.UserKey, 0, key.Kind()), val, false)
 		},
 		func(start, end []byte, seqNum base.SeqNum) error {
 			t.opts.Comparer.ValidateKey.MustValidate(start)
@@ -2173,7 +2173,7 @@ func (r *replicateOp) run(t *Test, h historyRecorder) {
 	if err != nil {
 		panic(err)
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	for ok := iter.SeekGE(r.start); ok && iter.Error() == nil; ok = iter.Next() {
 		hasPoint, hasRange := iter.HasPointAndRange()

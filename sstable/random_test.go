@@ -105,15 +105,14 @@ func runErrorInjectionTest(t *testing.T, seed int64) {
 	if rng.IntN(2) == 1 {
 		filterBlockSizeLimit = NeverUseFilterBlock
 	}
-	it, err := r.NewPointIter(
-		context.Background(),
-		NoTransforms,
-		nil /* lower TODO */, nil, /* upper TODO */
-		filterer,
-		filterBlockSizeLimit,
-		block.ReadEnv{Stats: &stats, IterStats: nil},
-		MakeTrivialReaderProvider(r),
-	)
+	it, err := r.NewPointIter(context.Background(), IterOptions{
+		Transforms:           NoTransforms,
+		Filterer:             filterer,
+		FilterBlockSizeLimit: filterBlockSizeLimit,
+		Env:                  ReadEnv{Block: block.ReadEnv{Stats: &stats, IterStats: nil}},
+		ReaderProvider:       MakeTrivialReaderProvider(r),
+		BlobContext:          AssertNoBlobHandles,
+	})
 	require.NoError(t, err)
 	defer it.Close()
 
@@ -299,7 +298,6 @@ func (cfg *randomTableConfig) randomize() {
 			BlockPropertyCollectors: nil,
 			KeySchema:               &testkeysSchema,
 			WritingToLowestLevel:    cfg.rng.IntN(2) == 1,
-			Parallelism:             cfg.rng.IntN(2) == 1,
 		}
 		if v := cfg.rng.IntN(11); v > 0 {
 			cfg.wopts.FilterPolicy = bloom.FilterPolicy(v)
@@ -399,7 +397,7 @@ func buildRandomSSTable(f vfs.File, cfg randomTableConfig) (*WriterMetadata, err
 				value[j] = byte(cfg.rng.Uint32())
 			}
 		}
-		if err := w.AddWithForceObsolete(keys[i], value, false /* forceObsolete */); err != nil {
+		if err := w.Add(keys[i], value, false /* forceObsolete */); err != nil {
 			return nil, err
 		}
 	}

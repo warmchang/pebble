@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -98,7 +97,7 @@ func writeSSTForIngestion(
 			return nil, err
 		}
 		t.opts.Comparer.ValidateKey.MustValidate(k.K.UserKey)
-		if err := w.Raw().AddWithForceObsolete(k.K, valBytes, false); err != nil {
+		if err := w.Raw().Add(k.K, valBytes, false); err != nil {
 			return nil, err
 		}
 	}
@@ -228,7 +227,7 @@ func buildForIngestExternalEmulation(
 	panicIfErr(err)
 
 	reader, pointIter, rangeDelIter, rangeKeyIter := openExternalObj(t, externalObjID, bounds, syntheticPrefix)
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	writable := objstorageprovider.NewFileWritable(f)
 	// The underlying file should already have unique prefixes. Plus we are
@@ -274,10 +273,10 @@ func openExternalObj(
 		start = syntheticPrefix.Invert(start)
 		end = syntheticPrefix.Invert(end)
 	}
-	pointIter, err = reader.NewIter(sstable.NoTransforms, start, end)
+	pointIter, err = reader.NewIter(sstable.NoTransforms, start, end, sstable.AssertNoBlobHandles)
 	panicIfErr(err)
 
-	rangeDelIter, err = reader.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
+	rangeDelIter, err = reader.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
 	panicIfErr(err)
 	if rangeDelIter != nil {
 		rangeDelIter = keyspan.Truncate(
@@ -287,7 +286,7 @@ func openExternalObj(
 		)
 	}
 
-	rangeKeyIter, err = reader.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
+	rangeKeyIter, err = reader.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
 	panicIfErr(err)
 	if rangeKeyIter != nil {
 		rangeKeyIter = keyspan.Truncate(

@@ -509,8 +509,10 @@ type LogWriterConfig struct {
 	// callbacks are serialized since they are invoked from the flushLoop.
 	ExternalSyncQueueCallback ExternalSyncQueueCallback
 
-	// WriteWALSyncOffsets represents whether to write the WAL sync chunk format.
-	WriteWALSyncOffsets bool
+	// WriteWALSyncOffsets determines whether to write WAL sync chunk offsets.
+	// The format major version can change (ratchet) at runtime, so this must be
+	// a function rather than a static bool to ensure we use the latest format version.
+	WriteWALSyncOffsets func() bool
 }
 
 // ExternalSyncQueueCallback is to be run when a PendingSync has been
@@ -552,7 +554,7 @@ func NewLogWriter(
 		},
 	}
 
-	if logWriterConfig.WriteWALSyncOffsets {
+	if logWriterConfig.WriteWALSyncOffsets() {
 		r.emitFragment = r.emitFragmentSyncOffsets
 	} else {
 		r.emitFragment = r.emitFragmentRecyclable
@@ -712,7 +714,7 @@ func (w *LogWriter) flushLoop(context.Context) {
 		if fErr != nil {
 			// NB: pop may invoke ExternalSyncQueueCallback, which is why we have
 			// called f.Unlock() above. We will acquire the lock again below.
-			f.pendingSyncs.pop(snap, fErr)
+			_ = f.pendingSyncs.pop(snap, fErr)
 			// Update the idleStartTime if work could not be done, so that we don't
 			// include the duration we tried to do work as idle. We don't bother
 			// with the rest of the accounting, which means we will undercount.

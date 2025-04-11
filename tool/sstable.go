@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
@@ -164,14 +163,17 @@ func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
 		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
 
-		iter, err := r.NewIter(sstable.NoTransforms, nil, nil)
+		// TODO(jackson): Adjust to support two modes: one that surfaces the raw
+		// blob value handles, and one that fetches the blob values from blob
+		// files uncovered by scanning the directory entries. See #4448.
+		iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s\n", err)
 			return
 		}
 
 		// Verify that SeekPrefixGE can find every key in the table.
-		prefixIter, err := r.NewIter(sstable.NoTransforms, nil, nil)
+		prefixIter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s\n", err)
 			return
@@ -312,7 +314,7 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 		for _, key := range keys {
 			fmt.Fprintf(tw, "  %s\t%s\n", key, r.Properties.UserProperties[key])
 		}
-		tw.Flush()
+		_ = tw.Flush()
 	})
 }
 
@@ -332,7 +334,10 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 			prefix = fmt.Sprintf("%s: ", path)
 		}
 
-		iter, err := r.NewIter(sstable.NoTransforms, nil, s.end)
+		// TODO(jackson): Adjust to support two modes: one that surfaces the raw
+		// blob value handles, and one that fetches the blob values from blob
+		// files uncovered by scanning the directory entries. See #4448.
+		iter, err := r.NewIter(sstable.NoTransforms, nil, s.end, sstable.AssertNoBlobHandles)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s%s\n", prefix, err)
 			return
@@ -350,7 +355,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		// bit more work here to put them in a form that can be iterated in
 		// parallel with the point records.
 		rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
-			iter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
+			iter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -452,7 +457,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 
 		// Handle range keys.
-		rkIter, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, block.NoReadEnv)
+		rkIter, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms, sstable.NoReadEnv)
 		if err != nil {
 			fmt.Fprintf(stdout, "%s\n", err)
 			os.Exit(1)
@@ -499,7 +504,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 func (s *sstableT) runSpace(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
 	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
-		bytes, err := r.EstimateDiskUsage(s.start, s.end)
+		bytes, err := r.EstimateDiskUsage(s.start, s.end, sstable.NoReadEnv)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s\n", err)
 			return
@@ -530,7 +535,7 @@ func (s *sstableT) foreachSstable(
 			fmt.Fprintf(stderr, "%s: %s\n", path, err)
 			return
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		fn(path, r)
 	}
 

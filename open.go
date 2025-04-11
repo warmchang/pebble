@@ -81,6 +81,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	// Make a copy of the options so that we don't mutate the passed in options.
 	opts = opts.Clone()
 	opts.EnsureDefaults()
+	if opts.Experimental.CompactionScheduler == nil {
+		opts.Experimental.CompactionScheduler = newConcurrencyLimitScheduler(defaultTimeSource{})
+	}
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
@@ -129,7 +132,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	defer func() {
 		if db == nil {
-			fileLock.Close()
+			_ = fileLock.Close()
 		}
 	}()
 
@@ -148,7 +151,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	defer func() {
 		if db == nil {
-			formatVersionMarker.Close()
+			_ = formatVersionMarker.Close()
 		}
 	}()
 
@@ -192,7 +195,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	defer func() {
 		if db == nil {
-			manifestMarker.Close()
+			_ = manifestMarker.Close()
 		}
 	}()
 
@@ -229,6 +232,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	d.mu.versions = &versionSet{}
 	d.diskAvailBytes.Store(math.MaxUint64)
+	d.problemSpans.Init(manifest.NumLevels, opts.Comparer.Compare)
 
 	defer func() {
 		// If an error or panic occurs during open, attempt to release the manually
@@ -256,7 +260,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 				d.cleanupManager.Close()
 			}
 			if d.objProvider != nil {
-				d.objProvider.Close()
+				_ = d.objProvider.Close()
 			}
 			if r != nil {
 				panic(r)
@@ -369,7 +373,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 		QueueSemChan:         d.commit.logSyncQSem,
 		Logger:               opts.Logger,
 		EventListener:        walEventListenerAdaptor{l: opts.EventListener},
-		WriteWALSyncOffsets:  FormatMajorVersion(d.mu.formatVers.vers.Load()) >= FormatWALSyncChunks,
+		WriteWALSyncOffsets:  func() bool { return d.FormatMajorVersion() >= FormatWALSyncChunks },
 	}
 	if opts.WALFailover != nil {
 		walOpts.Secondary = opts.WALFailover.Secondary
@@ -389,7 +393,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	defer func() {
 		if db == nil {
-			walManager.Close()
+			_ = walManager.Close()
 		}
 	}()
 
@@ -409,7 +413,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 		opts.FileCache = NewFileCache(opts.Experimental.FileCacheShards, fileCacheSize)
 		defer opts.FileCache.Unref()
 	}
-	d.fileCache = opts.FileCache.newHandle(d.cacheHandle, d.objProvider, d.opts.LoggerAndTracer, d.opts.MakeReaderOptions(), d.reportSSTableCorruption)
+	d.fileCache = opts.FileCache.newHandle(d.cacheHandle, d.objProvider, d.opts.LoggerAndTracer, d.opts.MakeReaderOptions(), d.reportCorruption)
 	d.newIters = d.fileCache.newIters
 	d.tableNewRangeKeyIter = tableNewRangeKeyIter(d.newIters)
 
@@ -525,6 +529,10 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	d.mu.versions.visibleSeqNum.Store(d.mu.versions.logSeqNum.Load())
 
+	// Register with the CompactionScheduler before calling
+	// d.maybeScheduleFlush, since completion of the flush can trigger
+	// compactions.
+	d.opts.Experimental.CompactionScheduler.Register(2, d)
 	if !d.opts.ReadOnly {
 		d.maybeScheduleFlush()
 		for d.mu.compact.flushing {
@@ -862,7 +870,7 @@ func (d *DB) replayWAL(
 	jobID JobID, ll wal.LogicalLog, strictWALTail bool,
 ) (flushableIngests []*ingestedFlushable, maxSeqNum base.SeqNum, err error) {
 	rr := ll.OpenForRead()
-	defer rr.Close()
+	defer func() { _ = rr.Close() }()
 	var (
 		b               Batch
 		buf             bytes.Buffer
@@ -975,7 +983,9 @@ func (d *DB) replayWAL(
 		// which is used below.
 		b = Batch{}
 		b.db = d
-		b.SetRepr(buf.Bytes())
+		if err := b.SetRepr(buf.Bytes()); err != nil {
+			return nil, 0, err
+		}
 		seqNum := b.SeqNum()
 		maxSeqNum = seqNum + base.SeqNum(b.Count())
 		keysReplayed += int64(b.Count())
@@ -1251,8 +1261,7 @@ func checkConsistency(v *manifest.Version, objProvider objstorage.Provider) erro
 	var errs []error
 	dedup := make(map[base.DiskFileNum]struct{})
 	for level, files := range v.Levels {
-		iter := files.Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
+		for f := range files.All() {
 			backingState := f.FileBacking
 			if _, ok := dedup[backingState.DiskFileNum]; ok {
 				continue

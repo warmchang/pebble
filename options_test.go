@@ -103,6 +103,10 @@ func TestDefaultOptionsString(t *testing.T) {
   mem_table_size=4194304
   mem_table_stop_writes_threshold=2
   min_deletion_rate=0
+  free_space_threshold_bytes=17179869184
+  free_space_timeframe=10s
+  obsolete_bytes_max_ratio=0.200000
+  obsolete_bytes_timeframe=5m0s
   merger=pebble.concatenate
   multilevel_compaction_heuristic=wamp(0.00, false)
   read_compaction_rate=16000
@@ -115,8 +119,6 @@ func TestDefaultOptionsString(t *testing.T) {
   validate_on_ingest=false
   wal_dir=
   wal_bytes_per_sync=0
-  max_writer_concurrency=0
-  force_writer_parallelism=false
   secondary_cache_size_bytes=0
   create_on_shared=0
 
@@ -296,8 +298,6 @@ func TestOptionsParse(t *testing.T) {
 			opts.Experimental.DeletionSizeRatioThreshold = 0.7
 			opts.Experimental.TombstoneDenseCompactionThreshold = 0.2
 			opts.Experimental.FileCacheShards = 500
-			opts.Experimental.MaxWriterConcurrency = 1
-			opts.Experimental.ForceWriterParallelism = true
 			opts.Experimental.SecondaryCacheSizeBytes = 1024
 			opts.EnsureDefaults()
 			str := opts.String()
