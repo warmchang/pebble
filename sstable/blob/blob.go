@@ -352,6 +352,8 @@ func (f *fileFooter) encode(b []byte) {
 }
 
 // FileReader reads a blob file.
+// If you update this struct, make sure you also update the magic number in
+// StringForTests() in metrics.go.
 type FileReader struct {
 	r      block.Reader
 	footer fileFooter
@@ -373,6 +375,9 @@ func (o FileReaderOptions) ensureDefaults() FileReaderOptions {
 }
 
 // NewFileReader opens a blob file for reading.
+//
+// In error cases, the objstorage.Readable is still open. The caller remains
+// responsible for closing it if necessary.
 func NewFileReader(
 	ctx context.Context, r objstorage.Readable, ro FileReaderOptions,
 ) (*FileReader, error) {
