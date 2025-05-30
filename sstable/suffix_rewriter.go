@@ -84,16 +84,21 @@ func rewriteKeySuffixesInBlocks(
 	r *Reader, sst []byte, out objstorage.Writable, o WriterOptions, from, to []byte, concurrency int,
 ) (*WriterMetadata, TableFormat, error) {
 	o = o.ensureDefaults()
+	props, err := r.ReadPropertiesBlock(context.TODO(), nil /* buffer pool */)
+	if err != nil {
+		return nil, TableFormatUnspecified, err
+	}
+
 	switch {
 	case concurrency < 1:
 		return nil, TableFormatUnspecified, errors.New("concurrency must be >= 1")
 	case r.Attributes.Has(AttributeValueBlocks):
 		return nil, TableFormatUnspecified,
 			errors.New("sstable with a single suffix should not have value blocks")
-	case r.Properties.ComparerName != o.Comparer.Name:
+	case props.ComparerName != o.Comparer.Name:
 		return nil, TableFormatUnspecified, errors.Errorf("mismatched Comparer %s vs %s, replacement requires same splitter to copy filters",
-			r.Properties.ComparerName, o.Comparer.Name)
-	case o.FilterPolicy != nil && r.Properties.FilterPolicyName != o.FilterPolicy.Name():
+			props.ComparerName, o.Comparer.Name)
+	case o.FilterPolicy != nil && props.FilterPolicyName != o.FilterPolicy.Name():
 		return nil, TableFormatUnspecified, errors.New("mismatched filters")
 	}
 
@@ -140,7 +145,7 @@ func rewriteDataBlocksInParallel(
 	concurrency int,
 	newDataBlockRewriter func() blockRewriter,
 ) ([]blockWithSpan, error) {
-	if r.Properties.NumEntries == 0 {
+	if !r.Attributes.Has(AttributePointKeys) {
 		// No point keys.
 		return nil, nil
 	}
@@ -270,7 +275,7 @@ func getShortIDs(
 		shortIDs[i] = invalidShortID
 	}
 	for i, p := range collectors {
-		prop, ok := r.Properties.UserProperties[p.Name()]
+		prop, ok := r.UserProperties[p.Name()]
 		if !ok {
 			return nil, 0, errors.Errorf("sstable does not contain property %s", p.Name())
 		}

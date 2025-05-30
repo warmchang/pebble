@@ -299,21 +299,8 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 
 	jobID := d.newJobIDLocked()
 
-	providerSettings := objstorageprovider.Settings{
-		Logger:              opts.Logger,
-		FS:                  opts.FS,
-		FSDirName:           dirname,
-		FSDirInitialListing: ls,
-		FSCleaner:           opts.Cleaner,
-		NoSyncOnClose:       opts.NoSyncOnClose,
-		BytesPerSync:        opts.BytesPerSync,
-	}
-	providerSettings.Local.ReadaheadConfig = opts.Local.ReadaheadConfig
-	providerSettings.Remote.StorageFactory = opts.Experimental.RemoteStorage
-	providerSettings.Remote.CreateOnShared = opts.Experimental.CreateOnShared
-	providerSettings.Remote.CreateOnSharedLocator = opts.Experimental.CreateOnSharedLocator
-	providerSettings.Remote.CacheSizeBytes = opts.Experimental.SecondaryCacheSizeBytes
-
+	providerSettings := opts.MakeObjStorageProviderSettings(dirname)
+	providerSettings.FSDirInitialListing = ls
 	d.objProvider, err = objstorageprovider.Open(providerSettings)
 	if err != nil {
 		return nil, err
@@ -377,12 +364,17 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	if opts.WALFailover != nil {
 		walOpts.Secondary = opts.WALFailover.Secondary
+		walOpts.Secondary.Dirname = resolveStorePath(dirname, walOpts.Secondary.Dirname)
 		walOpts.FailoverOptions = opts.WALFailover.FailoverOptions
 		walOpts.FailoverWriteAndSyncLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 			Buckets: FsyncLatencyBuckets,
 		})
 	}
-	walDirs := append(walOpts.Dirs(), opts.WALRecoveryDirs...)
+	walDirs := walOpts.Dirs()
+	for _, dir := range opts.WALRecoveryDirs {
+		dir.Dirname = resolveStorePath(dirname, dir.Dirname)
+		walDirs = append(walDirs, dir)
+	}
 	wals, err := wal.Scan(walDirs...)
 	if err != nil {
 		return nil, err
@@ -663,9 +655,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 func prepareAndOpenDirs(
 	dirname string, opts *Options,
 ) (walDirname string, dataDir vfs.File, err error) {
-	walDirname = opts.WALDir
-	if opts.WALDir == "" {
-		walDirname = dirname
+	walDirname = dirname
+	if opts.WALDir != "" {
+		walDirname = resolveStorePath(dirname, opts.WALDir)
 	}
 
 	// Create directories if needed.
@@ -684,7 +676,7 @@ func prepareAndOpenDirs(
 		}
 		if opts.WALFailover != nil {
 			secondary := opts.WALFailover.Secondary
-			f, err := mkdirAllAndSyncParents(secondary.FS, secondary.Dirname)
+			f, err := mkdirAllAndSyncParents(secondary.FS, resolveStorePath(dirname, secondary.Dirname))
 			if err != nil {
 				return "", nil, err
 			}

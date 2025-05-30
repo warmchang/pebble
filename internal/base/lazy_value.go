@@ -4,11 +4,7 @@
 
 package base
 
-import (
-	"context"
-
-	"github.com/cockroachdb/errors"
-)
+import "context"
 
 // A value can have user-defined attributes that are a function of the value
 // byte slice. For now, we only support "short attributes", which can be
@@ -161,20 +157,15 @@ type LazyValue struct {
 
 // LazyFetcher supports fetching a lazy value.
 //
-// Fetcher and Attribute are to be initialized at creation time. The fields
-// are arranged to reduce the sizeof this struct.
+// The fields are to be initialized at creation time.
 type LazyFetcher struct {
 	// Fetcher, given a handle, returns the value.
 	Fetcher ValueFetcher
-	err     error
-	value   []byte
 	// Attribute includes the short attribute and value length.
 	Attribute AttributeAndLen
 	// BlobFileNum identifies the blob file containing the value. It is only
 	// populated if the value is stored in a blob file.
 	BlobFileNum DiskFileNum
-	fetched     bool
-	callerOwned bool
 }
 
 // ValueFetcher is an interface for fetching a value.
@@ -197,32 +188,12 @@ type ValueFetcher interface {
 
 // Value returns the underlying value.
 func (lv *LazyValue) Value(buf []byte) (val []byte, callerOwned bool, err error) {
-	if lv.Fetcher == nil {
+	f := lv.Fetcher
+	if f == nil {
 		return lv.ValueOrHandle, false, nil
 	}
-	// Do the rest of the work in a separate method to attempt mid-stack
-	// inlining of Value(). Unfortunately, this still does not inline since the
-	// cost of 85 exceeds the budget of 80.
-	//
-	// TODO(sumeer): Packing the return values into a struct{[]byte error bool}
-	// causes it to be below the budget. Consider this if we need to recover
-	// more performance. I suspect that inlining this only matters in
-	// micro-benchmarks, and in actual use cases in CockroachDB it will not
-	// matter because there is substantial work done with a fetched value.
-	return lv.fetchValue(context.TODO(), buf)
-}
-
-// INVARIANT: lv.Fetcher != nil
-func (lv *LazyValue) fetchValue(
-	ctx context.Context, buf []byte,
-) (val []byte, callerOwned bool, err error) {
-	f := lv.Fetcher
-	if !f.fetched {
-		f.fetched = true
-		f.value, f.callerOwned, f.err = f.Fetcher.Fetch(ctx,
-			lv.ValueOrHandle, f.BlobFileNum, f.Attribute.ValueLen, buf)
-	}
-	return f.value, f.callerOwned, f.err
+	return f.Fetcher.Fetch(context.TODO(),
+		lv.ValueOrHandle, f.BlobFileNum, f.Attribute.ValueLen, buf)
 }
 
 // Len returns the length of the value.
@@ -286,22 +257,17 @@ func (lv *LazyValue) Clone(buf []byte, fetcher *LazyFetcher) (LazyValue, []byte)
 // NoBlobFetches is a ValueFetcher that returns an error. It's intended to be
 // used in situations where sstables should not encode a blob value, or the
 // caller should not fetch the handle's value.
-var NoBlobFetches = &errValueFetcher{
-	Err: errors.AssertionFailedf("unexpected blob value"),
-}
+var NoBlobFetches = errValueFetcher{}
 
 // errValueFetcher is a ValueFetcher that returns an error.
-type errValueFetcher struct {
-	Err error
-}
+type errValueFetcher struct{}
 
-// Assert that *errValueFetcher implements base.ValueFetcher.
-var _ ValueFetcher = (*errValueFetcher)(nil)
+var _ ValueFetcher = errValueFetcher{}
 
 // Fetch implements base.ValueFetcher.
-func (e *errValueFetcher) Fetch(
+func (e errValueFetcher) Fetch(
 	_ context.Context, _ []byte, blobFileNum DiskFileNum, valLen uint32, _ []byte,
 ) (val []byte, callerOwned bool, err error) {
-	err = errors.Wrapf(e.Err, "fetching %d-byte value from %s", valLen, blobFileNum)
+	err = AssertionFailedf("unexpected blob value: %d-byte from %s", valLen, blobFileNum)
 	return nil, false, err
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
@@ -257,7 +258,8 @@ func openExternalObj(
 	rangeDelIter keyspan.FragmentIterator,
 	rangeKeyIter keyspan.FragmentIterator,
 ) {
-	objReader, objSize, err := t.externalStorage.ReadObject(context.Background(), externalObjName(externalObjID))
+	objMeta := t.getExternalObj(externalObjID)
+	objReader, objSize, err := t.externalStorage.ReadObject(context.Background(), objMeta.objName)
 	panicIfErr(err)
 	opts := t.opts.MakeReaderOptions()
 	reader, err = sstable.NewReader(
@@ -265,7 +267,9 @@ func openExternalObj(
 		objstorageprovider.NewRemoteReadable(objReader, objSize),
 		opts,
 	)
-	panicIfErr(err)
+	if err != nil {
+		panic(errors.CombineErrors(err, objReader.Close()))
+	}
 
 	start := bounds.Start
 	end := bounds.End

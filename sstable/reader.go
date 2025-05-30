@@ -42,6 +42,8 @@ const (
 )
 
 // Reader is a table reader.
+// If you update this struct, make sure you also update the magic number in
+// StringForTests() in metrics.go.
 type Reader struct {
 	blockReader block.Reader
 
@@ -63,9 +65,9 @@ type Reader struct {
 	metaindexBH  block.Handle
 	footerBH     block.Handle
 
-	Properties  Properties
-	tableFormat TableFormat
-	Attributes  Attributes
+	tableFormat    TableFormat
+	Attributes     Attributes
+	UserProperties map[string]string
 }
 
 type ReadEnv struct {
@@ -440,25 +442,11 @@ var metaBufferPools = sync.Pool{
 
 func (r *Reader) readMetaindex(
 	ctx context.Context,
+	bufferPool *block.BufferPool,
 	readHandle objstorage.ReadHandle,
 	filters map[string]FilterPolicy,
-	deniedUserProperties map[string]struct{},
 ) error {
-	// We use a BufferPool when reading metaindex blocks in order to avoid
-	// populating the block cache with these blocks. In heavy-write workloads,
-	// especially with high compaction concurrency, new tables may be created
-	// frequently. Populating the block cache with these metaindex blocks adds
-	// additional contention on the block cache mutexes (see #1997).
-	// Additionally, these blocks are exceedingly unlikely to be read again
-	// while they're still in the block cache except in misconfigurations with
-	// excessive sstables counts or a file cache that's far too small.
-	bufferPool := metaBufferPools.Get().(*block.BufferPool)
-	defer metaBufferPools.Put(bufferPool)
-	// When we're finished, release the buffers we've allocated back to memory
-	// allocator.
-	defer bufferPool.Release()
 	metaEnv := block.ReadEnv{BufferPool: bufferPool}
-
 	b, err := r.readMetaindexBlock(ctx, metaEnv, readHandle)
 	if err != nil {
 		return err
@@ -482,16 +470,7 @@ func (r *Reader) readMetaindex(
 	}
 
 	if bh, ok := meta[metaPropertiesName]; ok {
-		b, err = r.blockReader.Read(ctx, metaEnv, readHandle, bh, noInitBlockMetadataFn)
-		if err != nil {
-			return err
-		}
 		r.propertiesBH = bh
-		r.Properties, err = decodePropertiesBlock(r.tableFormat, b.BlockData(), deniedUserProperties)
-		if err != nil {
-			return err
-		}
-		b.Release()
 	} else {
 		return errors.New("did not read any value for the properties block in the meta index")
 	}
@@ -524,14 +503,12 @@ func (r *Reader) readMetaindex(
 }
 
 // decodePropertiesBlock decodes the (uncompressed) properties block.
-func decodePropertiesBlock(
-	tableFormat TableFormat, blockData []byte, deniedUserProperties map[string]struct{},
-) (Properties, error) {
+func decodePropertiesBlock(tableFormat TableFormat, blockData []byte) (Properties, error) {
 	var props Properties
 	if tableFormat >= TableFormatPebblev7 {
 		var decoder colblk.KeyValueBlockDecoder
 		decoder.Init(blockData)
-		if err := props.load(decoder.All(), deniedUserProperties); err != nil {
+		if err := props.load(decoder.All()); err != nil {
 			return Properties{}, err
 		}
 	} else {
@@ -539,11 +516,50 @@ func decodePropertiesBlock(
 		if err != nil {
 			return Properties{}, err
 		}
-		if err := props.load(i.All(), deniedUserProperties); err != nil {
+		if err := props.load(i.All()); err != nil {
 			return Properties{}, err
 		}
 	}
 	return props, nil
+}
+
+var propertiesBlockBufPools = sync.Pool{
+	New: func() any {
+		bp := new(block.BufferPool)
+		// New pools are initialized with a capacity of 2 to accommodate
+		// both the compressed properties block (1) and decompressed
+		// properties block (1).
+		bp.Init(2)
+		return bp
+	},
+}
+
+// ReadPropertiesBlock reads the properties block
+// from the table. We always read the properties block into a buffer pool
+// instead of the block cache.
+func (r *Reader) ReadPropertiesBlock(
+	ctx context.Context, bufferPool *block.BufferPool,
+) (Properties, error) {
+	return r.readPropertiesBlockInternal(ctx, bufferPool, noReadHandle)
+}
+
+func (r *Reader) readPropertiesBlockInternal(
+	ctx context.Context, bufferPool *block.BufferPool, readHandle objstorage.ReadHandle,
+) (Properties, error) {
+	if bufferPool == nil {
+		// We always use a buffer pool when reading the properties block as
+		// we don't want it in the block cache.
+		bufferPool = propertiesBlockBufPools.Get().(*block.BufferPool)
+		defer propertiesBlockBufPools.Put(bufferPool)
+		defer bufferPool.Release()
+	}
+	env := block.ReadEnv{BufferPool: bufferPool}
+	b, err := r.blockReader.Read(ctx, env, readHandle, r.propertiesBH, noInitBlockMetadataFn)
+	if err != nil {
+		return Properties{}, err
+	}
+	defer b.Release()
+	return decodePropertiesBlock(r.tableFormat, b.BlockData())
 }
 
 // Layout returns the layout (block organization) for an sstable.
@@ -553,7 +569,7 @@ func (r *Reader) Layout() (*Layout, error) {
 	}
 
 	l := &Layout{
-		Data:       make([]block.HandleWithProperties, 0, r.Properties.NumDataBlocks),
+		Data:       make([]block.HandleWithProperties, 0),
 		RangeDel:   r.rangeDelBH,
 		RangeKey:   r.rangeKeyBH,
 		ValueIndex: r.valueBIH.Handle,
@@ -575,7 +591,7 @@ func (r *Reader) Layout() (*Layout, error) {
 
 	var alloc bytealloc.A
 
-	if r.Properties.IndexPartitions == 0 {
+	if !r.Attributes.Has(AttributeTwoLevelIndex) {
 		l.Index = append(l.Index, r.indexBH)
 		iter := r.tableFormat.newIndexIter()
 		err := iter.Init(r.Comparer, indexH.BlockData(), NoTransforms)
@@ -775,7 +791,7 @@ func estimateDiskUsage[I any, PI indexBlockIterator[I]](
 	// These may be different in case of partitioned index but will both point
 	// to the same blockIter over the single index in the unpartitioned case.
 	var startIdxIter, endIdxIter PI
-	if r.Properties.IndexPartitions == 0 {
+	if !r.Attributes.Has(AttributeTwoLevelIndex) {
 		startIdxIter = new(I)
 		if err := startIdxIter.InitHandle(r.Comparer, indexH, NoTransforms); err != nil {
 			return 0, err
@@ -834,8 +850,13 @@ func estimateDiskUsage[I any, PI indexBlockIterator[I]](
 		return 0, errCorruptIndexEntry(err)
 	}
 
+	props, err := r.ReadPropertiesBlock(ctx, nil /* buffer pool */)
+	if err != nil {
+		return 0, err
+	}
+
 	includeInterpolatedValueBlocksSize := func(dataBlockSize uint64) uint64 {
-		// INVARIANT: r.Properties.DataSize > 0 since startIdxIter is not nil.
+		// INVARIANT: props.DataSize > 0 since startIdxIter is not nil.
 		// Linearly interpolate what is stored in value blocks.
 		//
 		// TODO(sumeer): if we need more accuracy, without loading any data blocks
@@ -845,16 +866,16 @@ func estimateDiskUsage[I any, PI indexBlockIterator[I]](
 		// each data block in the index block entry. This increases the size of
 		// the BlockHandle, so wait until this becomes necessary.
 		return dataBlockSize +
-			uint64((float64(dataBlockSize)/float64(r.Properties.DataSize))*
-				float64(r.Properties.ValueBlocksSize))
+			uint64((float64(dataBlockSize)/float64(props.DataSize))*
+				float64(props.ValueBlocksSize))
 	}
 	if endIdxIter == nil {
 		// The range spans beyond this file. Include data blocks through the last.
-		return includeInterpolatedValueBlocksSize(r.Properties.DataSize - startBH.Offset), nil
+		return includeInterpolatedValueBlocksSize(props.DataSize - startBH.Offset), nil
 	}
 	if !endIdxIter.SeekGE(end) {
 		// The range spans beyond this file. Include data blocks through the last.
-		return includeInterpolatedValueBlocksSize(r.Properties.DataSize - startBH.Offset), nil
+		return includeInterpolatedValueBlocksSize(props.DataSize - startBH.Offset), nil
 	}
 	endBH, err := endIdxIter.BlockHandleWithProperties()
 	if err != nil {
@@ -884,7 +905,8 @@ func (r *Reader) BlockReader() *block.Reader {
 // The context is used for tracing any operations performed by NewReader; it is
 // NOT stored for future use.
 //
-// In error cases, the Readable is closed.
+// In error cases, the objstorage.Readable is still open. The caller remains
+// responsible for closing it if necessary.
 func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Reader, error) {
 	if f == nil {
 		return nil, errors.New("pebble/table: nil file")
@@ -902,7 +924,7 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 
 	footer, err := readFooter(ctx, f, rh, o.LoggerAndTracer, o.CacheOpts.FileNum)
 	if err != nil {
-		return nil, errors.CombineErrors(err, f.Close())
+		return nil, err
 	}
 	r.blockReader.Init(f, o.ReaderOptions, footer.checksum)
 	r.tableFormat = footer.format
@@ -911,13 +933,34 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 	r.footerBH = footer.footerBH
 
 	// Read the metaindex and properties blocks.
-	if err := r.readMetaindex(ctx, rh, o.Filters, o.DeniedUserProperties); err != nil {
+	// We use a BufferPool when reading metaindex blocks in order to avoid
+	// populating the block cache with these blocks. In heavy-write workloads,
+	// especially with high compaction concurrency, new tables may be created
+	// frequently. Populating the block cache with these metaindex blocks adds
+	// additional contention on the block cache mutexes (see #1997).
+	// Additionally, these blocks are exceedingly unlikely to be read again
+	// while they're still in the block cache except in misconfigurations with
+	// excessive sstables counts or a file cache that's far too small.
+	bufferPool := metaBufferPools.Get().(*block.BufferPool)
+	defer metaBufferPools.Put(bufferPool)
+	// When we're finished, release the buffers we've allocated back to memory
+	// allocator.
+	defer bufferPool.Release()
+
+	if err := r.readMetaindex(ctx, bufferPool, rh, o.Filters); err != nil {
 		r.err = err
-		return nil, r.Close()
+		return nil, err
 	}
 
+	props, err := r.readPropertiesBlockInternal(ctx, bufferPool, rh)
+	if err != nil {
+		r.err = err
+		return nil, err
+	}
+	r.UserProperties = props.UserProperties
+
 	// Set which attributes are in use based on property values.
-	r.Attributes = r.Properties.toAttributes()
+	r.Attributes = props.toAttributes()
 	if footer.format >= TableFormatPebblev7 && footer.attributes != r.Attributes {
 		// For now we just verify that our derived attributes from the properties match the bitset
 		// on the footer.
@@ -925,28 +968,28 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 			errors.Safe(r.blockReader.FileNum()), errors.Safe(footer.attributes), errors.Safe(r.Attributes))
 	}
 
-	if r.Properties.ComparerName == "" || o.Comparer.Name == r.Properties.ComparerName {
+	if props.ComparerName == "" || o.Comparer.Name == props.ComparerName {
 		r.Comparer = o.Comparer
-	} else if comparer, ok := o.Comparers[r.Properties.ComparerName]; ok {
+	} else if comparer, ok := o.Comparers[props.ComparerName]; ok {
 		r.Comparer = comparer
 	} else {
 		r.err = errors.Errorf("pebble/table: %d: unknown comparer %s",
-			errors.Safe(r.blockReader.FileNum()), errors.Safe(r.Properties.ComparerName))
+			errors.Safe(r.blockReader.FileNum()), errors.Safe(props.ComparerName))
 	}
 
-	if mergerName := r.Properties.MergerName; mergerName != "" && mergerName != "nullptr" {
+	if mergerName := props.MergerName; mergerName != "" && mergerName != "nullptr" {
 		if o.Merger != nil && o.Merger.Name == mergerName {
 			// opts.Merger matches.
 		} else if _, ok := o.Mergers[mergerName]; ok {
 			// Known merger.
 		} else {
 			r.err = errors.Errorf("pebble/table: %d: unknown merger %s",
-				errors.Safe(r.blockReader.FileNum()), errors.Safe(r.Properties.MergerName))
+				errors.Safe(r.blockReader.FileNum()), errors.Safe(props.MergerName))
 		}
 	}
 
 	if r.tableFormat.BlockColumnar() {
-		if ks, ok := o.KeySchemas[r.Properties.KeySchemaName]; ok {
+		if ks, ok := o.KeySchemas[props.KeySchemaName]; ok {
 			r.keySchema = ks
 		} else {
 			var known []string
@@ -956,15 +999,14 @@ func NewReader(ctx context.Context, f objstorage.Readable, o ReaderOptions) (*Re
 			slices.Sort(known)
 
 			r.err = errors.Newf("pebble/table: %d: unknown key schema %q; known key schemas: %s",
-				errors.Safe(r.blockReader.FileNum()), errors.Safe(r.Properties.KeySchemaName), errors.Safe(known))
+				errors.Safe(r.blockReader.FileNum()), errors.Safe(props.KeySchemaName), errors.Safe(known))
 			panic(r.err)
 		}
 	}
 
 	if r.err != nil {
-		return nil, r.Close()
+		return nil, r.err
 	}
-
 	return r, nil
 }
 

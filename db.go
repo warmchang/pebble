@@ -1209,7 +1209,6 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 			}
 			if dbi.rangeKey == nil {
 				dbi.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
-				dbi.rangeKey.init(dbi.comparer.Compare, dbi.comparer.Split, &dbi.opts)
 				dbi.constructRangeKeyIter()
 			} else {
 				dbi.rangeKey.iterConfig.SetBounds(dbi.opts.LowerBound, dbi.opts.UpperBound)
@@ -1347,6 +1346,8 @@ func (d *DB) newInternalIter(
 		seqNum:          seqNum,
 		mergingIter:     &buf.merging,
 	}
+	dbi.blobValueFetcher.Init(d.fileCache, block.ReadEnv{})
+
 	dbi.opts = *o
 	dbi.opts.logger = d.opts.Logger
 	if d.opts.private.disableLazyCombinedIteration {
@@ -1392,7 +1393,6 @@ func finishInitializingInternalIter(
 	// For internal iterators, we skip the lazy combined iteration optimization
 	// entirely, and create the range key iterator stack directly.
 	i.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
-	i.rangeKey.init(i.comparer.Compare, i.comparer.Split, &i.opts.IterOptions)
 	if err := i.constructRangeKeyIter(); err != nil {
 		return nil, err
 	}
@@ -1791,6 +1791,8 @@ func (d *DB) Close() error {
 		err = firstError(err, errors.Errorf("non-zero zombie blob count: %d", zblobs))
 	}
 
+	err = firstError(err, d.fileCache.Close())
+
 	err = firstError(err, d.objProvider.Close())
 
 	// If the options include a closer to 'close' the filesystem, close it.
@@ -1802,8 +1804,6 @@ func (d *DB) Close() error {
 	if v := d.mu.snapshots.count(); v > 0 {
 		err = firstError(err, errors.Errorf("leaked snapshots: %d open snapshots on DB %p", v, d))
 	}
-
-	err = firstError(err, d.fileCache.Close())
 
 	return err
 }

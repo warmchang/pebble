@@ -136,6 +136,8 @@ func runIterCmd(d *datadriven.TestData, iter *Iterator, closeIter bool) string {
 					op = "seeklt"
 				}
 				fmt.Fprintf(&b, "%s=%q\n", field, op)
+			case "value.Len()":
+				fmt.Fprintf(&b, "%s=%d\n", field, iter.value.Len())
 			default:
 				return fmt.Sprintf("unrecognized inspect field %q\n", field)
 			}
@@ -1343,15 +1345,19 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	}
 	r, err := sstable.NewReader(context.Background(), readable, readerOpts)
 	if err != nil {
-		return err.Error()
+		return errors.CombineErrors(err, readable.Close()).Error()
 	}
 	defer r.Close()
 
-	props := r.Properties.String()
+	loadedProps, err := r.ReadPropertiesBlock(context.Background(), nil /* buffer pool */)
+	if err != nil {
+		return err.Error()
+	}
+	props := loadedProps.String()
 	env := sstable.ReadEnv{}
 	if m != nil && m.Virtual {
 		env.Virtual = m.VirtualParams
-		scaledProps := r.Properties.GetScaledProperties(m.TableBacking.Size, m.Size)
+		scaledProps := loadedProps.GetScaledProperties(m.TableBacking.Size, m.Size)
 		props = scaledProps.String()
 	}
 	if len(td.Input) == 0 {
@@ -1383,7 +1389,7 @@ func runLayoutCmd(t *testing.T, td *datadriven.TestData, d *DB) string {
 	}
 	r, err := sstable.NewReader(context.Background(), readable, d.opts.MakeReaderOptions())
 	if err != nil {
-		return err.Error()
+		return errors.CombineErrors(err, readable.Close()).Error()
 	}
 	defer r.Close()
 	l, err := r.Layout()
