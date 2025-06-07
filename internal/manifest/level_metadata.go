@@ -24,7 +24,7 @@ type LevelMetadata struct {
 	NumVirtual uint64
 	// VirtualTableSize is the size of the virtual sstables in the level.
 	VirtualTableSize uint64
-	tree             btree
+	tree             btree[*TableMetadata]
 }
 
 // clone makes a copy of the level metadata, implicitly increasing the ref
@@ -52,7 +52,7 @@ func MakeLevelMetadata(cmp Compare, level int, files []*TableMetadata) LevelMeta
 	}
 	var lm LevelMetadata
 	lm.level = level
-	lm.tree = makeBTree(cmp, bcmp, files)
+	lm.tree = makeBTree(bcmp, files)
 	for _, f := range files {
 		lm.totalTableSize += f.Size
 		lm.totalRefSize += f.EstimatedReferenceSize()
@@ -64,8 +64,8 @@ func MakeLevelMetadata(cmp Compare, level int, files []*TableMetadata) LevelMeta
 	return lm
 }
 
-func makeBTree(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) btree {
-	t := btree{cmp: cmp, bcmp: bcmp}
+func makeBTree[M fileMetadata](bcmp btreeCmp[M], files []M) btree[M] {
+	t := btree[M]{bcmp: bcmp}
 	for _, f := range files {
 		if err := t.Insert(f); err != nil {
 			panic(err)
@@ -74,9 +74,9 @@ func makeBTree(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) btree {
 	return t
 }
 
-func makeLevelSlice(cmp base.Compare, bcmp btreeCmp, files []*TableMetadata) LevelSlice {
-	t := makeBTree(cmp, bcmp, files)
-	slice := newLevelSlice(t.Iter())
+func makeLevelSlice(bcmp btreeCmp[*TableMetadata], files []*TableMetadata) LevelSlice {
+	t := makeBTree(bcmp, files)
+	slice := newLevelSlice(tableMetadataIter(&t))
 	slice.verifyInvariants()
 	// We can release the tree because the nodes that are referenced by the
 	// LevelSlice are immutable and we never recycle them.
@@ -139,7 +139,7 @@ func (lm *LevelMetadata) EstimatedReferenceSize() uint64 {
 
 // Iter constructs a LevelIterator over the entire level.
 func (lm *LevelMetadata) Iter() LevelIterator {
-	return LevelIterator{iter: lm.tree.Iter()}
+	return LevelIterator{iter: tableMetadataIter(&lm.tree)}
 }
 
 // All returns an iterator over all files in the level.
@@ -156,7 +156,7 @@ func (lm *LevelMetadata) All() iter.Seq[*TableMetadata] {
 
 // Slice constructs a slice containing the entire level.
 func (lm *LevelMetadata) Slice() LevelSlice {
-	return newLevelSlice(lm.tree.Iter())
+	return newLevelSlice(tableMetadataIter(&lm.tree))
 }
 
 // Find finds the provided file in the level. If it exists, returns a LevelSlice
@@ -186,7 +186,7 @@ func (lf LevelFile) Slice() LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceSeqSorted(files []*TableMetadata) LevelSlice {
-	return makeLevelSlice(nil, btreeCmpSeqNum, files)
+	return makeLevelSlice(btreeCmpSeqNum, files)
 }
 
 // NewLevelSliceKeySorted constructs a LevelSlice over the provided files,
@@ -194,7 +194,7 @@ func NewLevelSliceSeqSorted(files []*TableMetadata) LevelSlice {
 // TODO(jackson): Can we improve this interface or avoid needing to export
 // a slice constructor like this?
 func NewLevelSliceKeySorted(cmp base.Compare, files []*TableMetadata) LevelSlice {
-	return makeLevelSlice(cmp, btreeCmpSmallestKey(cmp), files)
+	return makeLevelSlice(btreeCmpSmallestKey(cmp), files)
 }
 
 // NewLevelSliceSpecificOrder constructs a LevelSlice over the provided files,
@@ -202,13 +202,13 @@ func NewLevelSliceKeySorted(cmp base.Compare, files []*TableMetadata) LevelSlice
 // tests.
 // TODO(jackson): Update tests to avoid requiring this and remove it.
 func NewLevelSliceSpecificOrder(files []*TableMetadata) LevelSlice {
-	slice := makeLevelSlice(nil, btreeCmpSpecificOrder(files), files)
+	slice := makeLevelSlice(btreeCmpSpecificOrder(files), files)
 	slice.verifyInvariants()
 	return slice
 }
 
 // newLevelSlice constructs a new LevelSlice backed by iter.
-func newLevelSlice(iter iterator) LevelSlice {
+func newLevelSlice(iter iterator[*TableMetadata]) LevelSlice {
 	s := LevelSlice{iter: iter}
 	if iter.r != nil {
 		s.length = iter.r.subtreeCount
@@ -221,7 +221,9 @@ func newLevelSlice(iter iterator) LevelSlice {
 // by the provided start and end bounds. The provided startBound and endBound
 // iterators must be iterators over the same B-Tree. Both start and end bounds
 // are inclusive.
-func newBoundedLevelSlice(iter iterator, startBound, endBound *iterator) LevelSlice {
+func newBoundedLevelSlice(
+	iter iterator[*TableMetadata], startBound, endBound *iterator[*TableMetadata],
+) LevelSlice {
 	s := LevelSlice{
 		iter:  iter,
 		start: startBound,
@@ -253,13 +255,13 @@ func newBoundedLevelSlice(iter iterator, startBound, endBound *iterator) LevelSl
 // LevelSlices should be constructed through one of the existing constructors,
 // not manually initialized.
 type LevelSlice struct {
-	iter   iterator
+	iter   iterator[*TableMetadata]
 	length int
 	// start and end form the inclusive bounds of a slice of files within a
 	// level of the LSM. They may be nil if the entire B-Tree backing iter is
 	// accessible.
-	start *iterator
-	end   *iterator
+	start *iterator[*TableMetadata]
+	end   *iterator[*TableMetadata]
 }
 
 func (ls LevelSlice) verifyInvariants() {
@@ -430,11 +432,11 @@ const (
 // LevelIterator iterates over a set of files' metadata. Its zero value is an
 // empty iterator.
 type LevelIterator struct {
-	iter iterator
+	iter iterator[*TableMetadata]
 	// If set, start is an inclusive lower bound on the iterator.
-	start *iterator
+	start *iterator[*TableMetadata]
 	// If set, end is an inclusive upper bound on the iterator.
-	end    *iterator
+	end    *iterator[*TableMetadata]
 	filter KeyType
 }
 
@@ -508,7 +510,7 @@ func (i *LevelIterator) Filter(keyType KeyType) LevelIterator {
 	return l
 }
 
-func emptyWithBounds(i iterator, start, end *iterator) bool {
+func emptyWithBounds(i iterator[*TableMetadata], start, end *iterator[*TableMetadata]) bool {
 	// If i.r is nil, the iterator was constructed from an empty btree.
 	// If the end bound is before the start bound, the bounds represent an
 	// empty slice of the B-Tree.

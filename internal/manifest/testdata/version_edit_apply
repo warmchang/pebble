@@ -83,7 +83,7 @@ L0.0:
 apply v2
   add-table: L0 000001:[a#1,SET-c#2,SET] seqnums:[1-2]
 ----
-pebble: files 000001 and 000001 collided on sort keys
+pebble: files 000001:[a#1,SET-c#2,SET] and 000001:[a#1,SET-c#2,SET] collided on sort keys
 
 apply empty
   add-table: L0 000001:[a#1,SET-c#2,SET] seqnums:[1-2]
@@ -248,6 +248,8 @@ L1:
   000001:[a#2,SET-e#2,SET] seqnums:[0-0] points:[a#2,SET-e#2,SET]
 L2:
   000002:[c#1,SET-f#1,SET] seqnums:[0-0] points:[c#1,SET-f#1,SET]
+Blob files:
+  000003 -> 000003 size:[20535 (20KB)] vals:[25935 (25KB)]
 
 # Try to add another table referencing the blob file. Since the file is not
 # added in the same version edit, and no referencing table is deleted in the
@@ -272,6 +274,8 @@ L1:
   000006:[e#2,SET-z#9,SET] seqnums:[0-9] points:[e#2,SET-z#9,SET] blobrefs:[(000003: 14192); depth:1]
 L2:
   000002:[c#1,SET-f#1,SET] seqnums:[0-0] points:[c#1,SET-f#1,SET]
+Blob files:
+  000003 -> 000003 size:[20535 (20KB)] vals:[25935 (25KB)]
 
 # Repeat the above but this time applying the entire lifecycle of a blob file in
 # a single bulk version edit. This simulates a manifest replay during startup.

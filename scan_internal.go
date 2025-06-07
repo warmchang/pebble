@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/remote"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
 
@@ -89,7 +90,7 @@ type SharedSSTMeta struct {
 	tableNum base.TableNum
 }
 
-func (s *SharedSSTMeta) cloneFromFileMeta(f *tableMetadata) {
+func (s *SharedSSTMeta) cloneFromFileMeta(f *manifest.TableMetadata) {
 	*s = SharedSSTMeta{
 		Smallest:         f.Smallest().Clone(),
 		Largest:          f.Largest().Clone(),
@@ -418,23 +419,24 @@ type IteratorLevel struct {
 // *must* return the range delete as well as the range key unset/delete that did
 // the shadowing.
 type scanInternalIterator struct {
-	ctx             context.Context
-	db              *DB
-	opts            scanInternalOptions
-	comparer        *base.Comparer
-	merge           Merge
-	iter            internalIterator
-	readState       *readState
-	version         *version
-	rangeKey        *iteratorRangeKeyState
-	pointKeyIter    internalIterator
-	iterKV          *base.InternalKV
-	alloc           *iterAlloc
-	newIters        tableNewIters
-	newIterRangeKey keyspanimpl.TableNewSpanIter
-	seqNum          base.SeqNum
-	iterLevels      []IteratorLevel
-	mergingIter     *mergingIter
+	ctx              context.Context
+	db               *DB
+	opts             scanInternalOptions
+	comparer         *base.Comparer
+	merge            Merge
+	iter             internalIterator
+	readState        *readState
+	version          *manifest.Version
+	rangeKey         *iteratorRangeKeyState
+	pointKeyIter     internalIterator
+	iterKV           *base.InternalKV
+	alloc            *iterAlloc
+	newIters         tableNewIters
+	newIterRangeKey  keyspanimpl.TableNewSpanIter
+	seqNum           base.SeqNum
+	iterLevels       []IteratorLevel
+	mergingIter      *mergingIter
+	blobValueFetcher blob.ValueFetcher
 
 	// boundsBuf holds two buffers used to store the lower and upper bounds.
 	// Whenever the InternalIterator's bounds change, the new bounds are copied
@@ -461,7 +463,7 @@ func (d *DB) truncateExternalFile(
 	ctx context.Context,
 	lower, upper []byte,
 	level int,
-	file *tableMetadata,
+	file *manifest.TableMetadata,
 	objMeta objstorage.ObjectMetadata,
 ) (*ExternalFile, error) {
 	cmp := d.cmp
@@ -516,7 +518,7 @@ func (d *DB) truncateSharedFile(
 	ctx context.Context,
 	lower, upper []byte,
 	level int,
-	file *tableMetadata,
+	file *manifest.TableMetadata,
 	objMeta objstorage.ObjectMetadata,
 ) (sst *SharedSSTMeta, shouldSkip bool, err error) {
 	cmp := d.cmp
@@ -900,13 +902,16 @@ func (i *scanInternalIterator) constructPointIter(
 	rangeDelLevels = rangeDelLevels[:numLevelIters]
 	i.opts.IterOptions.snapshotForHideObsoletePoints = i.seqNum
 	i.opts.IterOptions.Category = category
+
+	internalOpts := internalIterOpts{
+		blobValueFetcher: &i.blobValueFetcher,
+	}
+
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Layer) {
 		li := &levels[levelsIndex]
 		rli := &rangeDelLevels[levelsIndex]
 
-		li.init(
-			i.ctx, i.opts.IterOptions, i.comparer, i.newIters, files, level,
-			internalIterOpts{})
+		li.init(i.ctx, i.opts.IterOptions, i.comparer, i.newIters, files, level, internalOpts)
 		mlevels[mlevelsIndex].iter = li
 		rli.Init(i.ctx, keyspan.SpanIterOptions{RangeKeyFilters: i.opts.RangeKeyFilters},
 			i.comparer.Compare, tableNewRangeDelIter(i.newIters), files, level,
@@ -1122,6 +1127,7 @@ func (i *scanInternalIterator) error() error {
 // close closes this iterator, and releases any pooled objects.
 func (i *scanInternalIterator) close() {
 	_ = i.iter.Close()
+	_ = i.blobValueFetcher.Close()
 	if i.readState != nil {
 		i.readState.unref()
 	}

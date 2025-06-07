@@ -33,10 +33,9 @@ type DeleteCleaner = base.DeleteCleaner
 type ArchiveCleaner = base.ArchiveCleaner
 
 type cleanupManager struct {
-	opts            *Options
-	objProvider     objstorage.Provider
-	onTableDeleteFn func(fileSize uint64, isLocal bool)
-	deletePacer     *deletionPacer
+	opts        *Options
+	objProvider objstorage.Provider
+	deletePacer *deletionPacer
 
 	// jobsCh is used as the cleanup job queue.
 	jobsCh chan *cleanupJob
@@ -47,10 +46,19 @@ type cleanupManager struct {
 		sync.Mutex
 		// totalJobs is the total number of enqueued jobs (completed or in progress).
 		totalJobs              int
+		completedStats         obsoleteObjectStats
 		completedJobs          int
 		completedJobsCond      sync.Cond
 		jobsQueueWarningIssued bool
 	}
+}
+
+// CompletedStats returns the stats summarizing objects deleted. The returned
+// stats increase monotonically over the lifetime of the DB.
+func (m *cleanupManager) CompletedStats() obsoleteObjectStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mu.completedStats
 }
 
 // We can queue this many jobs before we have to block EnqueueJob.
@@ -66,23 +74,25 @@ type obsoleteFile struct {
 	isLocal  bool
 }
 
+func (of *obsoleteFile) needsPacing() bool {
+	// We only need to pace local objects--sstables and blob files.
+	return of.isLocal && (of.fileType == base.FileTypeTable || of.fileType == base.FileTypeBlob)
+}
+
 type cleanupJob struct {
 	jobID         JobID
 	obsoleteFiles []obsoleteFile
+	stats         obsoleteObjectStats
 }
 
 // openCleanupManager creates a cleanupManager and starts its background goroutine.
 // The cleanupManager must be Close()d.
 func openCleanupManager(
-	opts *Options,
-	objProvider objstorage.Provider,
-	onTableDeleteFn func(fileSize uint64, isLocal bool),
-	getDeletePacerInfo func() deletionPacerInfo,
+	opts *Options, objProvider objstorage.Provider, getDeletePacerInfo func() deletionPacerInfo,
 ) *cleanupManager {
 	cm := &cleanupManager{
-		opts:            opts,
-		objProvider:     objProvider,
-		onTableDeleteFn: onTableDeleteFn,
+		opts:        opts,
+		objProvider: objProvider,
 		deletePacer: newDeletionPacer(
 			crtime.NowMono(),
 			opts.FreeSpaceThresholdBytes,
@@ -114,10 +124,13 @@ func (cm *cleanupManager) Close() {
 }
 
 // EnqueueJob adds a cleanup job to the manager's queue.
-func (cm *cleanupManager) EnqueueJob(jobID JobID, obsoleteFiles []obsoleteFile) {
+func (cm *cleanupManager) EnqueueJob(
+	jobID JobID, obsoleteFiles []obsoleteFile, stats obsoleteObjectStats,
+) {
 	job := &cleanupJob{
 		jobID:         jobID,
 		obsoleteFiles: obsoleteFiles,
+		stats:         stats,
 	}
 
 	// Report deleted bytes to the pacer, which can use this data to potentially
@@ -126,7 +139,7 @@ func (cm *cleanupManager) EnqueueJob(jobID JobID, obsoleteFiles []obsoleteFile) 
 	// subject to the throttling rate which defeats the purpose.
 	var pacingBytes uint64
 	for _, of := range obsoleteFiles {
-		if cm.needsPacing(of.fileType, of.fileNum) {
+		if of.needsPacing() {
 			pacingBytes += of.fileSize
 		}
 	}
@@ -168,11 +181,10 @@ func (cm *cleanupManager) mainLoop() {
 		for _, of := range job.obsoleteFiles {
 			switch of.fileType {
 			case base.FileTypeTable:
-				cm.maybePace(&tb, of.fileType, of.fileNum, of.fileSize)
-				cm.onTableDeleteFn(of.fileSize, of.isLocal)
+				cm.maybePace(&tb, &of)
 				cm.deleteObsoleteObject(of.fileType, job.jobID, of.fileNum)
 			case base.FileTypeBlob:
-				cm.maybePace(&tb, of.fileType, of.fileNum, of.fileSize)
+				cm.maybePace(&tb, &of)
 				cm.deleteObsoleteObject(of.fileType, job.jobID, of.fileNum)
 			default:
 				cm.deleteObsoleteFile(of.fs, of.fileType, job.jobID, of.path, of.fileNum)
@@ -180,37 +192,21 @@ func (cm *cleanupManager) mainLoop() {
 		}
 		cm.mu.Lock()
 		cm.mu.completedJobs++
+		cm.mu.completedStats.Add(job.stats)
 		cm.mu.completedJobsCond.Broadcast()
 		cm.maybeLogLocked()
 		cm.mu.Unlock()
 	}
 }
 
-// fileNumIfSST is read iff fileType is fileTypeTable.
-func (cm *cleanupManager) needsPacing(fileType base.FileType, fileNumIfSST base.DiskFileNum) bool {
-	if fileType != base.FileTypeTable && fileType != base.FileTypeBlob {
-		return false
-	}
-	meta, err := cm.objProvider.Lookup(fileType, fileNumIfSST)
-	if err != nil {
-		// The object was already removed from the provider; we won't actually
-		// delete anything, so we don't need to pace.
-		return false
-	}
-	// Don't throttle deletion of remote objects.
-	return !meta.IsRemote()
-}
-
 // maybePace sleeps before deleting an object if appropriate. It is always
 // called from the background goroutine.
-func (cm *cleanupManager) maybePace(
-	tb *tokenbucket.TokenBucket, fileType base.FileType, fileNum base.DiskFileNum, fileSize uint64,
-) {
-	if !cm.needsPacing(fileType, fileNum) {
+func (cm *cleanupManager) maybePace(tb *tokenbucket.TokenBucket, of *obsoleteFile) {
+	if !of.needsPacing() {
 		return
 	}
 
-	tokens := cm.deletePacer.PacingDelay(crtime.NowMono(), fileSize)
+	tokens := cm.deletePacer.PacingDelay(crtime.NowMono(), of.fileSize)
 	if tokens == 0.0 {
 		// The token bucket might be in debt; it could make us wait even for 0
 		// tokens. We don't want that if the pacer decided throttling should be
@@ -332,18 +328,6 @@ func (d *DB) getDeletionPacerInfo() deletionPacerInfo {
 	return pacerInfo
 }
 
-// onObsoleteTableDelete is called to update metrics when an sstable is deleted.
-func (d *DB) onObsoleteTableDelete(fileSize uint64, isLocal bool) {
-	d.mu.Lock()
-	d.mu.versions.metrics.Table.ObsoleteCount--
-	d.mu.versions.metrics.Table.ObsoleteSize -= fileSize
-	if isLocal {
-		d.mu.versions.metrics.Table.Local.ObsoleteSize -= fileSize
-		d.mu.versions.metrics.Table.Local.ObsoleteCount--
-	}
-	d.mu.Unlock()
-}
-
 // scanObsoleteFiles scans the filesystem for files that are no longer needed
 // and adds those to the internal lists of obsolete files. Note that the files
 // are not actually deleted by this method. A subsequent call to
@@ -377,8 +361,8 @@ func (d *DB) scanObsoleteFiles(list []string, flushableIngests []*ingestedFlusha
 
 	manifestFileNum := d.mu.versions.manifestFileNum
 
-	var obsoleteTables []objectInfo
-	var obsoleteBlobs []objectInfo
+	var obsoleteTables []obsoleteFile
+	var obsoleteBlobs []obsoleteFile
 	var obsoleteOptions []obsoleteFile
 	var obsoleteManifests []obsoleteFile
 
@@ -423,32 +407,32 @@ func (d *DB) scanObsoleteFiles(list []string, flushableIngests []*ingestedFlusha
 		if _, ok := liveFileNums[obj.DiskFileNum]; ok {
 			continue
 		}
-		makeObjectInfo := func() objectInfo {
-			fileInfo := fileInfo{FileNum: obj.DiskFileNum}
-			if size, err := d.objProvider.Size(obj); err == nil {
-				fileInfo.FileSize = uint64(size)
-			}
-			return objectInfo{
-				fileInfo: fileInfo,
-				isLocal:  !obj.IsRemote(),
-			}
-		}
-
-		switch obj.FileType {
-		case base.FileTypeTable:
-			obsoleteTables = append(obsoleteTables, makeObjectInfo())
-		case base.FileTypeBlob:
-			obsoleteBlobs = append(obsoleteBlobs, makeObjectInfo())
-		default:
+		if obj.FileType != base.FileTypeTable && obj.FileType != base.FileTypeBlob {
 			// Ignore object types we don't know about.
+			continue
+		}
+		of := obsoleteFile{
+			fileType: obj.FileType,
+			fs:       d.opts.FS,
+			path:     base.MakeFilepath(d.opts.FS, d.dirname, obj.FileType, obj.DiskFileNum),
+			fileNum:  obj.DiskFileNum,
+			isLocal:  true,
+		}
+		if size, err := d.objProvider.Size(obj); err == nil {
+			of.fileSize = uint64(size)
+		}
+		if obj.FileType == base.FileTypeTable {
+			obsoleteTables = append(obsoleteTables, of)
+		} else {
+			obsoleteBlobs = append(obsoleteBlobs, of)
 		}
 	}
 
-	d.mu.versions.obsoleteTables = mergeObjectInfos(d.mu.versions.obsoleteTables, obsoleteTables)
-	d.mu.versions.obsoleteBlobs = mergeObjectInfos(d.mu.versions.obsoleteBlobs, obsoleteBlobs)
-	d.mu.versions.updateObsoleteObjectMetricsLocked()
+	d.mu.versions.obsoleteTables = mergeObsoleteFiles(d.mu.versions.obsoleteTables, obsoleteTables)
+	d.mu.versions.obsoleteBlobs = mergeObsoleteFiles(d.mu.versions.obsoleteBlobs, obsoleteBlobs)
 	d.mu.versions.obsoleteManifests = mergeObsoleteFiles(d.mu.versions.obsoleteManifests, obsoleteManifests)
 	d.mu.versions.obsoleteOptions = mergeObsoleteFiles(d.mu.versions.obsoleteOptions, obsoleteOptions)
+	d.mu.versions.updateObsoleteObjectMetricsLocked()
 }
 
 // disableFileDeletions disables file deletions and then waits for any
@@ -460,7 +444,7 @@ func (d *DB) scanObsoleteFiles(list []string, flushableIngests []*ingestedFlusha
 //
 // d.mu must be held when calling this method.
 func (d *DB) disableFileDeletions() {
-	d.mu.disableFileDeletions++
+	d.mu.fileDeletions.disableCount++
 	d.mu.Unlock()
 	defer d.mu.Lock()
 	d.cleanupManager.Wait()
@@ -471,11 +455,11 @@ func (d *DB) disableFileDeletions() {
 //
 // d.mu must be held when calling this method.
 func (d *DB) enableFileDeletions() {
-	if d.mu.disableFileDeletions <= 0 {
+	if d.mu.fileDeletions.disableCount <= 0 {
 		panic("pebble: file deletion disablement invariant violated")
 	}
-	d.mu.disableFileDeletions--
-	if d.mu.disableFileDeletions > 0 {
+	d.mu.fileDeletions.disableCount--
+	if d.mu.fileDeletions.disableCount > 0 {
 		return
 	}
 	d.deleteObsoleteFiles(d.newJobIDLocked())
@@ -490,7 +474,7 @@ type fileInfo = base.FileInfo
 // Does nothing if file deletions are disabled (see disableFileDeletions). A
 // cleanup job will be scheduled when file deletions are re-enabled.
 func (d *DB) deleteObsoleteFiles(jobID JobID) {
-	if d.mu.disableFileDeletions > 0 {
+	if d.mu.fileDeletions.disableCount > 0 {
 		return
 	}
 	_, noRecycle := d.opts.Cleaner.(base.NeedsFileContents)
@@ -516,9 +500,9 @@ func (d *DB) deleteObsoleteFiles(jobID JobID) {
 			d.opts.Logger.Fatalf("obsoleteManifests is not sorted")
 		case !slices.IsSortedFunc(d.mu.versions.obsoleteOptions, cmpObsoleteFileNumbers):
 			d.opts.Logger.Fatalf("obsoleteOptions is not sorted")
-		case !slices.IsSortedFunc(obsoleteTables, cmpObjectFileNums):
+		case !slices.IsSortedFunc(obsoleteTables, cmpObsoleteFileNumbers):
 			d.opts.Logger.Fatalf("obsoleteTables is not sorted")
-		case !slices.IsSortedFunc(obsoleteBlobs, cmpObjectFileNums):
+		case !slices.IsSortedFunc(obsoleteBlobs, cmpObsoleteFileNumbers):
 			d.opts.Logger.Fatalf("obsoleteBlobs is not sorted")
 		}
 	}
@@ -536,14 +520,27 @@ func (d *DB) deleteObsoleteFiles(jobID JobID) {
 	obsoleteOptions := d.mu.versions.obsoleteOptions
 	d.mu.versions.obsoleteOptions = nil
 
+	// Compute the stats for the files being queued for deletion and add them to
+	// the running total. These stats will be used during DB.Metrics() to
+	// calculate the count and size of pending obsolete files by diffing these
+	// stats and the stats reported by the cleanup manager.
+	var objectStats obsoleteObjectStats
+	objectStats.tablesAll, objectStats.tablesLocal = calculateObsoleteObjectStats(obsoleteTables)
+	objectStats.blobFilesAll, objectStats.blobFilesLocal = calculateObsoleteObjectStats(obsoleteBlobs)
+	d.mu.fileDeletions.queuedStats.Add(objectStats)
+	d.mu.versions.updateObsoleteObjectMetricsLocked()
+
 	// Release d.mu while preparing the cleanup job and possibly waiting.
 	// Note the unusual order: Unlock and then Lock.
 	d.mu.Unlock()
 	defer d.mu.Lock()
 
-	filesToDelete := make([]obsoleteFile, 0, len(obsoleteLogs)+len(obsoleteTables)+len(obsoleteManifests)+len(obsoleteOptions))
+	n := len(obsoleteLogs) + len(obsoleteTables) + len(obsoleteBlobs) + len(obsoleteManifests) + len(obsoleteOptions)
+	filesToDelete := make([]obsoleteFile, 0, n)
 	filesToDelete = append(filesToDelete, obsoleteManifests...)
 	filesToDelete = append(filesToDelete, obsoleteOptions...)
+	filesToDelete = append(filesToDelete, obsoleteTables...)
+	filesToDelete = append(filesToDelete, obsoleteBlobs...)
 	for _, f := range obsoleteLogs {
 		filesToDelete = append(filesToDelete, obsoleteFile{
 			fileType: base.FileTypeLog,
@@ -555,16 +552,13 @@ func (d *DB) deleteObsoleteFiles(jobID JobID) {
 		})
 	}
 	for _, f := range obsoleteTables {
-		d.fileCache.Evict(f.FileNum, base.FileTypeTable)
-		filesToDelete = append(filesToDelete, f.asObsoleteFile(d.opts.FS, base.FileTypeTable, d.dirname))
+		d.fileCache.Evict(f.fileNum, base.FileTypeTable)
 	}
 	for _, f := range obsoleteBlobs {
-		d.fileCache.Evict(f.FileNum, base.FileTypeBlob)
-		filesToDelete = append(filesToDelete, f.asObsoleteFile(d.opts.FS, base.FileTypeBlob, d.dirname))
+		d.fileCache.Evict(f.fileNum, base.FileTypeBlob)
 	}
-
 	if len(filesToDelete) > 0 {
-		d.cleanupManager.EnqueueJob(jobID, filesToDelete)
+		d.cleanupManager.EnqueueJob(jobID, filesToDelete, objectStats)
 	}
 	if d.opts.private.testingAlwaysWaitForCleanup {
 		d.cleanupManager.Wait()
@@ -611,6 +605,54 @@ func (o objectInfo) asObsoleteFile(fs vfs.FS, fileType base.FileType, dirname st
 		fileSize: o.FileSize,
 		isLocal:  o.isLocal,
 	}
+}
+
+func calculateObsoleteObjectStats(files []obsoleteFile) (total, local countAndSize) {
+	for _, of := range files {
+		if of.isLocal {
+			local.count++
+			local.size += of.fileSize
+		}
+		total.count++
+		total.size += of.fileSize
+	}
+	return total, local
+}
+
+type obsoleteObjectStats struct {
+	tablesLocal    countAndSize
+	tablesAll      countAndSize
+	blobFilesLocal countAndSize
+	blobFilesAll   countAndSize
+}
+
+func (s *obsoleteObjectStats) Add(other obsoleteObjectStats) {
+	s.tablesLocal.Add(other.tablesLocal)
+	s.tablesAll.Add(other.tablesAll)
+	s.blobFilesLocal.Add(other.blobFilesLocal)
+	s.blobFilesAll.Add(other.blobFilesAll)
+}
+
+func (s *obsoleteObjectStats) Sub(other obsoleteObjectStats) {
+	s.tablesLocal.Sub(other.tablesLocal)
+	s.tablesAll.Sub(other.tablesAll)
+	s.blobFilesLocal.Sub(other.blobFilesLocal)
+	s.blobFilesAll.Sub(other.blobFilesAll)
+}
+
+type countAndSize struct {
+	count uint64
+	size  uint64
+}
+
+func (c *countAndSize) Add(other countAndSize) {
+	c.count += other.count
+	c.size += other.size
+}
+
+func (c *countAndSize) Sub(other countAndSize) {
+	c.count = invariants.SafeSub(c.count, other.count)
+	c.size = invariants.SafeSub(c.size, other.size)
 }
 
 func makeZombieObjects() zombieObjects {
@@ -693,19 +735,4 @@ func (z *zombieObjects) TotalSize() uint64 {
 // LocalStats returns the count and size of all local objects in the set.
 func (z *zombieObjects) LocalStats() (count uint64, size uint64) {
 	return z.localCount, z.localSize
-}
-
-func mergeObjectInfos(a, b []objectInfo) []objectInfo {
-	if len(b) == 0 {
-		return a
-	}
-	a = append(a, b...)
-	slices.SortFunc(a, cmpObjectFileNums)
-	return slices.CompactFunc(a, func(a, b objectInfo) bool {
-		return a.FileNum == b.FileNum
-	})
-}
-
-func cmpObjectFileNums(a, b objectInfo) int {
-	return cmp.Compare(a.FileNum, b.FileNum)
 }

@@ -18,8 +18,10 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +31,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
-	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -241,7 +242,15 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		cmd := exec.Command(binary, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf(`
+			historyPath := filepath.Join(runDir, "history")
+			historyLines := strings.Split(readFile(historyPath), "\n")
+			// Show only the last 30 lines of history.
+			if maxLines := 30; len(historyLines) > maxLines {
+				start := len(historyLines) - maxLines
+				historyLines = append([]string{fmt.Sprintf("...[%d lines skipped]...", start)}, historyLines[start:]...)
+			}
+
+			t.Fatalf(`error running %v
 ===== SEED =====
 %d
 ===== ERR =====
@@ -254,13 +263,16 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 %s
 ===== HISTORY =====
 %s
+%s
 To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir %s --try-to-reduce -v`,
+				cmd.String(),
 				runOpts.seed,
 				err,
 				out,
 				optionsStr,
 				opsPath,
-				readFile(filepath.Join(runDir, "history")),
+				historyPath,
+				strings.Join(historyLines, "\n"),
 				topLevelTestName, runDir,
 			)
 		}
@@ -303,14 +315,8 @@ To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir
 			t.Run(names[i], func(t *testing.T) {
 				lines := readHistory(t, getHistoryPath(names[i]))
 				lines = reorderHistory(lines)
-				diff := difflib.UnifiedDiff{
-					A:       base,
-					B:       lines,
-					Context: 5,
-				}
-				text, err := difflib.GetUnifiedDiffString(diff)
-				require.NoError(t, err)
-				if text != "" {
+				diff := lineByLineDiff(base, lines)
+				if diff != "" {
 					// NB: We force an exit rather than using t.Fatal because the latter
 					// will run another instance of the test if -count is specified, while
 					// we're happy to exit on the first failure.
@@ -332,7 +338,7 @@ To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir
 To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --compare "%s/{%s,%s}" --try-to-reduce -v
 `,
 						runOpts.seed,
-						metaDir, names[0], names[i], text,
+						metaDir, names[0], names[i], diff,
 						names[0], optionsStrA,
 						names[i], optionsStrB,
 						opsPath,
@@ -523,13 +529,13 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 		testOpts.Threads = runOpts.maxThreads
 	}
 
-	dir := opts.FS.PathJoin(runDir, "data")
+	dataDir := opts.FS.PathJoin(runDir, "data")
 	// Set up the initial database state if configured to start from a non-empty
 	// database. By default tests start from an empty database, but split
 	// version testing may configure a previous metamorphic tests's database
 	// state as the initial state.
 	if testOpts.initialStatePath != "" {
-		require.NoError(t, setupInitialState(dir, testOpts))
+		require.NoError(t, setupInitialState(dataDir, testOpts))
 	}
 
 	if testOpts.Opts.WALFailover != nil {
@@ -540,19 +546,13 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 			testOpts.Opts.WALFailover = nil
 		} else {
 			testOpts.Opts.WALFailover.Secondary.FS = opts.FS
-			testOpts.Opts.WALFailover.Secondary.Dirname = opts.FS.PathJoin(
-				runDir, testOpts.Opts.WALFailover.Secondary.Dirname)
 		}
 	}
 
-	if opts.WALDir != "" {
-		if runOpts.numInstances > 1 {
-			// TODO(bilal): Allow opts to diverge on a per-instance basis, and use
-			// that to set unique WAL dirs for all instances in multi-instance mode.
-			opts.WALDir = ""
-		} else {
-			opts.WALDir = opts.FS.PathJoin(runDir, opts.WALDir)
-		}
+	if runOpts.numInstances > 1 {
+		// TODO(bilal): Allow opts to diverge on a per-instance basis, and use
+		// that to set unique WAL dirs for all instances in multi-instance mode.
+		opts.WALDir = ""
 	}
 
 	historyFile, err := os.Create(historyPath)
@@ -567,7 +567,7 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 	defer h.Close()
 
 	m := newTest(ops)
-	require.NoError(t, m.init(h, dir, testOpts, runOpts.numInstances, runOpts.opTimeout))
+	require.NoError(t, m.init(h, dataDir, testOpts, runOpts.numInstances, runOpts.opTimeout))
 
 	if err := Execute(m); err != nil {
 		fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
@@ -706,4 +706,44 @@ func readFile(path string) string {
 	}
 
 	return string(history)
+}
+
+// lineByLineDiff performs a line-by-line diff of two histories and returns the
+// first chunk of differences.
+//
+// This is preferable to unified diffs (which groups differences into sections)
+// because it's easier to see the difference in each particular operation.
+//
+// Returns "" if the two slices are equal (modulo any trailing empty lines).
+func lineByLineDiff(a, b []string) string {
+	// Make the two slices the same length.
+	for len(a) < len(b) {
+		a = append(a, "")
+	}
+	for len(b) < len(a) {
+		b = append(b, "")
+	}
+	if slices.Equal(a, b) {
+		return ""
+	}
+	firstDiff := 0
+	for ; a[firstDiff] == b[firstDiff]; firstDiff++ {
+	}
+	start := max(0, firstDiff-8)
+	end := min(firstDiff+8, len(a))
+	var buf strings.Builder
+	extraLine := false
+	for i := start; i < end; i++ {
+		if a[i] == b[i] {
+			if extraLine {
+				fmt.Fprintf(&buf, "\n")
+				extraLine = false
+			}
+			fmt.Fprintf(&buf, "%s\n", strings.TrimSuffix(a[i], "\n"))
+		} else {
+			fmt.Fprintf(&buf, "\n-%s\n+%s\n", strings.TrimSuffix(a[i], "\n"), strings.TrimSuffix(b[i], "\n"))
+			extraLine = true
+		}
+	}
+	return buf.String()
 }

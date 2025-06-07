@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/buildtags"
 	"github.com/cockroachdb/pebble/internal/compact"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/testkeys"
@@ -42,14 +43,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newVersion(opts *Options, files [numLevels][]*tableMetadata) *version {
+func newVersion(opts *Options, files [numLevels][]*manifest.TableMetadata) *manifest.Version {
 	v, _ := newVersionAndL0Organizer(opts, files)
 	return v
 }
 
 func newVersionAndL0Organizer(
-	opts *Options, files [numLevels][]*tableMetadata,
-) (*version, *manifest.L0Organizer) {
+	opts *Options, files [numLevels][]*manifest.TableMetadata,
+) (*manifest.Version, *manifest.L0Organizer) {
 	l0Organizer := manifest.NewL0Organizer(opts.Comparer, opts.FlushSplitBytes)
 	v := manifest.NewVersionForTesting(
 		opts.Comparer,
@@ -122,8 +123,8 @@ func TestPickCompaction(t *testing.T) {
 	}
 
 	opts := DefaultOptions()
-	newFileMeta := func(tableNum base.TableNum, size uint64, smallest, largest base.InternalKey) *tableMetadata {
-		m := &tableMetadata{
+	newFileMeta := func(tableNum base.TableNum, size uint64, smallest, largest base.InternalKey) *manifest.TableMetadata {
+		m := &manifest.TableMetadata{
 			TableNum: tableNum,
 			Size:     size,
 		}
@@ -134,14 +135,14 @@ func TestPickCompaction(t *testing.T) {
 
 	testCases := []struct {
 		desc      string
-		files     [numLevels][]*tableMetadata
+		files     [numLevels][]*manifest.TableMetadata
 		picker    compactionPickerForTesting
 		want      string
 		wantMulti bool
 	}{
 		{
 			desc: "no compaction",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -156,7 +157,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "1 L0 file",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -176,7 +177,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files (0 overlaps)",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -202,7 +203,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files, with ikey overlap",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -228,7 +229,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "2 L0 files, with ukey overlap",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -254,7 +255,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "1 L0 file, 2 L1 files (0 overlaps)",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -288,7 +289,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "1 L0 file, 2 L1 files (1 overlap), 4 L2 files (3 overlaps)",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				0: {
 					newFileMeta(
 						100,
@@ -348,7 +349,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can grow",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -401,7 +402,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can't grow (range)",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -454,7 +455,7 @@ func TestPickCompaction(t *testing.T) {
 
 		{
 			desc: "4 L1 files, 2 L2 files, can't grow (size)",
-			files: [numLevels][]*tableMetadata{
+			files: [numLevels][]*manifest.TableMetadata{
 				1: {
 					newFileMeta(
 						200,
@@ -600,6 +601,7 @@ func TestAutomaticFlush(t *testing.T) {
 					}
 					r, err := sstable.NewReader(context.Background(), f, opts.MakeReaderOptions())
 					if err != nil {
+						err = errors.CombineErrors(err, f.Close())
 						return errors.WithStack(err)
 					}
 					defer r.Close()
@@ -692,21 +694,21 @@ func TestValidateVersionEdit(t *testing.T) {
 	}
 
 	cmp := DefaultComparer.Compare
-	newFileMeta := func(smallest, largest base.InternalKey) *tableMetadata {
-		m := (&tableMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
+	newFileMeta := func(smallest, largest base.InternalKey) *manifest.TableMetadata {
+		m := (&manifest.TableMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
 		m.InitPhysicalBacking()
 		return m
 	}
 
 	testCases := []struct {
 		desc    string
-		ve      *versionEdit
+		ve      *manifest.VersionEdit
 		vFunc   func([]byte) error
 		wantErr error
 	}{
 		{
 			desc: "single new file; start key",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				NewTables: []manifest.NewTableEntry{
 					{
 						Meta: newFileMeta(
@@ -721,7 +723,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "single new file; end key",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				NewTables: []manifest.NewTableEntry{
 					{
 						Meta: newFileMeta(
@@ -736,7 +738,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "multiple new files",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				NewTables: []manifest.NewTableEntry{
 					{
 						Meta: newFileMeta(
@@ -757,7 +759,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "single deleted file; start key",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{
 					{Level: 0, FileNum: 0}: newFileMeta(
 						manifest.InternalKey{UserKey: []byte(badKey)},
@@ -770,7 +772,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "single deleted file; end key",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{
 					{Level: 0, FileNum: 0}: newFileMeta(
 						manifest.InternalKey{UserKey: []byte("a")},
@@ -783,7 +785,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "multiple deleted files",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{
 					{Level: 0, FileNum: 0}: newFileMeta(
 						manifest.InternalKey{UserKey: []byte("a")},
@@ -800,7 +802,7 @@ func TestValidateVersionEdit(t *testing.T) {
 		},
 		{
 			desc: "no errors",
-			ve: &versionEdit{
+			ve: &manifest.VersionEdit{
 				NewTables: []manifest.NewTableEntry{
 					{
 						Level: 0,
@@ -1516,11 +1518,11 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 
 					start, end := []byte(parts[2]), []byte(parts[3])
 
-					var tombstoneFile *tableMetadata
+					var tombstoneFile *manifest.TableMetadata
 					tombstoneLevel := int(parseUint64(parts[0][1:]))
 
 					// Set file number to the value provided in the input.
-					tombstoneFile = &tableMetadata{
+					tombstoneFile = &manifest.TableMetadata{
 						TableNum: base.TableNum(parseUint64(parts[1])),
 					}
 
@@ -2038,7 +2040,7 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 
 	metaRE := regexp.MustCompile(`^L([0-9]+):([^-]+)-(.+)$`)
 	var tableNum base.TableNum
-	parseMeta := func(s string) (level int, meta *tableMetadata) {
+	parseMeta := func(s string) (level int, meta *manifest.TableMetadata) {
 		match := metaRE.FindStringSubmatch(s)
 		if match == nil {
 			t.Fatalf("malformed table spec: %s", s)
@@ -2048,7 +2050,7 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 			t.Fatalf("malformed table spec: %s: %s", s, err)
 		}
 		tableNum++
-		meta = &tableMetadata{TableNum: tableNum}
+		meta = &manifest.TableMetadata{TableNum: tableNum}
 		meta.ExtendPointKeyBounds(
 			d.cmp,
 			InternalKey{UserKey: []byte(match[2])},
@@ -2096,7 +2098,7 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 					c.flushing = nil
 					c.startLevel.level = -1
 
-					var startFiles, outputFiles []*tableMetadata
+					var startFiles, outputFiles []*manifest.TableMetadata
 
 					switch {
 					case len(parts) == 1 && parts[0] == "flush":
@@ -2146,12 +2148,12 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 
 func TestCompactionErrorOnUserKeyOverlap(t *testing.T) {
 	cmp := DefaultComparer.Compare
-	parseMeta := func(s string) *tableMetadata {
+	parseMeta := func(s string) *manifest.TableMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		m := (&tableMetadata{}).ExtendPointKeyBounds(
+		m := (&manifest.TableMetadata{}).ExtendPointKeyBounds(
 			cmp,
 			base.ParseInternalKey(strings.TrimSpace(parts[0])),
 			base.ParseInternalKey(strings.TrimSpace(parts[1])),
@@ -2183,7 +2185,7 @@ func TestCompactionErrorOnUserKeyOverlap(t *testing.T) {
 				}
 
 				result := "OK"
-				ve := &versionEdit{
+				ve := &manifest.VersionEdit{
 					NewTables: files,
 				}
 				if err := c.errorOnUserKeyOverlap(ve); err != nil {
@@ -2210,8 +2212,7 @@ func TestCompactionErrorCleanup(t *testing.T) {
 	mem := vfs.NewMem()
 	ii := errorfs.OnIndex(math.MaxInt32) // start disabled
 	opts := &Options{
-		FS:     errorfs.Wrap(mem, errorfs.ErrInjected.If(ii)),
-		Levels: make([]LevelOptions, numLevels),
+		FS: errorfs.Wrap(mem, errorfs.ErrInjected.If(ii)),
 		EventListener: &EventListener{
 			TableCreated: func(info TableCreateInfo) {
 				t.Log(info)
@@ -2278,12 +2279,12 @@ func TestCompactionErrorCleanup(t *testing.T) {
 
 func TestCompactionCheckOrdering(t *testing.T) {
 	cmp := DefaultComparer.Compare
-	parseMeta := func(s string) *tableMetadata {
+	parseMeta := func(s string) *manifest.TableMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		m := (&tableMetadata{}).ExtendPointKeyBounds(
+		m := (&manifest.TableMetadata{}).ExtendPointKeyBounds(
 			cmp,
 			base.ParseInternalKey(strings.TrimSpace(parts[0])),
 			base.ParseInternalKey(strings.TrimSpace(parts[1])),
@@ -2307,10 +2308,10 @@ func TestCompactionCheckOrdering(t *testing.T) {
 					inputs:    []compactionLevel{{level: -1}, {level: -1}},
 				}
 				c.startLevel, c.outputLevel = &c.inputs[0], &c.inputs[1]
-				var startFiles, outputFiles []*tableMetadata
+				var startFiles, outputFiles []*manifest.TableMetadata
 				var sublevels []manifest.LevelSlice
-				var files *[]*tableMetadata
-				var sublevel []*tableMetadata
+				var files *[]*manifest.TableMetadata
+				var sublevel []*manifest.TableMetadata
 				var sublevelNum int
 				var parsingSublevel bool
 				tableNum := base.TableNum(1)
@@ -2916,8 +2917,7 @@ func TestCompactionErrorStats(t *testing.T) {
 	mem := vfs.NewMem()
 	injector := &WriteErrorInjector{}
 	opts := &Options{
-		FS:     errorfs.Wrap(mem, injector),
-		Levels: make([]LevelOptions, numLevels),
+		FS: errorfs.Wrap(mem, injector),
 		EventListener: &EventListener{
 			TableCreated: func(info TableCreateInfo) {
 				t.Log(info)
@@ -2992,6 +2992,9 @@ func TestCompactionErrorStats(t *testing.T) {
 }
 
 func TestCompactionCorruption(t *testing.T) {
+	if buildtags.SlowBuild {
+		t.Skip("disabled in slow builds")
+	}
 	mem := vfs.NewMem()
 	var numFinishedCompactions atomic.Int32
 	var once sync.Once
@@ -3158,7 +3161,7 @@ func TestCompactionCorruption(t *testing.T) {
 }
 
 func hasExternalFiles(d *DB) bool {
-	v := func() *version {
+	v := func() *manifest.Version {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 
@@ -3204,7 +3207,7 @@ func TestTombstoneDensityCompactionMoveOptimization(t *testing.T) {
 	opts.WithFSDefaults()
 
 	// Create a file with high tombstone density.
-	meta := &tableMetadata{
+	meta := &manifest.TableMetadata{
 		TableNum: 1,
 		Size:     1024,
 		Stats: manifest.TableStats{
@@ -3221,8 +3224,8 @@ func TestTombstoneDensityCompactionMoveOptimization(t *testing.T) {
 	meta.StatsMarkValid()
 
 	// Set up the version: L4 has the file, L5 and L6 are empty.
-	var files [numLevels][]*tableMetadata
-	files[inputLevel] = []*tableMetadata{meta}
+	var files [numLevels][]*manifest.TableMetadata
+	files[inputLevel] = []*manifest.TableMetadata{meta}
 	vers, l0org := newVersionAndL0Organizer(opts, files)
 	virtualBackings := manifest.MakeVirtualBackings()
 
@@ -3302,7 +3305,7 @@ func TestTombstoneDensityCompactionMoveOptimization_NoMoveWithOverlap(t *testing
 	opts.WithFSDefaults()
 
 	// Create a file with high tombstone density in L4.
-	metaL4 := &tableMetadata{
+	metaL4 := &manifest.TableMetadata{
 		TableNum: 1,
 		Size:     1024,
 		Stats: manifest.TableStats{
@@ -3319,7 +3322,7 @@ func TestTombstoneDensityCompactionMoveOptimization_NoMoveWithOverlap(t *testing
 	metaL4.StatsMarkValid()
 
 	// Create an overlapping file in L5.
-	metaL5 := &tableMetadata{
+	metaL5 := &manifest.TableMetadata{
 		TableNum: 2,
 		Size:     1024,
 	}
@@ -3331,9 +3334,9 @@ func TestTombstoneDensityCompactionMoveOptimization_NoMoveWithOverlap(t *testing
 	metaL5.StatsMarkValid()
 
 	// Set up the version: L4 has metaL4, L5 has metaL5.
-	var files [numLevels][]*tableMetadata
-	files[inputLevel] = []*tableMetadata{metaL4}
-	files[outputLevel] = []*tableMetadata{metaL5}
+	var files [numLevels][]*manifest.TableMetadata
+	files[inputLevel] = []*manifest.TableMetadata{metaL4}
+	files[outputLevel] = []*manifest.TableMetadata{metaL5}
 	vers, l0org := newVersionAndL0Organizer(opts, files)
 	virtualBackings := manifest.MakeVirtualBackings()
 
@@ -3381,7 +3384,7 @@ func TestTombstoneDensityCompactionMoveOptimization_GrandparentOverlapTooLarge(t
 	opts.WithFSDefaults()
 
 	// File in L4 with high tombstone density.
-	metaL4 := &tableMetadata{
+	metaL4 := &manifest.TableMetadata{
 		TableNum: 1,
 		Size:     1024,
 		Stats: manifest.TableStats{
@@ -3398,7 +3401,7 @@ func TestTombstoneDensityCompactionMoveOptimization_GrandparentOverlapTooLarge(t
 	metaL4.StatsMarkValid()
 
 	// Large overlapping file in L6 (grandparent level).
-	metaL6 := &tableMetadata{
+	metaL6 := &manifest.TableMetadata{
 		TableNum: 3,
 		Size:     1 << 30, // 1GB, exceeds overlap threshold
 	}
@@ -3409,9 +3412,9 @@ func TestTombstoneDensityCompactionMoveOptimization_GrandparentOverlapTooLarge(t
 	metaL6.InitPhysicalBacking()
 	metaL6.StatsMarkValid()
 
-	var files [numLevels][]*tableMetadata
-	files[inputLevel] = []*tableMetadata{metaL4}
-	files[grandparentLevel] = []*tableMetadata{metaL6}
+	var files [numLevels][]*manifest.TableMetadata
+	files[inputLevel] = []*manifest.TableMetadata{metaL4}
+	files[grandparentLevel] = []*manifest.TableMetadata{metaL6}
 	vers, l0org := newVersionAndL0Organizer(opts, files)
 	virtualBackings := manifest.MakeVirtualBackings()
 
@@ -3443,7 +3446,7 @@ func TestTombstoneDensityCompactionMoveOptimization_BelowDensityThreshold(t *tes
 	opts.Experimental.CompactionScheduler = NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
 	opts.WithFSDefaults()
 
-	meta := &tableMetadata{
+	meta := &manifest.TableMetadata{
 		TableNum: 1,
 		Size:     1024,
 		Stats: manifest.TableStats{
@@ -3459,8 +3462,8 @@ func TestTombstoneDensityCompactionMoveOptimization_BelowDensityThreshold(t *tes
 	meta.InitPhysicalBacking()
 	meta.StatsMarkValid()
 
-	var files [numLevels][]*tableMetadata
-	files[inputLevel] = []*tableMetadata{meta}
+	var files [numLevels][]*manifest.TableMetadata
+	files[inputLevel] = []*manifest.TableMetadata{meta}
 	vers, l0org := newVersionAndL0Organizer(opts, files)
 	virtualBackings := manifest.MakeVirtualBackings()
 
@@ -3491,7 +3494,7 @@ func TestTombstoneDensityCompactionMoveOptimization_InvalidStats(t *testing.T) {
 	opts.Experimental.CompactionScheduler = NewConcurrencyLimitSchedulerWithNoPeriodicGrantingForTest()
 	opts.WithFSDefaults()
 
-	meta := &tableMetadata{
+	meta := &manifest.TableMetadata{
 		TableNum: 1,
 		Size:     1024,
 		// No stats set, or stats are invalid
@@ -3503,8 +3506,8 @@ func TestTombstoneDensityCompactionMoveOptimization_InvalidStats(t *testing.T) {
 	meta.InitPhysicalBacking()
 	// meta.StatsMarkValid() is NOT called
 
-	var files [numLevels][]*tableMetadata
-	files[inputLevel] = []*tableMetadata{meta}
+	var files [numLevels][]*manifest.TableMetadata
+	files[inputLevel] = []*manifest.TableMetadata{meta}
 	vers, l0org := newVersionAndL0Organizer(opts, files)
 	virtualBackings := manifest.MakeVirtualBackings()
 

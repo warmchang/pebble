@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 )
 
 // RewriteKeySuffixesAndReturnFormat copies the content of the passed SSTable
@@ -84,17 +85,22 @@ func rewriteKeySuffixesInBlocks(
 	r *Reader, sst []byte, out objstorage.Writable, o WriterOptions, from, to []byte, concurrency int,
 ) (*WriterMetadata, TableFormat, error) {
 	o = o.ensureDefaults()
+	props, err := r.ReadPropertiesBlock(context.TODO(), nil /* buffer pool */)
+	if err != nil {
+		return nil, TableFormatUnspecified, err
+	}
+
 	switch {
 	case concurrency < 1:
 		return nil, TableFormatUnspecified, errors.New("concurrency must be >= 1")
 	case r.Attributes.Has(AttributeValueBlocks):
 		return nil, TableFormatUnspecified,
 			errors.New("sstable with a single suffix should not have value blocks")
-	case r.Properties.ComparerName != o.Comparer.Name:
+	case props.ComparerName != o.Comparer.Name:
 		return nil, TableFormatUnspecified, errors.Errorf("mismatched Comparer %s vs %s, replacement requires same splitter to copy filters",
-			r.Properties.ComparerName, o.Comparer.Name)
-	case o.FilterPolicy != nil && r.Properties.FilterPolicyName != o.FilterPolicy.Name():
-		return nil, TableFormatUnspecified, errors.New("mismatched filters")
+			props.ComparerName, o.Comparer.Name)
+	case o.FilterPolicy != base.NoFilterPolicy && props.FilterPolicyName != o.FilterPolicy.Name():
+		return nil, TableFormatUnspecified, errors.Errorf("mismatched filters %q vs %q", props.FilterPolicyName, o.FilterPolicy.Name())
 	}
 
 	o.TableFormat = r.tableFormat
@@ -140,7 +146,7 @@ func rewriteDataBlocksInParallel(
 	concurrency int,
 	newDataBlockRewriter func() blockRewriter,
 ) ([]blockWithSpan, error) {
-	if r.Properties.NumEntries == 0 {
+	if !r.Attributes.Has(AttributePointKeys) {
 		// No point keys.
 		return nil, nil
 	}
@@ -165,6 +171,8 @@ func rewriteDataBlocksInParallel(
 			// We'll assume all blocks are _roughly_ equal so round-robin static partition
 			// of each worker doing every ith block is probably enough.
 			err := func() error {
+				compressor := block.MakeCompressor(opts.Compression)
+				defer compressor.Close()
 				for i := worker; i < len(input); i += concurrency {
 					bh := input[i]
 					var err error
@@ -185,7 +193,7 @@ func rewriteDataBlocksInParallel(
 						return err
 					}
 					compressedBuf = compressedBuf[:cap(compressedBuf)]
-					finished := block.CompressAndChecksum(&compressedBuf, outputBlock, opts.Compression, &checksummer)
+					finished := block.CompressAndChecksum(&compressedBuf, outputBlock, blockkind.SSTableData, &compressor, &checksummer)
 					output[i].physical = finished.CloneWithByteAlloc(&blockAlloc)
 				}
 				return nil
@@ -270,7 +278,7 @@ func getShortIDs(
 		shortIDs[i] = invalidShortID
 	}
 	for i, p := range collectors {
-		prop, ok := r.Properties.UserProperties[p.Name()]
+		prop, ok := r.UserProperties[p.Name()]
 		if !ok {
 			return nil, 0, errors.Errorf("sstable does not contain property %s", p.Name())
 		}

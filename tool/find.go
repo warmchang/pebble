@@ -14,6 +14,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
@@ -22,7 +23,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/wal"
 	"github.com/spf13/cobra"
 )
@@ -72,8 +72,8 @@ type findT struct {
 	tableRefs map[base.FileNum]bool
 	// Map from file num to table metadata.
 	tableMeta map[base.FileNum]*manifest.TableMetadata
-	// Slice of references to a blob value file.
-	blobRefs manifest.BlobReferences
+	// Blob file mappings.
+	blobMappings *blobFileMappings
 	// List of error messages for SSTables that could not be decoded.
 	errors []string
 }
@@ -139,6 +139,13 @@ func (f *findT) run(cmd *cobra.Command, args []string) {
 		return
 	}
 	f.readManifests(stdout)
+	var err error
+	f.blobMappings, err = newBlobFileMappings(stderr, f.opts.FS, args[0], f.manifests)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s\n", err)
+		return
+	}
+	defer func() { _ = f.blobMappings.Close() }()
 
 	f.opts.Comparer = f.comparers[f.comparerName]
 	if f.opts.Comparer == nil {
@@ -182,7 +189,6 @@ func (f *findT) findFiles(stdout, stderr io.Writer, dir string) error {
 	f.manifests = nil
 	f.tables = nil
 	f.tableMeta = make(map[base.FileNum]*manifest.TableMetadata)
-	f.blobRefs = nil
 
 	if _, err := f.opts.FS.Stat(dir); err != nil {
 		return err
@@ -231,7 +237,6 @@ func (f *findT) findFiles(stdout, stderr io.Writer, dir string) error {
 // Read the manifests and populate the editRefs map which is used to determine
 // the provenance and metadata of tables.
 func (f *findT) readManifests(stdout io.Writer) {
-	blobMetas := make(map[base.DiskFileNum]struct{})
 	for _, fl := range f.manifests {
 		func() {
 			mf, err := f.opts.FS.Open(fl.path)
@@ -286,21 +291,8 @@ func (f *findT) readManifests(stdout io.Writer) {
 						f.tableMeta[nf.Meta.TableNum] = nf.Meta
 					}
 				}
-				for _, bf := range ve.NewBlobFiles {
-					if _, ok := blobMetas[bf.FileNum]; !ok {
-						blobMetas[bf.FileNum] = struct{}{}
-					}
-				}
 			}
 		}()
-	}
-	f.blobRefs = make(manifest.BlobReferences, len(blobMetas))
-	i := 0
-	for fn := range blobMetas {
-		f.blobRefs[i] = manifest.BlobReference{
-			FileNum: fn,
-		}
-		i++
 	}
 
 	if f.verbose {
@@ -476,6 +468,7 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 			}
 			r, err := sstable.NewReader(context.Background(), readable, opts)
 			if err != nil {
+				err = errors.CombineErrors(err, readable.Close())
 				f.errors = append(f.errors, fmt.Sprintf("Unable to decode sstable %s, %s", fl.path, err.Error()))
 				// Ensure the error only gets printed once.
 				err = nil
@@ -493,16 +486,11 @@ func (f *findT) searchTables(stdout io.Writer, searchKey []byte, refs []findRef)
 			var blobContext sstable.TableBlobContext
 			switch ConvertToBlobRefMode(f.blobMode) {
 			case BlobRefModePrint:
+				f.fmtValue.mustSet("[%s]")
 				blobContext = sstable.DebugHandlesBlobContext
 			case BlobRefModeLoad:
-				provider := debugReaderProvider{
-					fs:  f.opts.FS,
-					dir: f.Root.Flags().Arg(0),
-				}
 				f.fmtValue.mustSet("[%s]")
-				var vf *blob.ValueFetcher
-				vf, blobContext = sstable.LoadValBlobContext(&provider, &f.blobRefs)
-				defer func() { _ = vf.Close() }()
+				blobContext = f.blobMappings.LoadValueBlobContext(base.PhysicalTableFileNum(fl.DiskFileNum))
 			default:
 				blobContext = sstable.AssertNoBlobHandles
 			}

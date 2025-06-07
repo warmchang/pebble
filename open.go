@@ -180,12 +180,6 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 					dirname)
 			}
 		}()
-	} else {
-		if opts.Experimental.CreateOnShared != remote.CreateOnSharedNone && formatVersion < FormatMinForSharedObjects {
-			return nil, errors.Newf(
-				"pebble: database %q configured with shared objects but written in too old format major version %d",
-				dirname, formatVersion)
-		}
 	}
 
 	// Find the currently active manifest, if there is one.
@@ -299,21 +293,8 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 
 	jobID := d.newJobIDLocked()
 
-	providerSettings := objstorageprovider.Settings{
-		Logger:              opts.Logger,
-		FS:                  opts.FS,
-		FSDirName:           dirname,
-		FSDirInitialListing: ls,
-		FSCleaner:           opts.Cleaner,
-		NoSyncOnClose:       opts.NoSyncOnClose,
-		BytesPerSync:        opts.BytesPerSync,
-	}
-	providerSettings.Local.ReadaheadConfig = opts.Local.ReadaheadConfig
-	providerSettings.Remote.StorageFactory = opts.Experimental.RemoteStorage
-	providerSettings.Remote.CreateOnShared = opts.Experimental.CreateOnShared
-	providerSettings.Remote.CreateOnSharedLocator = opts.Experimental.CreateOnSharedLocator
-	providerSettings.Remote.CacheSizeBytes = opts.Experimental.SecondaryCacheSizeBytes
-
+	providerSettings := opts.MakeObjStorageProviderSettings(dirname)
+	providerSettings.FSDirInitialListing = ls
 	d.objProvider, err = objstorageprovider.Open(providerSettings)
 	if err != nil {
 		return nil, err
@@ -377,12 +358,17 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 	}
 	if opts.WALFailover != nil {
 		walOpts.Secondary = opts.WALFailover.Secondary
+		walOpts.Secondary.Dirname = resolveStorePath(dirname, walOpts.Secondary.Dirname)
 		walOpts.FailoverOptions = opts.WALFailover.FailoverOptions
 		walOpts.FailoverWriteAndSyncLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 			Buckets: FsyncLatencyBuckets,
 		})
 	}
-	walDirs := append(walOpts.Dirs(), opts.WALRecoveryDirs...)
+	walDirs := walOpts.Dirs()
+	for _, dir := range opts.WALRecoveryDirs {
+		dir.Dirname = resolveStorePath(dirname, dir.Dirname)
+		walDirs = append(walDirs, dir)
+	}
 	wals, err := wal.Scan(walDirs...)
 	if err != nil {
 		return nil, err
@@ -399,7 +385,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 
 	d.mu.log.manager = walManager
 
-	d.cleanupManager = openCleanupManager(opts, d.objProvider, d.onObsoleteTableDelete, d.getDeletionPacerInfo)
+	d.cleanupManager = openCleanupManager(opts, d.objProvider, d.getDeletionPacerInfo)
 
 	if manifestExists && !opts.DisableConsistencyCheck {
 		curVersion := d.mu.versions.currentVersion()
@@ -488,7 +474,7 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := opts.CheckCompatibility(previousOptions); err != nil {
+		if err := opts.CheckCompatibility(dirname, previousOptions); err != nil {
 			return nil, err
 		}
 	}
@@ -663,9 +649,9 @@ func Open(dirname string, opts *Options) (db *DB, err error) {
 func prepareAndOpenDirs(
 	dirname string, opts *Options,
 ) (walDirname string, dataDir vfs.File, err error) {
-	walDirname = opts.WALDir
-	if opts.WALDir == "" {
-		walDirname = dirname
+	walDirname = dirname
+	if opts.WALDir != "" {
+		walDirname = resolveStorePath(dirname, opts.WALDir)
 	}
 
 	// Create directories if needed.
@@ -684,7 +670,7 @@ func prepareAndOpenDirs(
 		}
 		if opts.WALFailover != nil {
 			secondary := opts.WALFailover.Secondary
-			f, err := mkdirAllAndSyncParents(secondary.FS, secondary.Dirname)
+			f, err := mkdirAllAndSyncParents(secondary.FS, resolveStorePath(dirname, secondary.Dirname))
 			if err != nil {
 				return "", nil, err
 			}
@@ -816,7 +802,7 @@ func (d *DB) replayIngestedFlushable(
 		panic("pebble: invalid number of entries in batch")
 	}
 
-	meta := make([]*tableMetadata, len(fileNums))
+	meta := make([]*manifest.TableMetadata, len(fileNums))
 	var lastRangeKey keyspan.Span
 	for i, n := range fileNums {
 		readable, err := d.objProvider.OpenForReading(context.TODO(), base.FileTypeTable, n,

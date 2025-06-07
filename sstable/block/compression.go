@@ -5,8 +5,8 @@
 package block
 
 import (
-	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -17,69 +17,75 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 )
 
-// Compression is the per-block compression algorithm to use.
-type Compression int
+// CompressionProfile contains the parameters for compressing blocks in an
+// sstable or blob file.
+//
+// CompressionProfile is a more advanced successor to Compression.
+type CompressionProfile struct {
+	Name string
 
-// The available compression types.
-const (
-	DefaultCompression Compression = iota
-	NoCompression
-	SnappyCompression
-	ZstdCompression
-	// MinLZCompression is only supported with table formats v6+. Older formats
-	// fall back to snappy.
-	MinLZCompression
-	NCompression
+	// DataBlocks applies to sstable data and value blocks, as well as blob file
+	// value blocks. OtherBlocks applies to all other blocks (such as index,
+	// filter, metadata blocks).
+	//
+	// Some blocks (like rangedel) never use compression; this is at the
+	// discretion of the sstable or blob file writer.
+	//
+	// Note that MinLZ is only supported with table formats v6+. Older formats
+	// fall back to Snappy.
+	DataBlocks  compression.Setting
+	OtherBlocks compression.Setting
+
+	// Blocks that are reduced by less than this percentage are stored
+	// uncompressed.
+	MinReductionPercent uint8
+
+	// TODO(radu): knobs for adaptive compression go here.
+}
+
+var (
+	NoCompression     = simpleCompressionProfile("NoCompression", compression.None)
+	SnappyCompression = simpleCompressionProfile("Snappy", compression.Snappy)
+	ZstdCompression   = simpleCompressionProfile("ZSTD", compression.ZstdLevel3)
+	MinLZCompression  = simpleCompressionProfile("MinLZ", compression.MinLZFastest)
+
+	DefaultCompression = SnappyCompression
 )
 
-var setting = [...]compression.Setting{
-	DefaultCompression: compression.Snappy,
-	NoCompression:      compression.None,
-	SnappyCompression:  compression.Snappy,
-	ZstdCompression:    compression.ZstdLevel3,
-	MinLZCompression:   compression.MinLZFastest,
-}
-
-func (c Compression) setting() compression.Setting {
-	return setting[c]
-}
-
-// String implements fmt.Stringer, returning a human-readable name for the
-// compression algorithm.
-func (c Compression) String() string {
-	switch c {
-	case DefaultCompression:
-		return "Default"
-	case NoCompression:
-		return "NoCompression"
-	case SnappyCompression:
-		return "Snappy"
-	case ZstdCompression:
-		return "ZSTD"
-	case MinLZCompression:
-		return "MinLZ"
-	default:
-		return "Unknown"
+// simpleCompressionProfile returns a CompressionProfile that uses the same
+// compression setting for all blocks and which uses the uncompressed block if
+// compression reduces it by less than 12%. This is similar to older Pebble
+// versions which used Compression.
+//
+// It should only be used during global initialization.
+func simpleCompressionProfile(name string, setting compression.Setting) *CompressionProfile {
+	p := &CompressionProfile{
+		Name:                name,
+		DataBlocks:          setting,
+		OtherBlocks:         setting,
+		MinReductionPercent: 12,
 	}
+	registerCompressionProfile(p)
+	return p
 }
 
-// CompressionFromString returns an sstable.Compression from its
-// string representation. Inverse of c.String() above.
-func CompressionFromString(s string) Compression {
-	switch s {
-	case "Default":
-		return DefaultCompression
-	case "NoCompression":
-		return NoCompression
-	case "Snappy":
-		return SnappyCompression
-	case "ZSTD":
-		return ZstdCompression
-	case "MinLZ":
-		return MinLZCompression
-	default:
-		return DefaultCompression
+// CompressionProfileByName returns the built-in compression profile with the
+// given name, or nil if there is no such profile. It is case-insensitive.
+//
+// The caller must gracefully handle the nil return case as an unknown
+// (user-defined or deprecated) profile.
+func CompressionProfileByName(name string) *CompressionProfile {
+	return compressionProfileMap[strings.ToLower(name)]
+}
+
+var compressionProfileMap = make(map[string]*CompressionProfile)
+
+func registerCompressionProfile(p *CompressionProfile) {
+	key := strings.ToLower(p.Name)
+	if _, ok := compressionProfileMap[key]; ok {
+		panic(errors.AssertionFailedf("duplicate compression profile: %s", p.Name))
 	}
+	compressionProfileMap[key] = p
 }
 
 // CompressionIndicator is the byte stored physically within the block.Trailer
@@ -261,25 +267,10 @@ func (b *PhysicalBlock) WriteTo(w objstorage.Writable) (n int, err error) {
 // the compressed payload is discarded and the original, uncompressed block data
 // is used to avoid unnecessary decompression overhead at read time.
 func CompressAndChecksum(
-	dst *[]byte, blockData []byte, c Compression, checksummer *Checksummer,
-) PhysicalBlock {
-	compressor := GetCompressor(c)
-	defer compressor.Close()
-	return CompressAndChecksumWithCompressor(dst, blockData, compressor, checksummer)
-}
-
-func CompressAndChecksumWithCompressor(
-	dst *[]byte, blockData []byte, compressor Compressor, checksummer *Checksummer,
+	dst *[]byte, blockData []byte, blockKind Kind, compressor *Compressor, checksummer *Checksummer,
 ) PhysicalBlock {
 	buf := (*dst)[:0]
-	// Compress the buffer, discarding the result if the improvement isn't at
-	// least 12.5%.
-	ci, buf := compressor.Compress(buf, blockData)
-	if len(buf) >= len(blockData)-len(blockData)/8 && ci != NoCompressionIndicator {
-		ci = NoCompressionIndicator
-		buf = append(buf[:0], blockData...)
-	}
-
+	ci, buf := compressor.Compress(buf, blockData, blockKind)
 	*dst = buf
 
 	// Calculate the checksum.
@@ -289,177 +280,91 @@ func CompressAndChecksumWithCompressor(
 	return pb
 }
 
-// A Buffer is a buffer for encoding a block. The caller mutates the buffer to
-// construct the uncompressed block, and calls CompressAndChecksum to produce
-// the physical, possibly-compressed PhysicalBlock. A Buffer recycles byte
-// slices used in construction of the uncompressed block and the compressed
-// physical block.
-type Buffer struct {
-	h           *BufHandle
-	compression Compression
-	checksummer Checksummer
-}
-
-// Init configures the BlockBuffer with the specified compression and checksum
-// type.
-func (b *Buffer) Init(compression Compression, checksumType ChecksumType) {
-	b.h = uncompressedBuffers.Get()
-	b.h.b = b.h.b[:0]
-	b.compression = compression
-	b.checksummer.Type = checksumType
-}
-
-// Checksummer returns the Checksummer for the Buffer.
-func (b *Buffer) Checksummer() *Checksummer {
-	return &b.checksummer
-}
-
-// Get returns the byte slice currently backing the Buffer.
-func (b *Buffer) Get() []byte {
-	return b.h.b
-}
-
-// Size returns the current size of the buffer.
-func (b *Buffer) Size() int {
-	return len(b.h.b)
-}
-
-// Append appends the contents of v to the buffer, returning the offset at which
-// it was appended, growing the buffer if necessary.
-func (b *Buffer) Append(v []byte) int {
-	// We may need to grow b.Buffer to accommodate the new value. If necessary,
-	// double the size of the buffer until it's sufficiently large.
-	off := len(b.h.b)
-	newLen := off + len(v)
-	if cap(b.h.b) < newLen {
-		size := max(2*cap(b.h.b), 1024)
-		for size < newLen {
-			size *= 2
-		}
-		b.h.b = slices.Grow(b.h.b, size-len(b.h.b))
-	}
-	b.h.b = b.h.b[:newLen]
-	if n := copy(b.h.b[off:], v); n != len(v) {
-		panic("incorrect length computation")
-	}
-	return off
-}
-
-// Resize resizes the buffer to the specified length, allocating if necessary.
-func (b *Buffer) Resize(length int) {
-	if length > cap(b.h.b) {
-		b.h.b = slices.Grow(b.h.b, length-len(b.h.b))
-	}
-	b.h.b = b.h.b[:length]
-}
-
-// CompressAndChecksum compresses and checksums the block data, returning a
-// PhysicalBlock that is owned by the caller. The returned PhysicalBlock's
-// memory is backed by the returned BufHandle. If non-nil, the returned
-// BufHandle may be Released once the caller is done with the physical block to
-// recycle the block's underlying memory.
-//
-// When CompressAndChecksum returns, the callee has been reset and is ready to
-// be reused.
-func (b *Buffer) CompressAndChecksum() (PhysicalBlock, *BufHandle) {
+// CompressAndChecksumToTempBuffer compresses and checksums the provided block
+// into a TempBuffer. The caller should Release() the TempBuffer once it is no
+// longer necessary.
+func CompressAndChecksumToTempBuffer(
+	blockData []byte, blockKind Kind, compressor *Compressor, checksummer *Checksummer,
+) (PhysicalBlock, *TempBuffer) {
 	// Grab a buffer to use as the destination for compression.
-	compressedBuf := compressedBuffers.Get()
-	pb := CompressAndChecksum(&compressedBuf.b, b.h.b, b.compression, &b.checksummer)
-	b.h.b = b.h.b[:0]
+	compressedBuf := NewTempBuffer()
+	pb := CompressAndChecksum(&compressedBuf.b, blockData, blockKind, compressor, checksummer)
 	return pb, compressedBuf
 }
 
-// SetCompression changes the compression algorithm used by CompressAndChecksum.
-func (b *Buffer) SetCompression(compression Compression) {
-	b.compression = compression
+// TempBuffer is a buffer that is used temporarily and is released back to a
+// pool for reuse.
+type TempBuffer struct {
+	b []byte
 }
 
-// Release may be called when a buffer will no longer be used. It releases to
-// pools any memory held by the Buffer so that it may be reused.
-func (b *Buffer) Release() {
-	if b.h != nil {
-		b.h.Release()
-		b.h = nil
+// NewTempBuffer returns a TempBuffer from the pool. The buffer will have zero
+// size and length and arbitrary capacity.
+func NewTempBuffer() *TempBuffer {
+	tb := tempBufferPool.Get().(*TempBuffer)
+	if invariants.Enabled && len(tb.b) > 0 {
+		panic("NewTempBuffer length not 0")
 	}
+	return tb
 }
 
-// BufHandle is a handle to a buffer that can be released to a pool for reuse.
-type BufHandle struct {
-	pool *bufferSyncPool
-	b    []byte
+// Data returns the byte slice currently backing the Buffer.
+func (tb *TempBuffer) Data() []byte {
+	return tb.b
+}
+
+// Size returns the current size of the buffer.
+func (tb *TempBuffer) Size() int {
+	return len(tb.b)
+}
+
+// Append appends the contents of v to the buffer, growing the buffer if
+// necessary. Returns the offset at which it was appended.
+func (tb *TempBuffer) Append(v []byte) (startOffset int) {
+	startOffset = len(tb.b)
+	tb.b = append(tb.b, v...)
+	return startOffset
+}
+
+// Resize resizes the buffer to the specified length, allocating if necessary.
+// If the length is longer than the current length, the values of the new bytes
+// are arbitrary.
+func (tb *TempBuffer) Resize(length int) {
+	if length > cap(tb.b) {
+		tb.b = slices.Grow(tb.b, length-len(tb.b))
+	}
+	tb.b = tb.b[:length]
+}
+
+// Reset is equivalent to Resize(0).
+func (tb *TempBuffer) Reset() {
+	tb.b = tb.b[:0]
 }
 
 // Release releases the buffer back to the pool for reuse.
-func (h *BufHandle) Release() {
-	if invariants.Enabled && (h.pool == nil) != (h.b == nil) {
-		panic(errors.AssertionFailedf("pool (%t) and buffer (%t) nilness disagree", h.pool == nil, h.b == nil))
-	}
-	if invariants.Enabled && (h.pool != nil && h.pool.Max == 0) {
-		panic(errors.AssertionFailedf("pool has no maximum size"))
-	}
+func (tb *TempBuffer) Release() {
 	// Note we avoid releasing buffers that are larger than the configured
 	// maximum to the pool. This avoids holding on to occasional large buffers
-	// necessary for, for example, singlular large values.
-	if h.b != nil && len(h.b) < h.pool.Max {
-		if invariants.Sometimes(50) {
-			// Set the bytes to a random value. Cap the number of bytes being
-			// randomized to prevent test timeouts.
-			l := min(cap(h.b), 1000)
-			h.b = h.b[:l:l]
-			for j := range h.b {
-				h.b[j] = byte(rand.Uint32())
+	// necessary for e.g. singular large values.
+	if tb.b != nil && len(tb.b) < tempBufferMaxReusedSize {
+		if invariants.Sometimes(20) {
+			// Mangle the buffer data.
+			for i := range tb.b {
+				tb.b[i] = 0xCC
 			}
 		}
-		h.pool.Put(h)
+		tb.b = tb.b[:0]
+		tempBufferPool.Put(tb)
 	}
 }
 
-var (
-	// uncompressedBuffers is a pool of buffers that were used to store
-	// uncompressed block data. These buffers should be sized right around the
-	// configured block size. If multiple Pebble engines are running in the same
-	// process, they all share a pool and the size of the buffers may vary.
-	uncompressedBuffers = bufferSyncPool{Max: 256 << 10, Default: 4 << 10}
-	// compressedBuffers is a pool of buffers that were used to store compressed
-	// block data. These buffers will vary significantly in size depending on
-	// the compressibility of the data.
-	compressedBuffers = bufferSyncPool{Max: 128 << 10, Default: 4 << 10}
-)
-
-// bufferSyncPool is a pool of block buffers for memory re-use.
-type bufferSyncPool struct {
-	Max     int
-	Default int
-	pool    sync.Pool
+// tempBufferPool is a pool of buffers that are used to temporarily hold either
+// compressed or uncompressed block data.
+var tempBufferPool = sync.Pool{
+	New: func() any {
+		return &TempBuffer{b: make([]byte, 0, tempBufferInitialSize)}
+	},
 }
 
-// Put returns a buffer to the pool. While the buffer is in the pool, its pool
-// member is zeroed. This is used to validate invariants around double use of a
-// buffer.
-func (p *bufferSyncPool) Put(bh *BufHandle) {
-	if bh.pool != p {
-		panic(errors.AssertionFailedf("buffer has pool %v; trying to return it to pool %v", bh.pool, p))
-	}
-	bh.pool = nil
-	p.pool.Put(bh)
-}
-
-// Get retrieves a new buf from the pool, or allocates one of the configured
-// default size if the pool is empty.
-func (p *bufferSyncPool) Get() *BufHandle {
-	v := p.pool.Get()
-	if v != nil {
-		bh := v.(*BufHandle)
-		if bh.pool != nil {
-			panic(errors.AssertionFailedf("buffer has a pool; was it inserted into a pool twice?"))
-		}
-		// Set the pool so we know where to return the buffer to.
-		bh.pool = p
-		return bh
-	}
-	if invariants.Enabled && p.Default == 0 {
-		// Guard against accidentally forgetting to initialize a buffer sync pool.
-		panic(errors.AssertionFailedf("buffer pool has no default size"))
-	}
-	return &BufHandle{b: make([]byte, 0, p.Default), pool: p}
-}
+const tempBufferInitialSize = 32 * 1024
+const tempBufferMaxReusedSize = 256 * 1024

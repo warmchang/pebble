@@ -7,9 +7,11 @@ package compressionanalyzer
 import (
 	"context"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/tokenbucket"
 )
@@ -60,7 +62,7 @@ func (fa *FileAnalyzer) SSTable(ctx context.Context, fs vfs.FS, path string) err
 	}
 	r, err := sstable.NewReader(ctx, readable, fa.sstReadOpts)
 	if err != nil {
-		return err
+		return errors.CombineErrors(err, readable.Close())
 	}
 	defer func() { _ = r.Close() }()
 	layout, err := r.Layout()
@@ -71,32 +73,32 @@ func (fa *FileAnalyzer) SSTable(ctx context.Context, fs vfs.FS, path string) err
 	rh := objstorage.MakeNoopReadHandle(readable)
 	br := r.BlockReader()
 
-	block := func(kind BlockKind, handle block.Handle) {
+	block := func(kind block.Kind, handle block.Handle) {
 		if err == nil {
 			err = fa.sstBlock(ctx, &rh, kind, handle, br)
 		}
 	}
 	for i := range layout.Data {
-		block(DataBlock, layout.Data[i].Handle)
+		block(blockkind.SSTableData, layout.Data[i].Handle)
 	}
 	for i := range layout.Index {
-		block(IndexBlock, layout.Index[i])
+		block(blockkind.SSTableIndex, layout.Index[i])
 	}
-	block(IndexBlock, layout.TopIndex)
+	block(blockkind.SSTableIndex, layout.TopIndex)
 	for i := range layout.Filter {
-		block(OtherBlock, layout.Filter[i].Handle)
+		block(blockkind.Filter, layout.Filter[i].Handle)
 	}
-	block(OtherBlock, layout.RangeDel)
-	block(OtherBlock, layout.RangeKey)
+	block(blockkind.RangeDel, layout.RangeDel)
+	block(blockkind.RangeKey, layout.RangeKey)
 	for i := range layout.ValueBlock {
-		block(SSTableValueBlock, layout.ValueBlock[i])
+		block(blockkind.SSTableValue, layout.ValueBlock[i])
 	}
-	block(OtherBlock, layout.ValueIndex)
+	block(blockkind.Metadata, layout.ValueIndex)
 	return err
 }
 
 func (fa *FileAnalyzer) sstBlock(
-	ctx context.Context, rh objstorage.ReadHandle, kind BlockKind, bh block.Handle, r *block.Reader,
+	ctx context.Context, rh objstorage.ReadHandle, kind block.Kind, bh block.Handle, r *block.Reader,
 ) error {
 	if bh.Length == 0 {
 		return nil
@@ -106,7 +108,7 @@ func (fa *FileAnalyzer) sstBlock(
 			return err
 		}
 	}
-	h, err := r.Read(ctx, block.NoReadEnv, rh, bh, func(*block.Metadata, []byte) error { return nil })
+	h, err := r.Read(ctx, block.NoReadEnv, rh, bh, kind, func(*block.Metadata, []byte) error { return nil })
 	if err != nil {
 		return err
 	}

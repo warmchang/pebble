@@ -143,7 +143,9 @@ func runVirtualReaderTest(t *testing.T, path string, blockSize, indexBlockSize i
 		if showProps {
 			fmt.Fprintf(&b, "filenum: %s\n", env.Virtual.FileNum.String())
 			fmt.Fprintf(&b, "props:\n")
-			p := r.Properties.GetScaledProperties(backingSize, tableSize)
+			props, err := r.ReadPropertiesBlock(context.Background(), nil)
+			require.NoError(t, err)
+			p := props.GetScaledProperties(backingSize, tableSize)
 			for _, line := range strings.Split(strings.TrimSpace(p.String()), "\n") {
 				fmt.Fprintf(&b, "  %s\n", line)
 			}
@@ -657,7 +659,7 @@ func indexLayoutString(t *testing.T, r *Reader) string {
 	require.NoError(t, err)
 	defer indexH.Release()
 	var buf strings.Builder
-	twoLevelIndex := r.Properties.IndexType == twoLevelIndex
+	twoLevelIndex := r.Attributes.Has(AttributeTwoLevelIndex)
 	buf.WriteString("index entries:\n")
 	iter := r.tableFormat.newIndexIter()
 	require.NoError(t, iter.Init(r.Comparer, indexH.BlockData(), NoTransforms))
@@ -778,7 +780,7 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, printVa
 				if len(bpfs) > 0 {
 					filterer = newBlockPropertiesFilterer(bpfs, nil, nil)
 					intersects, err :=
-						filterer.intersectsUserPropsAndFinishInit(r.Properties.UserProperties)
+						filterer.intersectsUserPropsAndFinishInit(r.UserProperties)
 					if err != nil {
 						return err.Error()
 					}
@@ -1626,7 +1628,7 @@ func TestValidateBlockChecksums(t *testing.T) {
 		{
 			name: "top index block corruption",
 			files: []string{
-				"h.no-compression.two_level_index.sst",
+				"h-no-compression-two-level-index-sst/000003.sst",
 			},
 			corruptionLocations: []corruptionLocation{
 				corruptionLocationTopIndex,
@@ -1635,9 +1637,9 @@ func TestValidateBlockChecksums(t *testing.T) {
 		{
 			name: "filter block corruption",
 			files: []string{
-				"h.table-bloom.no-compression.prefix_extractor.no_whole_key_filter.sst",
-				"h.table-bloom.no-compression.sst",
-				"h.table-bloom.sst",
+				"h-table-bloom-no-compression-prefix-extractor-no-whole-key-filter-sst/000013.sst",
+				"h-table-bloom-no-compression-sst/000011.sst",
+				"h-table-bloom-sst/000010.sst",
 			},
 			corruptionLocations: []corruptionLocation{
 				corruptionLocationFilter,
@@ -1815,7 +1817,7 @@ func buildTestTableWithProvider(
 	provider objstorage.Provider,
 	numEntries uint64,
 	blockSize, indexBlockSize int,
-	compression block.Compression,
+	compression *block.CompressionProfile,
 	prefix []byte,
 	ch *cache.Handle,
 ) *Reader {
@@ -1896,7 +1898,7 @@ func buildBenchmarkTable(
 	if err != nil {
 		b.Fatal(err)
 	}
-	if confirmTwoLevelIndex && r.Properties.IndexPartitions == 0 {
+	if confirmTwoLevelIndex && !r.Attributes.Has(AttributeTwoLevelIndex) {
 		b.Fatalf("should have constructed two level index")
 	}
 	return r, keys
@@ -2512,7 +2514,7 @@ func BenchmarkIteratorScanObsolete(b *testing.B) {
 									filterer = newBlockPropertiesFilterer(
 										[]BlockPropertyFilter{obsoleteKeyBlockPropertyFilter{}}, nil, nil)
 									intersects, err :=
-										filterer.intersectsUserPropsAndFinishInit(r.Properties.UserProperties)
+										filterer.intersectsUserPropsAndFinishInit(r.UserProperties)
 									if err != nil {
 										b.Fatalf("%s", err.Error())
 									}
@@ -2559,7 +2561,11 @@ func newReader(r ReadableFile, o ReaderOptions) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewReader(context.Background(), readable, o)
+	reader, err := NewReader(context.Background(), readable, o)
+	if err != nil {
+		return nil, errors.CombineErrors(err, readable.Close())
+	}
+	return reader, nil
 }
 
 // TestReaderReportsCorruption tests that the reader reports corruption when

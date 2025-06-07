@@ -51,7 +51,7 @@ func TestLevelIter(t *testing.T) {
 		switch d.Cmd {
 		case "define":
 			iterKVs = nil
-			var metas []*tableMetadata
+			var metas []*manifest.TableMetadata
 			for _, line := range strings.Split(d.Input, "\n") {
 				var kvs []base.InternalKV
 				for _, key := range strings.Fields(line) {
@@ -60,7 +60,7 @@ func TestLevelIter(t *testing.T) {
 				}
 				iterKVs = append(iterKVs, kvs)
 
-				meta := &tableMetadata{
+				meta := &manifest.TableMetadata{
 					TableNum: base.TableNum(len(metas)),
 				}
 				meta.ExtendPointKeyBounds(
@@ -160,7 +160,7 @@ type levelIterTest struct {
 	cmp          base.Comparer
 	mem          vfs.FS
 	readers      []*sstable.Reader
-	metas        []*tableMetadata
+	metas        []*manifest.TableMetadata
 	itersCreated int
 }
 
@@ -300,10 +300,10 @@ func (lt *levelIterTest) runBuild(d *datadriven.TestData) string {
 		},
 	})
 	if err != nil {
-		return err.Error()
+		return errors.CombineErrors(err, readable.Close()).Error()
 	}
 	lt.readers = append(lt.readers, r)
-	m := &tableMetadata{TableNum: tableNum}
+	m := &manifest.TableMetadata{TableNum: tableNum}
 	if meta.HasPointKeys {
 		m.ExtendPointKeyBounds(lt.cmp.Compare, meta.SmallestPoint, meta.LargestPoint)
 	}
@@ -566,7 +566,7 @@ func buildLevelIterTables(
 		}
 		readers[i], err = sstable.NewReader(context.Background(), readable, opts)
 		if err != nil {
-			b.Fatal(err)
+			b.Fatal(errors.CombineErrors(err, readable.Close()))
 		}
 	}
 
@@ -576,12 +576,12 @@ func buildLevelIterTables(
 		}
 	}
 
-	meta := make([]*tableMetadata, len(readers))
+	meta := make([]*manifest.TableMetadata, len(readers))
 	for i := range readers {
 		iter, err := readers[i].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 		require.NoError(b, err)
 		smallest := iter.First()
-		meta[i] = &tableMetadata{}
+		meta[i] = &manifest.TableMetadata{}
 		meta[i].TableNum = base.TableNum(i)
 		largest := iter.Last()
 		meta[i].ExtendPointKeyBounds(opts.Comparer.Compare, smallest.K.Clone(), largest.K.Clone())

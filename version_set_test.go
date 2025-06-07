@@ -67,7 +67,7 @@ func TestVersionSet(t *testing.T) {
 
 	tableMetas := make(map[base.TableNum]*manifest.TableMetadata)
 	backings := make(map[base.DiskFileNum]*manifest.TableBacking)
-	blobMetas := make(map[base.DiskFileNum]*manifest.BlobFileMetadata)
+	blobMetas := make(map[base.BlobFileID]*manifest.PhysicalBlobFile)
 	// When we parse VersionEdits, we get a new TableBacking each time. We need to
 	// deduplicate them, since they hold a ref count.
 	dedupBacking := func(b *manifest.TableBacking) *manifest.TableBacking {
@@ -80,7 +80,7 @@ func TestVersionSet(t *testing.T) {
 		return b
 	}
 
-	refs := make(map[string]*version)
+	refs := make(map[string]*manifest.Version)
 	datadriven.RunTest(t, "testdata/version_set", func(t *testing.T, td *datadriven.TestData) (retVal string) {
 		// createFile only exists to prevent versionSet from complaining that a
 		// file that is becoming a zombie does not exist.
@@ -98,7 +98,7 @@ func TestVersionSet(t *testing.T) {
 				td.Fatalf(t, "%v", err)
 			}
 			for _, bm := range ve.NewBlobFiles {
-				blobMetas[bm.FileNum] = bm
+				blobMetas[base.BlobFileID(bm.FileNum)] = bm
 			}
 			for _, nf := range ve.NewTables {
 				// Set a size that depends on FileNum.
@@ -109,7 +109,7 @@ func TestVersionSet(t *testing.T) {
 					createFile(nf.Meta.TableBacking.DiskFileNum)
 				}
 				for i := range nf.Meta.BlobReferences {
-					nf.Meta.BlobReferences[i].Metadata = blobMetas[nf.Meta.BlobReferences[i].FileNum]
+					nf.Meta.BlobReferences[i].OriginalMetadata = blobMetas[nf.Meta.BlobReferences[i].FileID]
 				}
 			}
 
@@ -121,7 +121,7 @@ func TestVersionSet(t *testing.T) {
 				ve.DeletedTables[de] = m
 			}
 			for num := range ve.DeletedBlobFiles {
-				ve.DeletedBlobFiles[num] = blobMetas[num]
+				ve.DeletedBlobFiles[num] = blobMetas[base.BlobFileID(num)]
 			}
 			for i := range ve.CreatedBackingTables {
 				ve.CreatedBackingTables[i] = dedupBacking(ve.CreatedBackingTables[i])
@@ -199,13 +199,13 @@ func TestVersionSet(t *testing.T) {
 			// Repopulate the maps.
 			tableMetas = make(map[base.TableNum]*manifest.TableMetadata)
 			backings = make(map[base.DiskFileNum]*manifest.TableBacking)
-			blobMetas = make(map[base.DiskFileNum]*manifest.BlobFileMetadata)
+			blobMetas = make(map[base.BlobFileID]*manifest.PhysicalBlobFile)
 			v := vs.currentVersion()
 			for _, l := range v.Levels {
 				for f := range l.All() {
 					tableMetas[f.TableNum] = f
 					for _, b := range f.BlobReferences {
-						blobMetas[b.FileNum] = b.Metadata
+						blobMetas[b.FileID] = b.OriginalMetadata
 					}
 					dedupBacking(f.TableBacking)
 				}
@@ -222,7 +222,7 @@ func TestVersionSet(t *testing.T) {
 			}
 		}
 		buf.WriteString(vs.virtualBackings.String())
-		printObjectBreakdown := func(kind string, zombies zombieObjects, obsolete []objectInfo) {
+		printObjectBreakdown := func(kind string, zombies zombieObjects, obsolete []obsoleteFile) {
 			if zombies.Count() == 0 {
 				buf.WriteString(fmt.Sprintf("no zombie %s\n", kind))
 			} else {
@@ -239,7 +239,7 @@ func TestVersionSet(t *testing.T) {
 			} else {
 				buf.WriteString(fmt.Sprintf("obsolete %s:", kind))
 				for _, fi := range obsolete {
-					fmt.Fprintf(&buf, " %s", fi.FileNum)
+					fmt.Fprintf(&buf, " %s", fi.fileNum)
 				}
 				buf.WriteString("\n")
 			}
@@ -310,17 +310,17 @@ func TestVersionSetSeqNums(t *testing.T) {
 	// observed SeqNum.
 	filenames, err := mem.List("")
 	require.NoError(t, err)
-	var manifest vfs.File
+	var manifestFile vfs.File
 	for _, filename := range filenames {
 		fileType, _, ok := base.ParseFilename(mem, filename)
 		if ok && fileType == base.FileTypeManifest {
-			manifest, err = mem.Open(filename)
+			manifestFile, err = mem.Open(filename)
 			require.NoError(t, err)
 		}
 	}
-	require.NotNil(t, manifest)
-	defer manifest.Close()
-	rr := record.NewReader(manifest, 0 /* logNum */)
+	require.NotNil(t, manifestFile)
+	defer manifestFile.Close()
+	rr := record.NewReader(manifestFile, 0 /* logNum */)
 	var lastSeqNum base.SeqNum
 	for {
 		r, err := rr.Next()
@@ -328,7 +328,7 @@ func TestVersionSetSeqNums(t *testing.T) {
 			break
 		}
 		require.NoError(t, err)
-		var ve versionEdit
+		var ve manifest.VersionEdit
 		err = ve.Decode(r)
 		require.NoError(t, err)
 		if ve.LastSeqNum != 0 {

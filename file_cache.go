@@ -24,11 +24,13 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/valblk"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 )
 
@@ -213,7 +215,9 @@ func (h *fileCacheHandle) openFile(
 	case base.FileTypeTable:
 		r, err := sstable.NewReader(ctx, f, o)
 		if err != nil {
-			return nil, objMeta, err
+			// If opening the sstable reader fails, we're responsible for
+			// closing the objstorage.Readable.
+			return nil, objMeta, errors.CombineErrors(err, f.Close())
 		}
 		return r, objMeta, nil
 	case base.FileTypeBlob:
@@ -221,7 +225,9 @@ func (h *fileCacheHandle) openFile(
 			ReaderOptions: o.ReaderOptions,
 		})
 		if err != nil {
-			return nil, objMeta, err
+			// If opening the blob file reader fails, we're responsible for
+			// closing the objstorage.Readable.
+			return nil, objMeta, errors.CombineErrors(err, f.Close())
 		}
 		return r, objMeta, nil
 	default:
@@ -268,6 +274,11 @@ func (h *fileCacheHandle) findOrCreateBlob(
 
 // Evict the given file from the file cache and the block cache.
 func (h *fileCacheHandle) Evict(fileNum base.DiskFileNum, fileType base.FileType) {
+	defer func() {
+		if p := recover(); p != nil {
+			panic(fmt.Sprintf("pebble: evicting in-use file %s(%s): %v", fileNum, fileType, p))
+		}
+	}()
 	h.fileCache.c.Evict(fileCacheKey{handle: h, fileNum: fileNum, fileType: fileType})
 	h.blockCacheHandle.EvictFile(fileNum)
 }
@@ -302,7 +313,7 @@ func (h *fileCacheHandle) Metrics() (CacheMetrics, FilterMetrics) {
 }
 
 func (h *fileCacheHandle) estimateSize(
-	meta *tableMetadata, lower, upper []byte,
+	meta *manifest.TableMetadata, lower, upper []byte,
 ) (size uint64, err error) {
 	err = h.withReader(context.TODO(), block.NoReadEnv, meta, func(r *sstable.Reader, env sstable.ReadEnv) error {
 		size, err = r.EstimateDiskUsage(lower, upper, env)
@@ -311,7 +322,9 @@ func (h *fileCacheHandle) estimateSize(
 	return size, err
 }
 
-func createReader(v *fileCacheValue, meta *tableMetadata) (*sstable.Reader, sstable.ReadEnv) {
+func createReader(
+	v *fileCacheValue, meta *manifest.TableMetadata,
+) (*sstable.Reader, sstable.ReadEnv) {
 	r := v.mustSSTableReader()
 	env := sstable.ReadEnv{}
 	if meta.Virtual {
@@ -329,7 +342,7 @@ func createReader(v *fileCacheValue, meta *tableMetadata) (*sstable.Reader, ssta
 func (h *fileCacheHandle) withReader(
 	ctx context.Context,
 	blockEnv block.ReadEnv,
-	meta *tableMetadata,
+	meta *manifest.TableMetadata,
 	fn func(*sstable.Reader, sstable.ReadEnv) error,
 ) error {
 	ref, err := h.findOrCreateTable(ctx, meta)
@@ -505,7 +518,7 @@ func checkAndIntersectFilters(
 		filterer, err = sstable.IntersectsTable(
 			blockPropertyFilters,
 			boundLimitedFilter,
-			r.Properties.UserProperties,
+			r.UserProperties,
 			syntheticSuffix,
 		)
 		// NB: IntersectsTable will return a nil filterer if the table-level
@@ -721,6 +734,75 @@ func (h *fileCacheHandle) addReference(v *fileCacheValue) (closeHook func()) {
 	return closeHook
 }
 
+// SetupBlobReaderProvider creates a fileCachHandle blob.ReaderProvider for
+// reading blob files. The caller is responsible for calling the returned cleanup
+// function.
+//
+// NB: This function is intended for testing and tooling purposes only. It
+// provides blob file access outside of normal database operations and is not
+// used by databases opened through Open().
+func SetupBlobReaderProvider(
+	fs vfs.FS, path string, opts *Options, readOpts sstable.ReaderOptions,
+) (blob.ReaderProvider, func(), error) {
+	var fc *FileCache
+	var c *cache.Cache
+	var ch *cache.Handle
+	var objProvider objstorage.Provider
+	var provider *fileCacheHandle
+
+	// Helper to clean up resources in case of error.
+	cleanup := func() {
+		if provider != nil {
+			_ = provider.Close()
+		}
+		if objProvider != nil {
+			_ = objProvider.Close()
+		}
+		if ch != nil {
+			ch.Close()
+		}
+		if c != nil {
+			c.Unref()
+		}
+		if fc != nil {
+			fc.Unref()
+		}
+	}
+
+	fileCacheSize := FileCacheSize(opts.MaxOpenFiles)
+	if opts.FileCache == nil {
+		fc = NewFileCache(opts.Experimental.FileCacheShards, fileCacheSize)
+	} else {
+		fc = opts.FileCache
+		fc.Ref()
+	}
+
+	if opts.Cache == nil {
+		c = cache.New(opts.CacheSize)
+	} else {
+		c = opts.Cache
+		c.Ref()
+	}
+	ch = c.NewHandle()
+
+	var err error
+	objProvider, err = objstorageprovider.Open(objstorageprovider.DefaultSettings(fs, path))
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+
+	provider = fc.newHandle(
+		ch,
+		objProvider,
+		opts.LoggerAndTracer,
+		readOpts,
+		func(any, error) error { return nil },
+	)
+
+	return provider, cleanup, nil
+}
+
 // newRangeDelIter is an internal helper that constructs an iterator over a
 // sstable's range deletions. This function is for table-cache internal use
 // only, and callers should use newIters instead.
@@ -755,7 +837,7 @@ func newRangeDelIter(
 // callers should use newIters instead.
 func newRangeKeyIter(
 	ctx context.Context,
-	file *tableMetadata,
+	file *manifest.TableMetadata,
 	r *sstable.Reader,
 	opts keyspan.SpanIterOptions,
 	internalOpts internalIterOpts,
@@ -861,7 +943,9 @@ func (rp *tableCacheShardReaderProvider) Close() {
 //
 // WARNING! If file is a virtual table, we return the properties of the physical
 // table.
-func (h *fileCacheHandle) getTableProperties(file *tableMetadata) (*sstable.Properties, error) {
+func (h *fileCacheHandle) getTableProperties(
+	file *manifest.TableMetadata,
+) (*sstable.Properties, error) {
 	// Calling findOrCreateTable gives us the responsibility of decrementing v's
 	// refCount here
 	v, err := h.findOrCreateTable(context.TODO(), file)
@@ -871,7 +955,11 @@ func (h *fileCacheHandle) getTableProperties(file *tableMetadata) (*sstable.Prop
 	defer v.Unref()
 
 	r := v.Value().mustSSTableReader()
-	return &r.Properties, nil
+	props, err := r.ReadPropertiesBlock(context.TODO(), nil /* buffer pool */)
+	if err != nil {
+		return nil, err
+	}
+	return &props, nil
 }
 
 type fileCacheValue struct {

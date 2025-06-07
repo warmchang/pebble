@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/pebble/internal/compression"
+	"github.com/cockroachdb/pebble/sstable/block"
 )
 
 // BlockAnalyzer is used to evaluate the performance and compressibility of different
@@ -48,7 +49,7 @@ func (a *BlockAnalyzer) Close() {
 
 // Block analyzes a block by measuring its compressibility and the performance
 // of various compression algorithms on it.
-func (a *BlockAnalyzer) Block(kind BlockKind, block []byte) {
+func (a *BlockAnalyzer) Block(kind block.Kind, block []byte) {
 	size := MakeBlockSize(len(block))
 	compressibility := MakeCompressibility(len(block), len(a.minLZFastest.Compress(a.buf1[:0], block)))
 	bucket := &a.b[kind][size][compressibility]
@@ -88,10 +89,10 @@ func (a *BlockAnalyzer) runExperiment(
 	}
 	decompressionTime := t2.Elapsed()
 
-	// CPU times are in microseconds.
-	pa.CompressionTime.Add(compressionTime.Seconds() * 1e6)
-	pa.DecompressionTime.Add(decompressionTime.Seconds() * 1e6)
-	pa.CompressionRatio.Add(float64(len(block)) / float64(len(compressed)))
+	// CPU times are in nanoseconds / byte.
+	pa.CompressionTime.Add(float64(compressionTime)/float64(len(block)), uint64(len(block)))
+	pa.DecompressionTime.Add(float64(decompressionTime)/float64(len(block)), uint64(len(block)))
+	pa.CompressionRatio.Add(float64(len(block))/float64(len(compressed)), uint64(len(block)))
 }
 
 func ensureLen(b []byte, n int) []byte {

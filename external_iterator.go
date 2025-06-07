@@ -271,7 +271,6 @@ func finishInitializingExternal(ctx context.Context, it *Iterator) error {
 			}
 			if len(rangeKeyIters) > 0 {
 				it.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
-				it.rangeKey.init(it.comparer.Compare, it.comparer.Split, &it.opts)
 				it.rangeKey.rangeKeyIter = it.rangeKey.iterConfig.Init(
 					&it.comparer,
 					base.SeqNumMax,
@@ -308,7 +307,7 @@ func openExternalTables(
 		}
 		r, err := sstable.NewReader(ctx, readable, readerOpts)
 		if err != nil {
-			return readers, err
+			return readers, errors.CombineErrors(err, readable.Close())
 		}
 		if r.Attributes.Has(sstable.AttributeBlobValues) {
 			return readers, errors.Newf("pebble: NewExternalIter does not support blob references")

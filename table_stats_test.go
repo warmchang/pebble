@@ -12,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
@@ -191,7 +193,7 @@ func TestTableStats(t *testing.T) {
 }
 
 func TestTableRangeDeletionIter(t *testing.T) {
-	var m *tableMetadata
+	var m *manifest.TableMetadata
 	cmp := testkeys.Comparer
 	keySchema := colblk.DefaultKeySchema(cmp, 16)
 	fs := vfs.NewMem()
@@ -207,7 +209,7 @@ func TestTableRangeDeletionIter(t *testing.T) {
 				KeySchema:   &keySchema,
 				TableFormat: sstable.TableFormatMax,
 			})
-			m = &tableMetadata{}
+			m = &manifest.TableMetadata{}
 			for _, line := range strings.Split(td.Input, "\n") {
 				err = w.EncodeSpan(keyspan.ParseSpan(line))
 				if err != nil {
@@ -246,10 +248,10 @@ func TestTableRangeDeletionIter(t *testing.T) {
 				KeySchemas: sstable.KeySchemas{keySchema.Name: &keySchema},
 			})
 			if err != nil {
-				return err.Error()
+				return errors.CombineErrors(err, readable.Close()).Error()
 			}
 			defer r.Close()
-			iter, err := newCombinedDeletionKeyspanIter(cmp, r, m, sstable.NoReadEnv)
+			iter, err := newCombinedDeletionKeyspanIter(context.Background(), cmp, r, m, sstable.NoReadEnv)
 			if err != nil {
 				return err.Error()
 			}

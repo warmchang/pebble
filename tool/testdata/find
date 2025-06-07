@@ -148,45 +148,59 @@ eee
     bbb-eee#19,RANGEDEL
 
 find
-testdata/find-db-val-sep
+testdata/find-val-sep-db
 crdb:aaa
 --blob-mode=print
 ----
-000002.log
-    aaa\x00#10,SET [7975756d69]
 000005.sst [aaa\x00#10,SET-ddd\x00#13,SET]
     (flushed to L0)
-    aaa\x00#10,SET [2866302c626c6b305b303a355d29]
+    aaa\x00#10,SET [(f0,blk0,id0,len5)]
 
 find
-testdata/find-db-val-sep
+testdata/find-val-sep-db
+crdb:eee
+--blob-mode=print
+----
+000004.log
+    eee\x00#14,SET [pigeon]
+000008.sst [eee\x00#14,SET-fff\x00#15,SET]
+    (flushed to L0)
+    eee\x00#14,SET [(f0,blk0,id0,len6)]
+
+find
+testdata/find-val-sep-db
 crdb:ddd
 --blob-mode=print
 ----
-000002.log
-    ddd\x00#13,SET [36]
 000005.sst [aaa\x00#10,SET-ddd\x00#13,SET]
     (flushed to L0)
-    ddd\x00#13,SET [36]
+    ddd\x00#13,SET [6]
 
 find
-testdata/find-db-val-sep
+testdata/find-val-sep-db
 crdb:aaa
 --blob-mode=load
 ----
-000002.log
-    aaa\x00#10,SET [yuumi]
 000005.sst [aaa\x00#10,SET-ddd\x00#13,SET]
     (flushed to L0)
     aaa\x00#10,SET [yuumi]
 
 find
-testdata/find-db-val-sep
+testdata/find-val-sep-db
 crdb:ddd
 --blob-mode=load
 ----
-000002.log
-    ddd\x00#13,SET [6]
 000005.sst [aaa\x00#10,SET-ddd\x00#13,SET]
     (flushed to L0)
     ddd\x00#13,SET [6]
+
+find
+testdata/find-val-sep-db
+crdb:eee
+--blob-mode=load
+----
+000004.log
+    eee\x00#14,SET [pigeon]
+000008.sst [eee\x00#14,SET-fff\x00#15,SET]
+    (flushed to L0)
+    eee\x00#14,SET [pigeon]

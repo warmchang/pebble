@@ -9,6 +9,7 @@ package invariants
 import (
 	"fmt"
 	"math/rand/v2"
+	"slices"
 )
 
 // Sometimes returns true percent% of the time if invariants are Enabled (i.e.
@@ -71,6 +72,27 @@ func (v *Value[V]) Get() V {
 	return v.v
 }
 
+// BufMangler is a utility that can be used to test that the caller doesn't use
+type BufMangler struct {
+	lastReturnedBuf []byte
+}
+
+// MaybeMangleLater returns either the given buffer or a copy of it which will
+// be mangled the next time this function is called.
+func (bm *BufMangler) MaybeMangleLater(buf []byte) []byte {
+	if bm.lastReturnedBuf != nil {
+		for i := range bm.lastReturnedBuf {
+			bm.lastReturnedBuf[i] = 0xCC
+		}
+		bm.lastReturnedBuf = nil
+	}
+	if rand.Uint32N(2) == 0 {
+		bm.lastReturnedBuf = slices.Clone(buf)
+		return bm.lastReturnedBuf
+	}
+	return buf
+}
+
 // Set the value; no-op in non-invariant builds.
 func (v *Value[V]) Set(inner V) {
 	v.v = inner
@@ -78,7 +100,7 @@ func (v *Value[V]) Set(inner V) {
 
 // CheckBounds panics if the index is not in the range [0, n). No-op in
 // non-invariant builds.
-func CheckBounds(i int, n int) {
+func CheckBounds[T Integer](i T, n T) {
 	if i < 0 || i >= n {
 		panic(fmt.Sprintf("index %d out of bounds [0, %d)", i, n))
 	}

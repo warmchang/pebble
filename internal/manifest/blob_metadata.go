@@ -7,6 +7,7 @@ package manifest
 import (
 	stdcmp "cmp"
 	"fmt"
+	"iter"
 	"slices"
 	"sync/atomic"
 
@@ -20,10 +21,13 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// A BlobReference describes a sstable's reference to a blob value file.
+// A BlobReference describes a sstable's reference to a blob value file. A
+// BlobReference is immutable.
 type BlobReference struct {
-	// FileNum identifies the referenced blob file.
-	FileNum base.DiskFileNum
+	// FileID identifies the referenced blob file. FileID is stable. If a blob
+	// file is rewritten and a blob reference is preserved during a compaction,
+	// the new sstable's BlobReference will preserve the same FileID.
+	FileID base.BlobFileID
 	// ValueSize is the sum of the lengths of the uncompressed values within the
 	// blob file for which there exists a reference in the sstable. Note that if
 	// any of the referencing tables are virtualized tables, the ValueSize may
@@ -32,12 +36,21 @@ type BlobReference struct {
 	// INVARIANT: ValueSize <= Metadata.ValueSize
 	ValueSize uint64
 
-	// Metadata is the metadata for the blob file. It is non-nil for blob
-	// references contained within active Versions. It is expected to initially
-	// be nil when decoding a version edit as a part of manfiest replay. When
-	// the version edit is accumulated into a bulk version edit, the metadata
-	// is populated.
-	Metadata *BlobFileMetadata
+	// OriginalMetadata is the metadata for the original physical blob file. It
+	// is non-nil for blob references contained within active Versions. It is
+	// expected to initially be nil when decoding a version edit as a part of
+	// manfiest replay. When the version edit is accumulated into a bulk version
+	// edit, the metadata is populated.
+	//
+	// The OriginalMetadata describes the physical blob file that existed when
+	// the reference was originally created. The original physical blob file may
+	// no longer exist. The BlobReference.FileID should be translated using a
+	// Version's BlobFileSet.
+	//
+	// TODO(jackson): We should either remove the OriginalMetadata from the
+	// BlobReference or use it to infer when a blob file has definitely NOT been
+	// replaced and a lookup in Version.BlobFileSet is unnecessary.
+	OriginalMetadata *PhysicalBlobFile
 }
 
 // EstimatedPhysicalSize returns an estimate of the physical size of the blob
@@ -46,28 +59,69 @@ type BlobReference struct {
 // ValueSize of the blob file.
 func (br *BlobReference) EstimatedPhysicalSize() uint64 {
 	if invariants.Enabled {
-		if br.ValueSize > br.Metadata.ValueSize {
+		if br.ValueSize > br.OriginalMetadata.ValueSize {
 			panic(errors.AssertionFailedf("pebble: blob reference value size %d is greater than the blob file's value size %d",
-				br.ValueSize, br.Metadata.ValueSize))
+				br.ValueSize, br.OriginalMetadata.ValueSize))
 		}
 		if br.ValueSize == 0 {
 			panic(errors.AssertionFailedf("pebble: blob reference value size %d is zero", br.ValueSize))
 		}
-		if br.Metadata.ValueSize == 0 {
-			panic(errors.AssertionFailedf("pebble: blob file value size %d is zero", br.Metadata.ValueSize))
+		if br.OriginalMetadata.ValueSize == 0 {
+			panic(errors.AssertionFailedf("pebble: blob file value size %d is zero", br.OriginalMetadata.ValueSize))
 		}
 	}
 	//                         br.ValueSize
-	//   Reference size =  --------------------   ×  br.Metadata.Size
-	//                     br.Metadata.ValueSize
+	//   Reference size =  -----------------------------  ×  br.OriginalMetadata.Size
+	//                     br.OriginalMetadata.ValueSize
 	//
 	// We perform the multiplication first to avoid floating point arithmetic.
-	return (br.ValueSize * br.Metadata.Size) / br.Metadata.ValueSize
+	return (br.ValueSize * br.OriginalMetadata.Size) / br.OriginalMetadata.ValueSize
 }
 
-// BlobFileMetadata is metadata describing a blob value file.
+// BlobFileMetadata encapsulates a blob file ID used to identify a particular
+// blob file, and a reference-counted physical blob file. Different Versions may
+// contain different BlobFileMetadata with the same FileID, but if so they
+// necessarily point to different PhysicalBlobFiles.
+//
+// See the BlobFileSet documentation for more details.
 type BlobFileMetadata struct {
-	// FileNum is the file number.
+	// FileID is a stable identifier for referencing a blob file containing
+	// values. It is the same domain as the BlobReference.FileID. Blob
+	// references use the FileID to look up the physical blob file containing
+	// referenced values.
+	FileID base.BlobFileID
+	// Physical is the metadata for the physical blob file.
+	//
+	// If the blob file has been replaced, Physical.FileNum ≠ FileID. Physical
+	// is always non-nil.
+	Physical *PhysicalBlobFile
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (m BlobFileMetadata) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("%s -> %s", m.FileID, m.Physical)
+}
+
+// String implements fmt.Stringer.
+func (m BlobFileMetadata) String() string {
+	return redact.StringWithoutMarkers(m)
+}
+
+// Ref increments the reference count for the physical blob file.
+func (m BlobFileMetadata) Ref() {
+	m.Physical.ref()
+}
+
+// Unref decrements the reference count for the physical blob file. If the
+// reference count reaches zero, the blob file is added to the provided obsolete
+// files set.
+func (m BlobFileMetadata) Unref(of ObsoleteFilesSet) {
+	m.Physical.unref(of)
+}
+
+// PhysicalBlobFile is metadata describing a physical blob value file.
+type PhysicalBlobFile struct {
+	// FileNum is an ID that uniquely identifies the blob file.
 	FileNum base.DiskFileNum
 	// Size is the size of the file, in bytes.
 	Size uint64
@@ -90,39 +144,64 @@ type BlobFileMetadata struct {
 }
 
 // SafeFormat implements redact.SafeFormatter.
-func (m *BlobFileMetadata) SafeFormat(w redact.SafePrinter, _ rune) {
+func (m *PhysicalBlobFile) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("%s size:[%d (%s)] vals:[%d (%s)]",
 		m.FileNum, redact.Safe(m.Size), humanize.Bytes.Uint64(m.Size),
 		redact.Safe(m.ValueSize), humanize.Bytes.Uint64(m.ValueSize))
 }
 
 // String implements fmt.Stringer.
-func (m *BlobFileMetadata) String() string {
+func (m *PhysicalBlobFile) String() string {
 	return redact.StringWithoutMarkers(m)
 }
 
 // ref increments the reference count for the blob file.
-func (m *BlobFileMetadata) ref() {
+func (m *PhysicalBlobFile) ref() {
 	m.refs.Add(+1)
 }
 
-// unref decrements the reference count for the blob file. It returns the
-// resulting reference count.
-func (m *BlobFileMetadata) unref() int32 {
+// unref decrements the reference count for the blob file. If the reference
+// count reaches zero, the blob file is added to the provided obsolete files
+// set.
+func (m *PhysicalBlobFile) unref(of ObsoleteFilesSet) {
 	refs := m.refs.Add(-1)
 	if refs < 0 {
-		panic(errors.AssertionFailedf("pebble: refs for blob file %d equal to %d", m.FileNum, refs))
+		panic(errors.AssertionFailedf("pebble: refs for blob file %s equal to %d", m.FileNum, refs))
+	} else if refs == 0 {
+		of.AddBlob(m)
 	}
-	return refs
 }
 
 // ParseBlobFileMetadataDebug parses a BlobFileMetadata from its string
 // representation. This function is intended for use in tests. It's the inverse
 // of BlobFileMetadata.String().
+func ParseBlobFileMetadataDebug(s string) (_ BlobFileMetadata, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.CombineErrors(err, errFromPanic(r))
+		}
+	}()
+
+	// Input format:
+	//  000102 -> 000000: size:[206536 (201KiB)], vals:[393256 (384KiB)]
+	p := strparse.MakeParser(debugParserSeparators, s)
+	fileID := base.BlobFileID(p.Int())
+	p.Expect("-")
+	p.Expect(">")
+	physical, err := parsePhysicalBlobFileDebug(&p)
+	if err != nil {
+		return BlobFileMetadata{}, err
+	}
+	return BlobFileMetadata{FileID: fileID, Physical: physical}, nil
+}
+
+// ParsePhysicalBlobFileDebug parses a PhysicalBlobFile from its string
+// representation. This function is intended for use in tests. It's the inverse
+// of PhysicalBlobFile.String().
 //
-// In production code paths, the BlobFileMetadata is serialized in a binary
+// In production code paths, the PhysicalBlobFile is serialized in a binary
 // format within a version edit under the tag tagNewBlobFile.
-func ParseBlobFileMetadataDebug(s string) (_ *BlobFileMetadata, err error) {
+func ParsePhysicalBlobFileDebug(s string) (_ *PhysicalBlobFile, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.CombineErrors(err, errFromPanic(r))
@@ -131,9 +210,13 @@ func ParseBlobFileMetadataDebug(s string) (_ *BlobFileMetadata, err error) {
 
 	// Input format:
 	//  000000: size:[206536 (201KiB)], vals:[393256 (384KiB)]
-	m := &BlobFileMetadata{}
 	p := strparse.MakeParser(debugParserSeparators, s)
-	m.FileNum = base.DiskFileNum(p.FileNum())
+	return parsePhysicalBlobFileDebug(&p)
+}
+
+func parsePhysicalBlobFileDebug(p *strparse.Parser) (*PhysicalBlobFile, error) {
+	m := &PhysicalBlobFile{}
+	m.FileNum = p.DiskFileNum()
 
 	maybeSkipParens := func() {
 		if p.Peek() != "(" {
@@ -209,21 +292,81 @@ type BlobReferences []BlobReference
 // Assert that *BlobReferences implements sstable.BlobReferences.
 var _ sstable.BlobReferences = (*BlobReferences)(nil)
 
-// FileNumByID returns the FileNum for the identified BlobReference.
-func (br *BlobReferences) FileNumByID(i blob.ReferenceID) base.DiskFileNum {
-	return (*br)[i].FileNum
+// BlobFileIDByID returns the BlobFileID for the identified BlobReference.
+func (br *BlobReferences) BlobFileIDByID(i blob.ReferenceID) base.BlobFileID {
+	return (*br)[i].FileID
 }
 
-// IDByFileNum returns the reference ID for the given FileNum. If the file
-// number is not found, the second return value is false. IDByFileNum is linear
-// in the length of the BlobReferences slice.
-func (br *BlobReferences) IDByFileNum(fileNum base.DiskFileNum) (blob.ReferenceID, bool) {
+// IDByBlobFileID returns the reference ID for the given BlobFileID. If the
+// blob file ID is not found, the second return value is false.
+// IDByBlobFileID is linear in the length of the BlobReferences slice.
+func (br *BlobReferences) IDByBlobFileID(fileID base.BlobFileID) (blob.ReferenceID, bool) {
 	for i, ref := range *br {
-		if ref.FileNum == fileNum {
+		if ref.FileID == fileID {
 			return blob.ReferenceID(i), true
 		}
 	}
 	return blob.ReferenceID(len(*br)), false
+}
+
+// BlobFileSet contains a set of blob files that are referenced by a version.
+// It's used to maintain reference counts on blob files still in-use by some
+// referenced version.
+//
+// It's backed by a copy-on-write B-Tree of BlobFileMetadata keyed by FileID. A
+// version edit that adds or deletes m blob files updates m⋅log(n) nodes in the
+// B-Tree.
+//
+// Initially a BlobFileMetadata has a FileID that matches the DiskFileNum of the
+// backing physical blob file. However a blob file may be replaced without
+// replacing the referencing TableMetadatas, which is recorded in the
+// BlobFileSet by replacing the old BlobFileMetadata with a different
+// PhysicalBlobFile.
+type BlobFileSet struct {
+	tree btree[BlobFileMetadata]
+}
+
+// MakeBlobFileSet creates a BlobFileSet from the given blob files.
+func MakeBlobFileSet(entries []BlobFileMetadata) BlobFileSet {
+	return BlobFileSet{tree: makeBTree(btreeCmpBlobFileID, entries)}
+}
+
+// All returns an iterator over all the blob files in the set.
+func (s *BlobFileSet) All() iter.Seq[BlobFileMetadata] {
+	return s.tree.All()
+}
+
+// Count returns the number of blob files in the set.
+func (s *BlobFileSet) Count() int {
+	return s.tree.Count()
+}
+
+// clone returns a copy-on-write clone of the blob file set.
+func (s *BlobFileSet) clone() BlobFileSet {
+	return BlobFileSet{tree: s.tree.Clone()}
+}
+
+// insert inserts a blob file into the set.
+func (s *BlobFileSet) insert(entry BlobFileMetadata) error {
+	return s.tree.Insert(entry)
+}
+
+// remove removes a blob file from the set.
+func (s *BlobFileSet) remove(entry BlobFileMetadata) {
+	// Removing an entry from the B-Tree may decrement file reference counts.
+	// However, the BlobFileSet is copy-on-write. We only mutate the BlobFileSet
+	// while constructing a new version edit. The current Version (to which the
+	// edit will be applied) should maintain a reference. So a call to remove()
+	// should never result in a file's reference count dropping to zero, and we
+	// pass assertNoObsoleteFiles{} to assert such.
+	s.tree.Delete(entry, assertNoObsoleteFiles{})
+}
+
+// release releases the blob file's references. It's called when unreferencing a
+// Version.
+func (s *BlobFileSet) release(of ObsoleteFilesSet) {
+	s.tree.Release(of)
+	s.tree = btree[BlobFileMetadata]{}
 }
 
 // AggregateBlobFileStats records cumulative stats across blob files.
@@ -257,15 +400,16 @@ func (s AggregateBlobFileStats) String() string {
 // the latest Version. CurrentBlobFileSet is not thread-safe. In practice its
 // use is protected by the versionSet logLock.
 type CurrentBlobFileSet struct {
-	// files is a map of blob file numbers to a *currentBlobFile, recording
-	// metadata about the blob file's active references in the latest Version.
-	files map[base.DiskFileNum]*currentBlobFile
+	// files is a map of blob file IDs to *currentBlobFiles, recording metadata
+	// about the blob file's active references in the latest Version.
+	files map[base.BlobFileID]*currentBlobFile
 	// stats records cumulative stats across all blob files in the set.
 	stats AggregateBlobFileStats
 }
 
 type currentBlobFile struct {
-	metadata *BlobFileMetadata
+	// metadata is a copy of the current BlobFileMetadata in the latest Version.
+	metadata BlobFileMetadata
 	// references holds pointers to TableMetadatas that exist in the latest
 	// version and reference this blob file. When the length of references falls
 	// to zero, the blob file is either a zombie file (if BlobFileMetadata.refs
@@ -288,29 +432,29 @@ type currentBlobFile struct {
 // Init initializes the CurrentBlobFileSet with the state of the provided
 // BulkVersionEdit. This is used after replaying a manifest.
 func (s *CurrentBlobFileSet) Init(bve *BulkVersionEdit) {
-	*s = CurrentBlobFileSet{files: make(map[base.DiskFileNum]*currentBlobFile)}
+	*s = CurrentBlobFileSet{files: make(map[base.BlobFileID]*currentBlobFile)}
 	if bve == nil {
 		return
 	}
-	for _, m := range bve.BlobFiles.Added {
-		s.files[m.FileNum] = &currentBlobFile{
-			metadata:   m,
+	for blobFileID, pbf := range bve.BlobFiles.Added {
+		s.files[blobFileID] = &currentBlobFile{
+			metadata:   BlobFileMetadata{FileID: blobFileID, Physical: pbf},
 			references: make(map[*TableMetadata]struct{}),
 		}
 		s.stats.Count++
-		s.stats.PhysicalSize += m.Size
-		s.stats.ValueSize += m.ValueSize
+		s.stats.PhysicalSize += pbf.Size
+		s.stats.ValueSize += pbf.ValueSize
 	}
 	// Record references to blob files from extant tables. Any referenced blob
 	// files should already exist in s.files.
-	for _, levelFiles := range bve.AddedTables {
-		for _, m := range levelFiles {
-			for _, ref := range m.BlobReferences {
-				cbf, ok := s.files[ref.FileNum]
+	for _, levelTables := range bve.AddedTables {
+		for _, table := range levelTables {
+			for _, ref := range table.BlobReferences {
+				cbf, ok := s.files[ref.FileID]
 				if !ok {
-					panic(errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileNum))
+					panic(errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileID))
 				}
-				cbf.references[m] = struct{}{}
+				cbf.references[table] = struct{}{}
 				cbf.referencedValueSize += ref.ValueSize
 				s.stats.ReferencedValueSize += ref.ValueSize
 				s.stats.ReferencesCount++
@@ -326,13 +470,13 @@ func (s *CurrentBlobFileSet) Stats() AggregateBlobFileStats {
 
 // Metadatas returns a slice of all blob file metadata in the set, sorted by
 // file number for determinism.
-func (s *CurrentBlobFileSet) Metadatas() []*BlobFileMetadata {
-	m := make([]*BlobFileMetadata, 0, len(s.files))
+func (s *CurrentBlobFileSet) Metadatas() []BlobFileMetadata {
+	m := make([]BlobFileMetadata, 0, len(s.files))
 	for _, cbf := range s.files {
 		m = append(m, cbf.metadata)
 	}
-	slices.SortFunc(m, func(a, b *BlobFileMetadata) int {
-		return stdcmp.Compare(a.FileNum, b.FileNum)
+	slices.SortFunc(m, func(a, b BlobFileMetadata) int {
+		return stdcmp.Compare(a.FileID, b.FileID)
 	})
 	return m
 }
@@ -344,12 +488,13 @@ func (s *CurrentBlobFileSet) Metadatas() []*BlobFileMetadata {
 func (s *CurrentBlobFileSet) ApplyAndUpdateVersionEdit(ve *VersionEdit) error {
 	// Insert new blob files into the set.
 	for _, nf := range ve.NewBlobFiles {
-		if _, ok := s.files[nf.FileNum]; ok {
+		if _, ok := s.files[base.BlobFileID(nf.FileNum)]; ok {
 			return errors.AssertionFailedf("pebble: new blob file %d already exists", nf.FileNum)
 		}
+		blobFileID := base.BlobFileID(nf.FileNum)
 		cbf := &currentBlobFile{references: make(map[*TableMetadata]struct{})}
-		cbf.metadata = nf
-		s.files[nf.FileNum] = cbf
+		cbf.metadata = BlobFileMetadata{FileID: blobFileID, Physical: nf}
+		s.files[blobFileID] = cbf
 		s.stats.Count++
 		s.stats.PhysicalSize += nf.Size
 		s.stats.ValueSize += nf.ValueSize
@@ -361,9 +506,9 @@ func (s *CurrentBlobFileSet) ApplyAndUpdateVersionEdit(ve *VersionEdit) error {
 	for _, e := range ve.NewTables {
 		newTables[e.Meta.TableNum] = struct{}{}
 		for _, ref := range e.Meta.BlobReferences {
-			cbf, ok := s.files[ref.FileNum]
+			cbf, ok := s.files[ref.FileID]
 			if !ok {
-				return errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileNum)
+				return errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileID)
 			}
 			cbf.references[e.Meta] = struct{}{}
 			cbf.referencedValueSize += ref.ValueSize
@@ -379,18 +524,18 @@ func (s *CurrentBlobFileSet) ApplyAndUpdateVersionEdit(ve *VersionEdit) error {
 	// remove it from the set.
 	for _, meta := range ve.DeletedTables {
 		for _, ref := range meta.BlobReferences {
-			cbf, ok := s.files[ref.FileNum]
+			cbf, ok := s.files[ref.FileID]
 			if !ok {
-				return errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileNum)
+				return errors.AssertionFailedf("pebble: referenced blob file %d not found", ref.FileID)
 			}
 			if invariants.Enabled {
 				if ref.ValueSize > cbf.referencedValueSize {
-					return errors.AssertionFailedf("pebble: referenced value size %d for blob file %d is greater than the referenced value size %d",
-						ref.ValueSize, cbf.metadata.FileNum, cbf.referencedValueSize)
+					return errors.AssertionFailedf("pebble: referenced value size %d for blob file %s is greater than the referenced value size %d",
+						ref.ValueSize, cbf.metadata.FileID, cbf.referencedValueSize)
 				}
 				if _, ok := cbf.references[meta]; !ok {
 					return errors.AssertionFailedf("pebble: deleted table %s's reference to blob file %d not known",
-						meta.TableNum, ref.FileNum)
+						meta.TableNum, ref.FileID)
 				}
 			}
 
@@ -414,16 +559,17 @@ func (s *CurrentBlobFileSet) ApplyAndUpdateVersionEdit(ve *VersionEdit) error {
 			if len(cbf.references) == 0 {
 				if cbf.referencedValueSize != 0 {
 					return errors.AssertionFailedf("pebble: referenced value size %d is non-zero for blob file %s with no refs",
-						cbf.referencedValueSize, cbf.metadata.FileNum)
+						cbf.referencedValueSize, cbf.metadata.FileID)
 				}
 				if ve.DeletedBlobFiles == nil {
-					ve.DeletedBlobFiles = make(map[base.DiskFileNum]*BlobFileMetadata)
+					ve.DeletedBlobFiles = make(map[base.BlobFileID]*PhysicalBlobFile)
 				}
-				ve.DeletedBlobFiles[cbf.metadata.FileNum] = cbf.metadata
+
+				ve.DeletedBlobFiles[cbf.metadata.FileID] = cbf.metadata.Physical
 				s.stats.Count--
-				s.stats.PhysicalSize -= cbf.metadata.Size
-				s.stats.ValueSize -= cbf.metadata.ValueSize
-				delete(s.files, cbf.metadata.FileNum)
+				s.stats.PhysicalSize -= cbf.metadata.Physical.Size
+				s.stats.ValueSize -= cbf.metadata.Physical.ValueSize
+				delete(s.files, cbf.metadata.FileID)
 			}
 		}
 	}

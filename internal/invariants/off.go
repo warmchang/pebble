@@ -50,9 +50,18 @@ func (*Value[V]) Get() V {
 // Set the value; no-op in non-invariant builds.
 func (*Value[V]) Set(v V) {}
 
+// BufMangler is a utility that can be used to test that the caller doesn't use
+type BufMangler struct{}
+
+// MaybeMangleLater returns either the given buffer or a copy of it which will
+// be mangled the next time this function is called.
+func (bm *BufMangler) MaybeMangleLater(buf []byte) []byte {
+	return buf
+}
+
 // CheckBounds panics if the index is not in the range [0, n). No-op in
 // non-invariant builds.
-func CheckBounds(i int, n int) {}
+func CheckBounds[T Integer](i T, n T) {}
 
 // SafeSub returns a - b. If a < b, it panics in invariant builds and returns 0
 // in non-invariant builds.

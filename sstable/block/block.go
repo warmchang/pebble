@@ -25,7 +25,12 @@ import (
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 )
+
+// Kind is a convenience alias.
+type Kind = blockkind.Kind
 
 // Handle is the file offset and length of a block.
 type Handle struct {
@@ -142,6 +147,10 @@ type Checksummer struct {
 	Type         ChecksumType
 	xxHasher     *xxhash.Digest
 	blockTypeBuf [1]byte
+}
+
+func (c *Checksummer) Init(typ ChecksumType) {
+	c.Type = typ
 }
 
 // Checksum computes a checksum over the provided block and block type.
@@ -443,6 +452,7 @@ func (r *Reader) Read(
 	env ReadEnv,
 	readHandle objstorage.ReadHandle,
 	bh Handle,
+	kind Kind,
 	initBlockMetadataFn func(*Metadata, []byte) error,
 ) (handle BufferHandle, _ error) {
 	// The compaction path uses env.BufferPool, and does not coordinate read
@@ -455,7 +465,7 @@ func (r *Reader) Read(
 				return CacheBufferHandle(cv), nil
 			}
 		}
-		value, err := r.doRead(ctx, env, readHandle, bh, initBlockMetadataFn)
+		value, err := r.doRead(ctx, env, readHandle, bh, kind, initBlockMetadataFn)
 		if err != nil {
 			return BufferHandle{}, env.maybeReportCorruption(err)
 		}
@@ -488,7 +498,7 @@ func (r *Reader) Read(
 		return CacheBufferHandle(cv), nil
 	}
 
-	value, err := r.doRead(ctx, env, readHandle, bh, initBlockMetadataFn)
+	value, err := r.doRead(ctx, env, readHandle, bh, kind, initBlockMetadataFn)
 	if err != nil {
 		crh.SetReadError(err)
 		return BufferHandle{}, env.maybeReportCorruption(err)
@@ -515,8 +525,10 @@ func (r *Reader) doRead(
 	env ReadEnv,
 	readHandle objstorage.ReadHandle,
 	bh Handle,
+	kind Kind,
 	initBlockMetadataFn func(*Metadata, []byte) error,
 ) (Value, error) {
+	ctx = objiotracing.WithBlockKind(ctx, kind)
 	// First acquire loadBlockSema, if needed.
 	if sema := r.opts.LoadBlockSema; sema != nil {
 		if err := sema.Acquire(ctx, 1); err != nil {

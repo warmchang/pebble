@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/record"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
 )
@@ -23,14 +24,6 @@ import (
 const numLevels = manifest.NumLevels
 
 const manifestMarkerName = `manifest`
-
-// Provide type aliases for the various manifest structs.
-type bulkVersionEdit = manifest.BulkVersionEdit
-type tableMetadata = manifest.TableMetadata
-type newTableEntry = manifest.NewTableEntry
-type version = manifest.Version
-type versionEdit = manifest.VersionEdit
-type versionList = manifest.VersionList
 
 // versionSet manages a collection of immutable versions, and manages the
 // creation of a new version from the most recent version. A new version is
@@ -65,7 +58,7 @@ type versionSet struct {
 	dynamicBaseLevel bool
 
 	// Mutable fields.
-	versions    versionList
+	versions    manifest.VersionList
 	l0Organizer *manifest.L0Organizer
 	// blobFiles is the set of blob files referenced by the current version.
 	// blobFiles is protected by the manifest logLock (not vs.mu).
@@ -82,8 +75,8 @@ type versionSet struct {
 	// on the creation of every version.
 	obsoleteFn func(manifest.ObsoleteFiles)
 	// obsolete{Tables,Blobs,Manifests,Options} are sorted by file number ascending.
-	obsoleteTables    []objectInfo
-	obsoleteBlobs     []objectInfo
+	obsoleteTables    []obsoleteFile
+	obsoleteBlobs     []obsoleteFile
 	obsoleteManifests []obsoleteFile
 	obsoleteOptions   []obsoleteFile
 
@@ -232,8 +225,8 @@ func (vs *versionSet) load(
 	manifestFilename := opts.FS.PathBase(manifestPath)
 
 	// Read the versionEdits in the manifest file.
-	var bve bulkVersionEdit
-	bve.AllAddedTables = make(map[base.TableNum]*tableMetadata)
+	var bve manifest.BulkVersionEdit
+	bve.AllAddedTables = make(map[base.TableNum]*manifest.TableMetadata)
 	manifestFile, err := vs.fs.Open(manifestPath)
 	if err != nil {
 		return errors.Wrapf(err, "pebble: could not open manifest file %q for DB %q",
@@ -250,7 +243,7 @@ func (vs *versionSet) load(
 			return errors.Wrapf(err, "pebble: error when loading manifest file %q",
 				errors.Safe(manifestFilename))
 		}
-		var ve versionEdit
+		var ve manifest.VersionEdit
 		err = ve.Decode(r)
 		if err != nil {
 			// Break instead of returning an error if the record is corrupted
@@ -508,7 +501,7 @@ func (vs *versionSet) UpdateVersionLocked(updateFn func() (versionUpdate, error)
 	}
 
 	currentVersion := vs.currentVersion()
-	var newVersion *version
+	var newVersion *manifest.Version
 
 	// Generate a new manifest if we don't currently have one, or forceRotation
 	// is true, or the current one is too large.
@@ -619,7 +612,7 @@ func (vs *versionSet) UpdateVersionLocked(updateFn func() (versionUpdate, error)
 			return errors.Wrap(err, "MANIFEST blob files apply and update failed")
 		}
 
-		var bulkEdit bulkVersionEdit
+		var bulkEdit manifest.BulkVersionEdit
 		err := bulkEdit.Accumulate(ve)
 		if err != nil {
 			return errors.Wrap(err, "MANIFEST accumulate failed")
@@ -809,7 +802,7 @@ type fileMetricDelta struct {
 //     match ve.RemovedBackingTables.
 //   - localLiveSizeDelta: the delta in local live bytes.
 func getZombieTablesAndUpdateVirtualBackings(
-	ve *versionEdit, virtualBackings *manifest.VirtualBackings, provider objstorage.Provider,
+	ve *manifest.VersionEdit, virtualBackings *manifest.VirtualBackings, provider objstorage.Provider,
 ) (zombieBackings, removedVirtualBackings []tableBackingInfo, localLiveDelta fileMetricDelta) {
 	// First, deal with the physical tables.
 	//
@@ -902,7 +895,7 @@ func getZombieTablesAndUpdateVirtualBackings(
 // zombie blob files, and computes the metric deltas for live files overall and
 // locally.
 func getZombieBlobFilesAndComputeLocalMetrics(
-	ve *versionEdit, provider objstorage.Provider,
+	ve *manifest.VersionEdit, provider objstorage.Provider,
 ) (zombieBlobFiles []objectInfo, localLiveDelta fileMetricDelta) {
 	for _, b := range ve.NewBlobFiles {
 		if objstorage.IsLocalBlobFile(provider, b.FileNum) {
@@ -911,16 +904,16 @@ func getZombieBlobFilesAndComputeLocalMetrics(
 		}
 	}
 	zombieBlobFiles = make([]objectInfo, 0, len(ve.DeletedBlobFiles))
-	for _, b := range ve.DeletedBlobFiles {
-		isLocal := objstorage.IsLocalBlobFile(provider, b.FileNum)
+	for _, physical := range ve.DeletedBlobFiles {
+		isLocal := objstorage.IsLocalBlobFile(provider, physical.FileNum)
 		if isLocal {
 			localLiveDelta.count--
-			localLiveDelta.size -= int64(b.Size)
+			localLiveDelta.size -= int64(physical.Size)
 		}
 		zombieBlobFiles = append(zombieBlobFiles, objectInfo{
 			fileInfo: fileInfo{
-				FileNum:  b.FileNum,
-				FileSize: b.Size,
+				FileNum:  physical.FileNum,
+				FileSize: physical.Size,
 			},
 			isLocal: isLocal,
 		})
@@ -1043,12 +1036,17 @@ func (vs *versionSet) createManifest(
 		MinUnflushedLogNum:   minUnflushedLogNum,
 		NextFileNum:          nextFileNum,
 		CreatedBackingTables: virtualBackings,
-		NewBlobFiles:         vs.blobFiles.Metadatas(),
 	}
+	blobFileMetadatas := vs.blobFiles.Metadatas()
+	snapshot.NewBlobFiles = make([]*manifest.PhysicalBlobFile, len(blobFileMetadatas))
+	for i, m := range blobFileMetadatas {
+		snapshot.NewBlobFiles[i] = m.Physical
+	}
+
 	// Add all extant sstables in the current version.
 	for level, levelMetadata := range vs.currentVersion().Levels {
 		for meta := range levelMetadata.All() {
-			snapshot.NewTables = append(snapshot.NewTables, newTableEntry{
+			snapshot.NewTables = append(snapshot.NewTables, manifest.NewTableEntry{
 				Level: level,
 				Meta:  meta,
 			})
@@ -1103,7 +1101,7 @@ func (vs *versionSet) getNextDiskFileNum() base.DiskFileNum {
 	return base.DiskFileNum(x)
 }
 
-func (vs *versionSet) append(v *version) {
+func (vs *versionSet) append(v *manifest.Version) {
 	if v.Refs() != 0 {
 		panic("pebble: version should be unreferenced")
 	}
@@ -1128,7 +1126,7 @@ func (vs *versionSet) append(v *version) {
 	}
 }
 
-func (vs *versionSet) currentVersion() *version {
+func (vs *versionSet) currentVersion() *manifest.Version {
 	return vs.versions.Back()
 }
 
@@ -1139,7 +1137,10 @@ func (vs *versionSet) addLiveFileNums(m map[base.DiskFileNum]struct{}) {
 			for f := range lm.All() {
 				m[f.TableBacking.DiskFileNum] = struct{}{}
 				for _, ref := range f.BlobReferences {
-					m[ref.FileNum] = struct{}{}
+					// TODO(jackson): Once we support blob file replacement, we
+					// need to look up the new blob file's number here.
+					diskFileNum := blob.DiskFileNumTODO(ref.FileID)
+					m[diskFileNum] = struct{}{}
 				}
 			}
 		}
@@ -1171,17 +1172,19 @@ func (vs *versionSet) addObsoleteLocked(obsolete manifest.ObsoleteFiles) {
 	// Note that the zombie objects transition from zombie *to* obsolete, and
 	// will no longer be considered zombie.
 
-	newlyObsoleteTables := make([]objectInfo, len(obsolete.TableBackings))
+	newlyObsoleteTables := make([]obsoleteFile, len(obsolete.TableBackings))
 	for i, bs := range obsolete.TableBackings {
-		newlyObsoleteTables[i] = vs.zombieTables.Extract(bs.DiskFileNum)
+		newlyObsoleteTables[i] = vs.zombieTables.Extract(bs.DiskFileNum).
+			asObsoleteFile(vs.fs, base.FileTypeTable, vs.dirname)
 	}
-	vs.obsoleteTables = mergeObjectInfos(vs.obsoleteTables, newlyObsoleteTables)
+	vs.obsoleteTables = mergeObsoleteFiles(vs.obsoleteTables, newlyObsoleteTables)
 
-	newlyObsoleteBlobFiles := make([]objectInfo, len(obsolete.BlobFiles))
+	newlyObsoleteBlobFiles := make([]obsoleteFile, len(obsolete.BlobFiles))
 	for i, bf := range obsolete.BlobFiles {
-		newlyObsoleteBlobFiles[i] = vs.zombieBlobs.Extract(bf.FileNum)
+		newlyObsoleteBlobFiles[i] = vs.zombieBlobs.Extract(bf.FileNum).
+			asObsoleteFile(vs.fs, base.FileTypeBlob, vs.dirname)
 	}
-	vs.obsoleteBlobs = mergeObjectInfos(vs.obsoleteBlobs, newlyObsoleteBlobFiles)
+	vs.obsoleteBlobs = mergeObsoleteFiles(vs.obsoleteBlobs, newlyObsoleteBlobFiles)
 	vs.updateObsoleteObjectMetricsLocked()
 }
 
@@ -1194,14 +1197,19 @@ func (vs *versionSet) addObsolete(obsolete manifest.ObsoleteFiles) {
 }
 
 func (vs *versionSet) updateObsoleteObjectMetricsLocked() {
+	// TODO(jackson): Ideally we would update vs.fileDeletions.queuedStats to
+	// include the files on vs.obsolete{Tables,Blobs}, but there's subtlety in
+	// deduplicating the files before computing the stats. It might also be
+	// possible to refactor to remove the vs.obsolete{Tables,Blobs} intermediary
+	// step. Revisit this.
 	vs.metrics.Table.ObsoleteCount = int64(len(vs.obsoleteTables))
 	vs.metrics.Table.ObsoleteSize = 0
 	vs.metrics.Table.Local.ObsoleteSize = 0
 	vs.metrics.Table.Local.ObsoleteCount = 0
 	for _, fi := range vs.obsoleteTables {
-		vs.metrics.Table.ObsoleteSize += fi.FileSize
+		vs.metrics.Table.ObsoleteSize += fi.fileSize
 		if fi.isLocal {
-			vs.metrics.Table.Local.ObsoleteSize += fi.FileSize
+			vs.metrics.Table.Local.ObsoleteSize += fi.fileSize
 			vs.metrics.Table.Local.ObsoleteCount++
 		}
 	}
@@ -1210,9 +1218,9 @@ func (vs *versionSet) updateObsoleteObjectMetricsLocked() {
 	vs.metrics.BlobFiles.Local.ObsoleteSize = 0
 	vs.metrics.BlobFiles.Local.ObsoleteCount = 0
 	for _, fi := range vs.obsoleteBlobs {
-		vs.metrics.BlobFiles.ObsoleteSize += fi.FileSize
+		vs.metrics.BlobFiles.ObsoleteSize += fi.fileSize
 		if fi.isLocal {
-			vs.metrics.BlobFiles.Local.ObsoleteSize += fi.FileSize
+			vs.metrics.BlobFiles.Local.ObsoleteSize += fi.fileSize
 			vs.metrics.BlobFiles.Local.ObsoleteCount++
 		}
 	}

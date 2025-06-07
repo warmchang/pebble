@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/compression"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/colblk"
@@ -84,9 +85,6 @@ func MakeKeySchemas(keySchemas ...*colblk.KeySchema) KeySchemas {
 type ReaderOptions struct {
 	block.ReaderOptions
 
-	// User properties specified in this map will not be added to sst.Properties.UserProperties.
-	DeniedUserProperties map[string]struct{}
-
 	// Comparer defines a total ordering over the space of []byte keys: a 'less
 	// than' relationship. The same comparison algorithm must be used for reads
 	// and writes over the lifetime of the DB.
@@ -121,9 +119,6 @@ func (o ReaderOptions) ensureDefaults() ReaderOptions {
 	}
 	if o.LoggerAndTracer == nil {
 		o.LoggerAndTracer = base.NoopLoggerAndTracer{}
-	}
-	if o.DeniedUserProperties == nil {
-		o.DeniedUserProperties = ignoredInternalProperties
 	}
 	if o.KeySchemas == nil {
 		o.KeySchemas = defaultKeySchemas
@@ -171,8 +166,8 @@ type WriterOptions struct {
 
 	// Compression defines the per-block compression to use.
 	//
-	// The default value (DefaultCompression) uses snappy compression.
-	Compression block.Compression
+	// The default value uses snappy compression.
+	Compression *block.CompressionProfile
 
 	// FilterPolicy defines a filter algorithm (such as a Bloom filter) that can
 	// reduce disk reads for Get calls.
@@ -180,7 +175,7 @@ type WriterOptions struct {
 	// One such implementation is bloom.FilterPolicy(10) from the pebble/bloom
 	// package.
 	//
-	// The default value means to use no filter.
+	// The default value is NoFilterPolicy.
 	FilterPolicy FilterPolicy
 
 	// FilterType defines whether an existing filter policy is applied at a
@@ -350,9 +345,22 @@ func (o WriterOptions) ensureDefaults() WriterOptions {
 		s := colblk.DefaultKeySchema(o.Comparer, 16 /* bundle size */)
 		o.KeySchema = &s
 	}
-	if o.Compression <= block.DefaultCompression || o.Compression >= block.NCompression ||
-		(o.Compression == block.MinLZCompression && o.TableFormat < TableFormatPebblev6) {
+	if o.Compression == nil || !tableFormatSupportsCompressionProfile(o.TableFormat, o.Compression) {
 		o.Compression = block.SnappyCompression
 	}
+	if o.FilterPolicy == nil {
+		o.FilterPolicy = base.NoFilterPolicy
+	}
 	return o
+}
+
+func tableFormatSupportsCompressionProfile(tf TableFormat, profile *block.CompressionProfile) bool {
+	if tf < TableFormatPebblev6 {
+		// MinLZ is only supported in TableFormatPebblev6 and higher.
+		if profile.DataBlocks.Algorithm == compression.MinLZ ||
+			profile.OtherBlocks.Algorithm == compression.MinLZ {
+			return false
+		}
+	}
+	return true
 }

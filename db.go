@@ -453,10 +453,16 @@ type DB struct {
 			noOngoingFlushStartTime crtime.Mono
 		}
 
-		// Non-zero when file cleaning is disabled. The disabled count acts as a
-		// reference count to prohibit file cleaning. See
-		// DB.{disable,Enable}FileDeletions().
-		disableFileDeletions int
+		fileDeletions struct {
+			// Non-zero when file cleaning is disableCount. The disableCount
+			// count acts as a reference count to prohibit file cleaning. See
+			// DB.{disable,enable}FileDeletions().
+			disableCount int
+			// queuedStats holds cumulative stats for files that have been
+			// queued for deletion by the cleanup manager. These stats are
+			// monotonically increasing for the *DB's lifetime.
+			queuedStats obsoleteObjectStats
+		}
 
 		snapshots struct {
 			// The list of active snapshots.
@@ -493,7 +499,7 @@ type DB struct {
 			// pending is a slice of metadata for sstables waiting to be
 			// validated. Only physical sstables should be added to the pending
 			// queue.
-			pending []newTableEntry
+			pending []manifest.NewTableEntry
 			// validating is set to true when validation is running.
 			validating bool
 		}
@@ -1027,7 +1033,7 @@ var iterAllocPool = sync.Pool{
 //     Only `seqNum` and `readState` are set.
 type snapshotIterOpts struct {
 	seqNum    base.SeqNum
-	vers      *version
+	vers      *manifest.Version
 	readState *readState
 }
 
@@ -1209,7 +1215,6 @@ func finishInitializingIter(ctx context.Context, buf *iterAlloc) *Iterator {
 			}
 			if dbi.rangeKey == nil {
 				dbi.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
-				dbi.rangeKey.init(dbi.comparer.Compare, dbi.comparer.Split, &dbi.opts)
 				dbi.constructRangeKeyIter()
 			} else {
 				dbi.rangeKey.iterConfig.SetBounds(dbi.opts.LowerBound, dbi.opts.UpperBound)
@@ -1347,6 +1352,8 @@ func (d *DB) newInternalIter(
 		seqNum:          seqNum,
 		mergingIter:     &buf.merging,
 	}
+	dbi.blobValueFetcher.Init(d.fileCache, block.ReadEnv{})
+
 	dbi.opts = *o
 	dbi.opts.logger = d.opts.Logger
 	if d.opts.private.disableLazyCombinedIteration {
@@ -1392,7 +1399,6 @@ func finishInitializingInternalIter(
 	// For internal iterators, we skip the lazy combined iteration optimization
 	// entirely, and create the range key iterator stack directly.
 	i.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
-	i.rangeKey.init(i.comparer.Compare, i.comparer.Split, &i.opts.IterOptions)
 	if err := i.constructRangeKeyIter(); err != nil {
 		return nil, err
 	}
@@ -1450,7 +1456,7 @@ func (i *Iterator) constructPointIter(
 		numMergingLevels++
 	}
 
-	var current *version
+	var current *manifest.Version
 	if !i.batchOnlyIter {
 		numMergingLevels += len(memtables)
 
@@ -1791,6 +1797,8 @@ func (d *DB) Close() error {
 		err = firstError(err, errors.Errorf("non-zero zombie blob count: %d", zblobs))
 	}
 
+	err = firstError(err, d.fileCache.Close())
+
 	err = firstError(err, d.objProvider.Close())
 
 	// If the options include a closer to 'close' the filesystem, close it.
@@ -1802,8 +1810,6 @@ func (d *DB) Close() error {
 	if v := d.mu.snapshots.count(); v > 0 {
 		err = firstError(err, errors.Errorf("leaked snapshots: %d open snapshots on DB %p", v, d))
 	}
-
-	err = firstError(err, d.fileCache.Close())
 
 	return err
 }
@@ -2055,6 +2061,7 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 func (d *DB) Metrics() *Metrics {
 	metrics := &Metrics{}
 	walStats := d.mu.log.manager.Stats()
+	completedObsoleteFileStats := d.cleanupManager.CompletedStats()
 
 	d.mu.Lock()
 	vers := d.mu.versions.currentVersion()
@@ -2114,6 +2121,30 @@ func (d *DB) Metrics() *Metrics {
 	metrics.Table.ZombieCount = int64(d.mu.versions.zombieTables.Count())
 	metrics.Table.ZombieSize = d.mu.versions.zombieTables.TotalSize()
 	metrics.Table.Local.ZombieCount, metrics.Table.Local.ZombieSize = d.mu.versions.zombieTables.LocalStats()
+
+	// The obsolete blob/table metrics have a subtle calculation:
+	//
+	// (A) The vs.metrics.{Table,BlobFiles}.[Local.]{ObsoleteCount,ObsoleteSize}
+	// fields reflect the set of files currently sitting in
+	// vs.obsolete{Tables,Blobs} but not yet enqueued to the cleanup manager.
+	//
+	// (B) The d.mu.fileDeletions.queuedStats field holds the set of files that have
+	// been queued for deletion by the cleanup manager.
+	//
+	// (C) The cleanup manager also maintains cumulative stats for the set of
+	// files that have been deleted.
+	//
+	// The value of currently pending obsolete files is (A) + (B) - (C).
+	pendingObsoleteFileStats := d.mu.fileDeletions.queuedStats
+	pendingObsoleteFileStats.Sub(completedObsoleteFileStats)
+	metrics.Table.Local.ObsoleteCount += pendingObsoleteFileStats.tablesLocal.count
+	metrics.Table.Local.ObsoleteSize += pendingObsoleteFileStats.tablesLocal.size
+	metrics.Table.ObsoleteCount += int64(pendingObsoleteFileStats.tablesAll.count)
+	metrics.Table.ObsoleteSize += pendingObsoleteFileStats.tablesAll.size
+	metrics.BlobFiles.Local.ObsoleteCount += pendingObsoleteFileStats.blobFilesLocal.count
+	metrics.BlobFiles.Local.ObsoleteSize += pendingObsoleteFileStats.blobFilesLocal.size
+	metrics.BlobFiles.ObsoleteCount += pendingObsoleteFileStats.blobFilesAll.count
+	metrics.BlobFiles.ObsoleteSize += pendingObsoleteFileStats.blobFilesAll.size
 	metrics.private.optionsFileSize = d.optionsFileSize
 
 	// TODO(jackson): Consider making these metrics optional.
@@ -2382,16 +2413,18 @@ func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
 // storage size of files that meet some criteria defined by filter. When
 // applicable, this includes both the sstable size and the size of any
 // referenced blob files.
-func (d *DB) makeFileSizeAnnotator(filter func(f *tableMetadata) bool) *manifest.Annotator[uint64] {
+func (d *DB) makeFileSizeAnnotator(
+	filter func(f *manifest.TableMetadata) bool,
+) *manifest.Annotator[uint64] {
 	return &manifest.Annotator[uint64]{
 		Aggregator: manifest.SumAggregator{
-			AccumulateFunc: func(f *tableMetadata) (uint64, bool) {
+			AccumulateFunc: func(f *manifest.TableMetadata) (uint64, bool) {
 				if filter(f) {
 					return f.Size + f.EstimatedReferenceSize(), true
 				}
 				return 0, true
 			},
-			AccumulatePartialOverlapFunc: func(f *tableMetadata, bounds base.UserKeyBounds) uint64 {
+			AccumulatePartialOverlapFunc: func(f *manifest.TableMetadata, bounds base.UserKeyBounds) uint64 {
 				if filter(f) {
 					overlappingFileSize, err := d.fileCache.estimateSize(f, bounds.Start, bounds.End.Key)
 					if err != nil {
@@ -3032,7 +3065,7 @@ func (d *DB) ObjProvider() objstorage.Provider {
 	return d.objProvider
 }
 
-func (d *DB) checkVirtualBounds(m *tableMetadata) {
+func (d *DB) checkVirtualBounds(m *manifest.TableMetadata) {
 	if !invariants.Enabled {
 		return
 	}
