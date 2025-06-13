@@ -7,6 +7,7 @@ package metamorphic
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -66,6 +67,10 @@ func parseOptions(
 			return pebble.KeySchema{}, errors.Newf("unknown key schema %q", name)
 		},
 		SkipUnknown: func(name, value string) bool {
+			if strings.EqualFold(value, "false") {
+				// TODO(radu): audit all settings and use ParseBool wherever necessary.
+				panic(fmt.Sprintf("%s: boolean options can only be set to true", name))
+			}
 			switch name {
 			case "TestOptions":
 				return true
@@ -124,14 +129,12 @@ func parseOptions(
 				return true
 			case "TestOptions.shared_storage_enabled":
 				opts.sharedStorageEnabled = true
-				opts.sharedStorageFS = remote.NewInMem()
 				if opts.Opts.Experimental.CreateOnShared == remote.CreateOnSharedNone {
 					opts.Opts.Experimental.CreateOnShared = remote.CreateOnSharedAll
 				}
 				return true
 			case "TestOptions.external_storage_enabled":
 				opts.externalStorageEnabled = true
-				opts.externalStorageFS = remote.NewInMem()
 				return true
 			case "TestOptions.secondary_cache_enabled":
 				opts.secondaryCacheEnabled = true
@@ -166,6 +169,7 @@ func parseOptions(
 				opts.ioLatencySeed = v
 				return true
 			case "TestOptions.ingest_split":
+				// TODO(radu): this should be on by default.
 				opts.ingestSplit = true
 				opts.Opts.Experimental.IngestSplit = func() bool {
 					return true
@@ -178,6 +182,7 @@ func parseOptions(
 				opts.useExternalReplicate = true
 				return true
 			case "TestOptions.use_excise":
+				// TODO(radu): this should be on by default.
 				opts.useExcise = true
 				return true
 			case "TestOptions.use_delete_only_compaction_excises":
@@ -191,19 +196,6 @@ func parseOptions(
 				return true
 			case "TestOptions.use_jemalloc_size_classes":
 				opts.Opts.AllocatorSizeClasses = pebble.JemallocSizeClasses
-				return true
-			case "TestOptions.disable_value_separation":
-				v, err := strconv.ParseBool(value)
-				if err != nil {
-					panic(err)
-				}
-				if v {
-					opts.Opts.Experimental.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
-						return pebble.ValueSeparationPolicy{
-							Enabled: false,
-						}
-					}
-				}
 				return true
 			default:
 				if customOptionParsers == nil {
@@ -226,7 +218,6 @@ func parseOptions(
 	if opts.Opts.WALFailover != nil {
 		opts.Opts.WALFailover.Secondary.FS = opts.Opts.FS
 	}
-	opts.InitRemoteStorageFactory()
 	opts.Opts.EnsureDefaults()
 	return err
 }
@@ -336,16 +327,15 @@ func defaultOptions(kf KeyFormat) *pebble.Options {
 		// Use an archive cleaner to ease post-mortem debugging.
 		Cleaner: base.ArchiveCleaner{},
 		// Always use our custom comparer which provides a Split method.
-		Comparer:           kf.Comparer,
-		KeySchema:          kf.KeySchema.Name,
-		KeySchemas:         sstable.MakeKeySchemas(kf.KeySchema),
-		FS:                 vfs.NewMem(),
-		FormatMajorVersion: defaultFormatMajorVersion,
-		Levels: []pebble.LevelOptions{{
-			FilterPolicy: bloom.FilterPolicy(10),
-		}},
+		Comparer:                kf.Comparer,
+		KeySchema:               kf.KeySchema.Name,
+		KeySchemas:              sstable.MakeKeySchemas(kf.KeySchema),
+		FS:                      vfs.NewMem(),
+		FormatMajorVersion:      defaultFormatMajorVersion,
 		BlockPropertyCollectors: kf.BlockPropertyCollectors,
 	}
+	opts.Levels[0].FilterPolicy = bloom.FilterPolicy(10)
+	opts.Experimental.IngestSplit = func() bool { return false }
 	opts.Experimental.EnableColumnarBlocks = func() bool { return true }
 
 	opts.Experimental.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
@@ -435,10 +425,8 @@ type TestOptions struct {
 	asyncApplyToDB bool
 	// Enable the use of shared storage.
 	sharedStorageEnabled bool
-	sharedStorageFS      remote.Storage
 	// Enable the use of shared storage for external file ingestion.
 	externalStorageEnabled bool
-	externalStorageFS      remote.Storage
 	// Enables the use of shared replication in TestOptions.
 	useSharedReplicate bool
 	// Enables the use of external replication in TestOptions.
@@ -471,20 +459,6 @@ type TestOptions struct {
 	useDeleteOnlyCompactionExcises bool
 	// disableDownloads, if true, makes downloadOp a no-op.
 	disableDownloads bool
-}
-
-// InitRemoteStorageFactory initializes Opts.Experimental.RemoteStorage.
-func (testOpts *TestOptions) InitRemoteStorageFactory() {
-	if testOpts.sharedStorageEnabled || testOpts.externalStorageEnabled {
-		m := make(map[remote.Locator]remote.Storage)
-		if testOpts.sharedStorageEnabled {
-			m[""] = testOpts.sharedStorageFS
-		}
-		if testOpts.externalStorageEnabled {
-			m["external"] = testOpts.externalStorageFS
-		}
-		testOpts.Opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(m)
-	}
 }
 
 // CustomOption defines a custom option that configures the behavior of an
@@ -558,7 +532,7 @@ func standardOptions(kf KeyFormat) []*TestOptions {
 `,
 		10: `
 [Options]
-  wal_dir=data/wal
+  wal_dir={store_path}/wal
 `,
 		11: `
 [Level "0"]
@@ -632,7 +606,6 @@ func standardOptions(kf KeyFormat) []*TestOptions {
   format_major_version=%s
 [TestOptions]
   shared_storage_enabled=true
-  secondary_cache_enabled=true
 `, pebble.FormatMinForSharedObjects),
 		27: fmt.Sprintf(`
 [Options]
@@ -647,11 +620,10 @@ func standardOptions(kf KeyFormat) []*TestOptions {
 [TestOptions]
   shared_storage_enabled=true
   external_storage_enabled=true
-  secondary_cache_enabled=false
 `, pebble.FormatSyntheticPrefixSuffix),
 		29: `
-[TestOptions]
-  disable_value_separation=true
+[Value Separation]
+enabled = false
 `,
 	}
 
@@ -738,7 +710,7 @@ func RandomOptions(
 	opts.MemTableSize = 2 << (10 + uint(rng.IntN(16))) // 2KB - 256MB
 	opts.MemTableStopWritesThreshold = 2 + rng.IntN(5) // 2 - 5
 	if rng.IntN(2) == 0 {
-		opts.WALDir = "data/wal"
+		opts.WALDir = pebble.MakeStoreRelativePath(opts.FS, "wal")
 	}
 
 	// Half the time enable WAL failover.
@@ -761,7 +733,7 @@ func RandomOptions(
 		// must not exceed 119x the probe interval.
 		healthyInterval := scaleDuration(probeInterval, 1.0, 119.0)
 		opts.WALFailover = &pebble.WALFailoverOptions{
-			Secondary: wal.Dir{FS: vfs.Default, Dirname: "data/wal_secondary"},
+			Secondary: wal.Dir{FS: vfs.Default, Dirname: pebble.MakeStoreRelativePath(vfs.Default, "wal_secondary")},
 			FailoverOptions: wal.FailoverOptions{
 				PrimaryDirProbeInterval:      probeInterval,
 				HealthyProbeLatencyThreshold: healthyThreshold,
@@ -819,23 +791,24 @@ func RandomOptions(
 	opts.Filters = nil
 	switch rng.IntN(3) {
 	case 0:
-		lopts.FilterPolicy = nil
+		lopts.FilterPolicy = pebble.NoFilterPolicy
 	case 1:
 		lopts.FilterPolicy = bloom.FilterPolicy(10)
 	default:
 		lopts.FilterPolicy = newTestingFilterPolicy(1 << rng.IntN(5))
 	}
 
-	// We use either no compression, snappy compression or zstd compression.
-	switch rng.IntN(3) {
+	switch rng.IntN(4) {
 	case 0:
-		lopts.Compression = func() block.Compression { return pebble.NoCompression }
+		lopts.Compression = func() *block.CompressionProfile { return pebble.NoCompression }
 	case 1:
-		lopts.Compression = func() block.Compression { return pebble.ZstdCompression }
+		lopts.Compression = func() *block.CompressionProfile { return pebble.ZstdCompression }
+	case 2:
+		lopts.Compression = func() *block.CompressionProfile { return pebble.SnappyCompression }
 	default:
-		lopts.Compression = func() block.Compression { return pebble.SnappyCompression }
+		lopts.Compression = func() *block.CompressionProfile { return pebble.MinLZCompression }
 	}
-	opts.Levels = []pebble.LevelOptions{lopts}
+	opts.Levels[0] = lopts
 
 	// Explicitly disable disk-backed FS's for the random configurations. The
 	// single standard test configuration that uses a disk-backed FS is
@@ -883,15 +856,14 @@ func RandomOptions(
 		if testOpts.Opts.FormatMajorVersion < pebble.FormatMinForSharedObjects {
 			testOpts.Opts.FormatMajorVersion = pebble.FormatMinForSharedObjects
 		}
-		testOpts.sharedStorageFS = remote.NewInMem()
 		// If shared storage is enabled, pick between writing all files on shared
 		// vs. lower levels only, 50% of the time.
 		testOpts.Opts.Experimental.CreateOnShared = remote.CreateOnSharedAll
 		if rng.IntN(2) == 0 {
 			testOpts.Opts.Experimental.CreateOnShared = remote.CreateOnSharedLower
 		}
-		// If shared storage is enabled, enable secondary cache 50% of the time.
-		if rng.IntN(2) == 0 {
+		// If shared storage is enabled, enable secondary cache 20% of the time.
+		if rng.IntN(100) < 20 {
 			testOpts.secondaryCacheEnabled = true
 			// TODO(josh): Randomize various secondary cache settings.
 			testOpts.Opts.Experimental.SecondaryCacheSizeBytes = 1024 * 1024 * 32 // 32 MBs
@@ -906,11 +878,18 @@ func RandomOptions(
 		if testOpts.Opts.FormatMajorVersion < pebble.FormatSyntheticPrefixSuffix {
 			testOpts.Opts.FormatMajorVersion = pebble.FormatSyntheticPrefixSuffix
 		}
-		testOpts.externalStorageFS = remote.NewInMem()
 	}
 
-	// 75% of the time, randomize value separation parameters.
-	if rng.IntN(4) > 0 {
+	// Value separation:
+	//  - 25% of the time (n = 0), use default value separation parameters;
+	//  - 25% of the time (n = 1), disable value separation;
+	//  - 50% of the time (n = 2,3), enable value separation and randomize parameters.
+	if n := rng.IntN(4); n == 1 {
+		// 25% of the time, disable value separation.
+		opts.Experimental.ValueSeparationPolicy = func() pebble.ValueSeparationPolicy {
+			return pebble.ValueSeparationPolicy{Enabled: false}
+		}
+	} else if n > 1 {
 		if testOpts.Opts.FormatMajorVersion < pebble.FormatExperimentalValueSeparation {
 			testOpts.Opts.FormatMajorVersion = pebble.FormatExperimentalValueSeparation
 		}
@@ -939,7 +918,6 @@ func RandomOptions(
 		return testOpts.useDeleteOnlyCompactionExcises
 	}
 	testOpts.disableDownloads = rng.IntN(2) == 0
-	testOpts.InitRemoteStorageFactory()
 	testOpts.Opts.EnsureDefaults()
 	return testOpts
 }
@@ -949,10 +927,12 @@ func expRandDuration(rng *rand.Rand, meanDur, maxDur time.Duration) time.Duratio
 }
 
 func setupInitialState(dataDir string, testOpts *TestOptions) error {
+	fs := testOpts.Opts.FS
+
 	// Copy (vfs.Default,<initialStatePath>/data) to (testOpts.opts.FS,<dataDir>).
 	ok, err := vfs.Clone(
 		vfs.Default,
-		testOpts.Opts.FS,
+		fs,
 		vfs.Default.PathJoin(testOpts.initialStatePath, "data"),
 		dataDir,
 		vfs.CloneSync,
@@ -968,35 +948,86 @@ func setupInitialState(dataDir string, testOpts *TestOptions) error {
 		return os.ErrNotExist
 	}
 
-	// Tests with wal_dir set store their WALs in a `wal` directory. The source
-	// database (initialStatePath) could've had wal_dir set, or the current test
-	// options (testOpts) could have wal_dir set, or both.
-	//
-	// If the test opts are not configured to use a WAL dir, we add the WAL dir
-	// as a 'WAL recovery dir' so that we'll read any WALs in the directory in
-	// Open.
-	walRecoveryPath := testOpts.Opts.FS.PathJoin(dataDir, "wal")
-	if testOpts.Opts.WALDir != "" {
-		// If the test opts are configured to use a WAL dir, we add the data
-		// directory itself as a 'WAL recovery dir' so that we'll read any WALs if
-		// the previous test was writing them to the data directory.
-		walRecoveryPath = dataDir
+	// Find the previous OPTIONS file.
+	ls, err := fs.List(dataDir)
+	if err != nil {
+		return err
 	}
-	testOpts.Opts.WALRecoveryDirs = append(testOpts.Opts.WALRecoveryDirs, wal.Dir{
-		FS:      testOpts.Opts.FS,
-		Dirname: walRecoveryPath,
-	})
 
-	// If the failover dir exists and the test opts are not configured to use
-	// WAL failover, add the failover directory as a 'WAL recovery dir' in case
-	// the previous test was configured to use failover.
-	failoverDir := testOpts.Opts.FS.PathJoin(dataDir, "wal_secondary")
-	if _, err := testOpts.Opts.FS.Stat(failoverDir); err == nil && testOpts.Opts.WALFailover == nil {
+	var lastOptionsNum base.DiskFileNum
+	var lastOptionsFilename string
+
+	for _, filename := range ls {
+		ft, fn, ok := base.ParseFilename(fs, filename)
+		if ok && ft == base.FileTypeOptions && fn > lastOptionsNum {
+			lastOptionsNum = fn
+			lastOptionsFilename = filename
+		}
+	}
+
+	if lastOptionsFilename == "" {
+		return errors.Errorf("could not find any OPTIONS file in %s/data", testOpts.initialStatePath)
+	}
+
+	f, err := fs.Open(fs.PathJoin(dataDir, lastOptionsFilename))
+	if err != nil {
+		return err
+	}
+	data, err := io.ReadAll(f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	var opts pebble.Options
+	if err := opts.Parse(string(data), nil /* hooks */); err != nil {
+		return errors.Wrapf(err, "failed to parse %s/%s", dataDir, lastOptionsFilename)
+	}
+
+	// WALDir must be either empty or `{store_path}/wal`.
+	expectedWALDir := pebble.MakeStoreRelativePath(fs, "wal")
+	if opts.WALDir != "" && opts.WALDir != expectedWALDir {
+		return errors.Errorf("unexpected wal_dir value in initial store: %q", opts.WALDir)
+	}
+	if testOpts.Opts.WALDir != "" && testOpts.Opts.WALDir != expectedWALDir {
+		return errors.Errorf("unexpected wal_dir value in test optons: %q", testOpts.Opts.WALDir)
+	}
+
+	if opts.WALDir == "" && testOpts.Opts.WALDir != "" {
+		// The previous test did not use a WAL dir but this test does. Add the
+		// store path as a WAL recovery dir.
 		testOpts.Opts.WALRecoveryDirs = append(testOpts.Opts.WALRecoveryDirs, wal.Dir{
-			FS:      testOpts.Opts.FS,
-			Dirname: failoverDir,
+			FS:      fs,
+			Dirname: pebble.MakeStoreRelativePath(fs, ""),
+		})
+	} else if opts.WALDir != "" && testOpts.Opts.WALDir == "" {
+		// The previous test used a WAL dir but this test does not. Add the
+		// previous WAL dir as a WAL recovery dir.
+		testOpts.Opts.WALRecoveryDirs = append(testOpts.Opts.WALRecoveryDirs, wal.Dir{
+			FS:      fs,
+			Dirname: opts.WALDir,
 		})
 	}
+
+	// WAL secondary must be `{store_path}/wal_secondary` if WAL failover is enabled.
+	expectedSecondaryDir := pebble.MakeStoreRelativePath(fs, "wal_secondary")
+	if wf := opts.WALFailover; wf != nil && wf.Secondary.Dirname != expectedSecondaryDir {
+		return errors.Errorf("unexpected wal_secondary value in initial store: %q", wf.Secondary.Dirname)
+	}
+	if wf := testOpts.Opts.WALFailover; wf != nil && wf.Secondary.Dirname != expectedSecondaryDir {
+		return errors.Errorf("unexpected wal_secondary value in test options: %q", wf.Secondary.Dirname)
+	}
+
+	if opts.WALFailover != nil && testOpts.Opts.WALFailover == nil {
+		// The previous test used WAL failover but this test does not. Add the
+		// previous secondary directory as a WAL recovery dir.
+		testOpts.Opts.WALRecoveryDirs = append(testOpts.Opts.WALRecoveryDirs, wal.Dir{
+			FS:      testOpts.Opts.FS,
+			Dirname: opts.WALFailover.Secondary.Dirname,
+		})
+	}
+	// If the previous test did not use WAL failover but this test does, we don't
+	// need to add any recovery dir.
 	return nil
 }
 
@@ -1029,7 +1060,7 @@ func (t *testingFilterPolicy) Name() string {
 func filterPolicyFromName(name string) (pebble.FilterPolicy, error) {
 	switch name {
 	case "none":
-		return nil, nil
+		return base.NoFilterPolicy, nil
 	case "rocksdb.BuiltinBloomFilter":
 		return bloom.FilterPolicy(10), nil
 	}

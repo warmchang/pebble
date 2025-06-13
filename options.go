@@ -41,18 +41,18 @@ const (
 	defaultLevelMultiplier = 10
 )
 
-// Compression exports the base.Compression type.
-type Compression = block.Compression
+type CompressionProfile = block.CompressionProfile
 
 // Exported Compression constants.
-const (
+var (
 	DefaultCompression = block.DefaultCompression
 	NoCompression      = block.NoCompression
 	SnappyCompression  = block.SnappyCompression
 	ZstdCompression    = block.ZstdCompression
 	// MinLZCompression is only supported with table formats v6+. Older formats
 	// fall back to snappy.
-	MinLZCompression = block.MinLZCompression
+	MinLZCompression   = block.MinLZCompression
+	FastestCompression = block.FastestCompression
 )
 
 // FilterType exports the base.FilterType type.
@@ -68,6 +68,8 @@ type FilterWriter = base.FilterWriter
 
 // FilterPolicy exports the base.FilterPolicy type.
 type FilterPolicy = base.FilterPolicy
+
+var NoFilterPolicy = base.NoFilterPolicy
 
 // KeySchema exports the colblk.KeySchema type.
 type KeySchema = colblk.KeySchema
@@ -395,25 +397,29 @@ type LevelOptions struct {
 	// BlockRestartInterval is the number of keys between restart points
 	// for delta encoding of keys.
 	//
-	// The default value is 16.
+	// The default value is 16 for L0, and the value from the previous level for
+	// all other levels.
 	BlockRestartInterval int
 
 	// BlockSize is the target uncompressed size in bytes of each table block.
 	//
-	// The default value is 4096.
+	// The default value is 4096 for L0, and the value from the previous level for
+	// all other levels.
 	BlockSize int
 
 	// BlockSizeThreshold finishes a block if the block size is larger than the
 	// specified percentage of the target block size and adding the next entry
 	// would cause the block to be larger than the target block size.
 	//
-	// The default value is 90
+	// The default value is 90 for L0, and the value from the previous level for
+	// all other levels.
 	BlockSizeThreshold int
 
 	// Compression defines the per-block compression to use.
 	//
-	// The default value (DefaultCompression) uses snappy compression.
-	Compression func() Compression
+	// The default value is Snappy for L0, or the function from the previous level
+	// for all other levels.
+	Compression func() *CompressionProfile
 
 	// FilterPolicy defines a filter algorithm (such as a Bloom filter) that can
 	// reduce disk reads for Get calls.
@@ -421,16 +427,12 @@ type LevelOptions struct {
 	// One such implementation is bloom.FilterPolicy(10) from the pebble/bloom
 	// package.
 	//
-	// The default value means to use no filter.
+	// The default value for L0 is NoFilterPolicy (no filter), and the value from
+	// the previous level for all other levels.
 	FilterPolicy FilterPolicy
 
-	// FilterType defines whether an existing filter policy is applied at a
-	// block-level or table-level. Block-level filters use less memory to create,
-	// but are slower to access as a check for the key in the index must first be
-	// performed to locate the filter block. A table-level filter will require
-	// memory proportional to the number of keys in an sstable to create, but
-	// avoids the index lookup when determining if a key is present. Table-level
-	// filters should be preferred except under constrained memory situations.
+	// FilterType is a legacy field. The default and only possible value is
+	// TableFilter.
 	FilterType FilterType
 
 	// IndexBlockSize is the target uncompressed size in bytes of each index
@@ -439,17 +441,20 @@ type LevelOptions struct {
 	// (such as math.MaxInt32) disables the automatic creation of two-level
 	// indexes.
 	//
-	// The default value is the value of BlockSize.
+	// The default value is the value of BlockSize for L0, or the value from the
+	// previous level for all other levels.
 	IndexBlockSize int
 
 	// The target file size for the level.
+	//
+	// The default value is 2MB for L0, and double the value for the previous
+	// level for all other levels.
 	TargetFileSize int64
 }
 
-// EnsureDefaults ensures that the default values for all of the options have
-// been initialized. It is valid to call EnsureDefaults on a nil receiver. A
-// non-nil result will always be returned.
-func (o *LevelOptions) EnsureDefaults() {
+// EnsureL0Defaults ensures that the L0 default values for the options have been
+// initialized.
+func (o *LevelOptions) EnsureL0Defaults() {
 	if o.BlockRestartInterval <= 0 {
 		o.BlockRestartInterval = base.DefaultBlockRestartInterval
 	}
@@ -462,13 +467,44 @@ func (o *LevelOptions) EnsureDefaults() {
 		o.BlockSizeThreshold = base.DefaultBlockSizeThreshold
 	}
 	if o.Compression == nil {
-		o.Compression = func() Compression { return DefaultCompression }
+		o.Compression = func() *CompressionProfile { return SnappyCompression }
+	}
+	if o.FilterPolicy == nil {
+		o.FilterPolicy = NoFilterPolicy
 	}
 	if o.IndexBlockSize <= 0 {
 		o.IndexBlockSize = o.BlockSize
 	}
 	if o.TargetFileSize <= 0 {
 		o.TargetFileSize = 2 << 20 // 2 MB
+	}
+}
+
+// EnsureL1PlusDefaults ensures that the L1+ default values for the options have
+// been initialized. Requires the fully initialized options for the level above.
+func (o *LevelOptions) EnsureL1PlusDefaults(previousLevel *LevelOptions) {
+	if o.BlockRestartInterval <= 0 {
+		o.BlockRestartInterval = previousLevel.BlockRestartInterval
+	}
+	if o.BlockSize <= 0 {
+		o.BlockSize = previousLevel.BlockSize
+	} else if o.BlockSize > sstable.MaximumRestartOffset {
+		panic(errors.Errorf("BlockSize %d exceeds MaximumRestartOffset", o.BlockSize))
+	}
+	if o.BlockSizeThreshold <= 0 {
+		o.BlockSizeThreshold = previousLevel.BlockSizeThreshold
+	}
+	if o.Compression == nil {
+		o.Compression = previousLevel.Compression
+	}
+	if o.FilterPolicy == nil {
+		o.FilterPolicy = previousLevel.FilterPolicy
+	}
+	if o.IndexBlockSize <= 0 {
+		o.IndexBlockSize = previousLevel.IndexBlockSize
+	}
+	if o.TargetFileSize <= 0 {
+		o.TargetFileSize = previousLevel.TargetFileSize * 2
 	}
 }
 
@@ -838,9 +874,8 @@ type Options struct {
 	// maximum number of bytes for a level is exceeded, compaction is requested.
 	LBaseMaxBytes int64
 
-	// Per-level options. Options for at least one level must be specified. The
-	// options for the last level are used for all subsequent levels.
-	Levels []LevelOptions
+	// Per-level options.
+	Levels [manifest.NumLevels]LevelOptions
 
 	// LoggerAndTracer will be used, if non-nil, else Logger will be used and
 	// tracing will be a noop.
@@ -1322,21 +1357,9 @@ func (o *Options) EnsureDefaults() {
 	if o.LBaseMaxBytes <= 0 {
 		o.LBaseMaxBytes = 64 << 20 // 64 MB
 	}
-	if o.Levels == nil {
-		o.Levels = make([]LevelOptions, 1)
-		for i := range o.Levels {
-			if i > 0 {
-				l := &o.Levels[i]
-				if l.TargetFileSize <= 0 {
-					l.TargetFileSize = o.Levels[i-1].TargetFileSize * 2
-				}
-			}
-			o.Levels[i].EnsureDefaults()
-		}
-	} else {
-		for i := range o.Levels {
-			o.Levels[i].EnsureDefaults()
-		}
+	o.Levels[0].EnsureL0Defaults()
+	for i := 1; i < len(o.Levels); i++ {
+		o.Levels[i].EnsureL1PlusDefaults(&o.Levels[i-1])
 	}
 	if o.Logger == nil {
 		o.Logger = DefaultLogger
@@ -1454,7 +1477,7 @@ func (o *Options) AddEventListener(l EventListener) {
 func (o *Options) initMaps() {
 	for i := range o.Levels {
 		l := &o.Levels[i]
-		if l.FilterPolicy != nil {
+		if l.FilterPolicy != NoFilterPolicy {
 			if o.Filters == nil {
 				o.Filters = make(map[string]FilterPolicy)
 			}
@@ -1466,19 +1489,6 @@ func (o *Options) initMaps() {
 	}
 }
 
-// Level returns the LevelOptions for the specified level.
-func (o *Options) Level(level int) LevelOptions {
-	if level < len(o.Levels) {
-		return o.Levels[level]
-	}
-	n := len(o.Levels) - 1
-	l := o.Levels[n]
-	for i := n; i < level; i++ {
-		l.TargetFileSize *= 2
-	}
-	return l
-}
-
 // Clone creates a shallow-copy of the supplied options.
 func (o *Options) Clone() *Options {
 	n := &Options{}
@@ -1486,13 +1496,6 @@ func (o *Options) Clone() *Options {
 		*n = *o
 	}
 	return n
-}
-
-func filterPolicyName(p FilterPolicy) string {
-	if p == nil {
-		return "none"
-	}
-	return p.Name()
 }
 
 func (o *Options) String() string {
@@ -1611,8 +1614,8 @@ func (o *Options) String() string {
 		fmt.Fprintf(&buf, "  block_restart_interval=%d\n", l.BlockRestartInterval)
 		fmt.Fprintf(&buf, "  block_size=%d\n", l.BlockSize)
 		fmt.Fprintf(&buf, "  block_size_threshold=%d\n", l.BlockSizeThreshold)
-		fmt.Fprintf(&buf, "  compression=%s\n", resolveDefaultCompression(l.Compression()))
-		fmt.Fprintf(&buf, "  filter_policy=%s\n", filterPolicyName(l.FilterPolicy))
+		fmt.Fprintf(&buf, "  compression=%s\n", l.Compression().Name)
+		fmt.Fprintf(&buf, "  filter_policy=%s\n", l.FilterPolicy.Name())
 		fmt.Fprintf(&buf, "  filter_type=%s\n", l.FilterType)
 		fmt.Fprintf(&buf, "  index_block_size=%d\n", l.IndexBlockSize)
 		fmt.Fprintf(&buf, "  target_file_size=%d\n", l.TargetFileSize)
@@ -2070,11 +2073,6 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			}
 			index, _ := strconv.Atoi(m[1])
 
-			if len(o.Levels) <= index {
-				newLevels := make([]LevelOptions, index+1)
-				copy(newLevels, o.Levels)
-				o.Levels = newLevels
-			}
 			l := &o.Levels[index]
 
 			var err error
@@ -2086,23 +2084,16 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "block_size_threshold":
 				l.BlockSizeThreshold, err = strconv.Atoi(value)
 			case "compression":
-				switch value {
-				case "Default":
-					l.Compression = func() Compression { return DefaultCompression }
-				case "NoCompression":
-					l.Compression = func() Compression { return NoCompression }
-				case "Snappy":
-					l.Compression = func() Compression { return SnappyCompression }
-				case "ZSTD":
-					l.Compression = func() Compression { return ZstdCompression }
-				case "MinLZ":
-					l.Compression = func() Compression { return MinLZCompression }
-				default:
+				profile := block.CompressionProfileByName(value)
+				if profile == nil {
 					return errors.Errorf("pebble: unknown compression: %q", errors.Safe(value))
 				}
+				l.Compression = func() *CompressionProfile { return profile }
 			case "filter_policy":
 				if hooks != nil && hooks.NewFilterPolicy != nil {
 					l.FilterPolicy, err = hooks.NewFilterPolicy(value)
+				} else {
+					l.FilterPolicy = NoFilterPolicy
 				}
 			case "filter_type":
 				switch value {
@@ -2126,7 +2117,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 		if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 			return nil
 		}
-		return errors.Errorf("pebble: unknown section: %q", errors.Safe(section))
+		return errors.Errorf("pebble: unknown section %q or key %q", errors.Safe(section), errors.Safe(key))
 	}
 	err := parseOptions(s, parseOptionsFuncs{
 		visitKeyValue: visitKeyValue,
@@ -2159,12 +2150,13 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 // opened without supplying a Options.WALRecoveryDir entry for a directory that
 // may contain WALs required to recover a consistent database state.
 type ErrMissingWALRecoveryDir struct {
-	Dir string
+	Dir       string
+	ExtraInfo string
 }
 
 // Error implements error.
 func (e ErrMissingWALRecoveryDir) Error() string {
-	return fmt.Sprintf("directory %q may contain relevant WALs", e.Dir)
+	return fmt.Sprintf("directory %q may contain relevant WALs but is not in WALRecoveryDirs%s", e.Dir, e.ExtraInfo)
 }
 
 // CheckCompatibility verifies the options are compatible with the previous options
@@ -2173,7 +2165,9 @@ func (e ErrMissingWALRecoveryDir) Error() string {
 //
 // This function only looks at specific keys and does not error out if the
 // options are newer and contain unknown keys.
-func (o *Options) CheckCompatibility(previousOptions string) error {
+func (o *Options) CheckCompatibility(storeDir string, previousOptions string) error {
+	previousWALDir := ""
+
 	visitKeyValue := func(i, j int, section, key, value string) error {
 		switch section + "." + key {
 		case "Options.comparer":
@@ -2188,24 +2182,65 @@ func (o *Options) CheckCompatibility(previousOptions string) error {
 				return errors.Errorf("pebble: merger name from file %q != merger name from options %q",
 					errors.Safe(value), errors.Safe(o.Merger.Name))
 			}
-		case "Options.wal_dir", "WAL Failover.secondary_dir":
-			switch {
-			case o.WALDir == value:
-				return nil
-			case o.WALFailover != nil && o.WALFailover.Secondary.Dirname == value:
-				return nil
-			default:
-				for _, d := range o.WALRecoveryDirs {
-					if d.Dirname == value {
-						return nil
-					}
-				}
-				return ErrMissingWALRecoveryDir{Dir: value}
+		case "Options.wal_dir":
+			previousWALDir = value
+		case "WAL Failover.secondary_dir":
+			previousWALSecondaryDir := value
+			if err := o.checkWALDir(storeDir, previousWALSecondaryDir, "WALFailover.Secondary changed from previous options"); err != nil {
+				return err
 			}
 		}
 		return nil
 	}
-	return parseOptions(previousOptions, parseOptionsFuncs{visitKeyValue: visitKeyValue})
+	if err := parseOptions(previousOptions, parseOptionsFuncs{visitKeyValue: visitKeyValue}); err != nil {
+		return err
+	}
+	if err := o.checkWALDir(storeDir, previousWALDir, "WALDir changed from previous options"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkWALDir verifies that walDir is among o.WALDir, o.WALFailover.Secondary,
+// or o.WALRecoveryDirs. An empty "walDir" maps to the storeDir.
+func (o *Options) checkWALDir(storeDir, walDir, errContext string) error {
+	walPath := resolveStorePath(storeDir, walDir)
+	if walDir == "" {
+		walPath = storeDir
+	}
+
+	if o.WALDir == "" {
+		if walPath == storeDir {
+			return nil
+		}
+	} else {
+		if walPath == resolveStorePath(storeDir, o.WALDir) {
+			return nil
+		}
+	}
+
+	if o.WALFailover != nil && walPath == resolveStorePath(storeDir, o.WALFailover.Secondary.Dirname) {
+		return nil
+	}
+
+	for _, d := range o.WALRecoveryDirs {
+		// TODO(radu): should we also check that d.FS is the same as walDir's FS?
+		if walPath == resolveStorePath(storeDir, d.Dirname) {
+			return nil
+		}
+	}
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "\n  %s\n", errContext)
+	fmt.Fprintf(&buf, "  o.WALDir: %q\n", o.WALDir)
+	if o.WALFailover != nil {
+		fmt.Fprintf(&buf, "  o.WALFailover.Secondary.Dirname: %q\n", o.WALFailover.Secondary.Dirname)
+	}
+	fmt.Fprintf(&buf, "  o.WALRecoveryDirs: %d", len(o.WALRecoveryDirs))
+	for _, d := range o.WALRecoveryDirs {
+		fmt.Fprintf(&buf, "\n    %q", d.Dirname)
+	}
+	return ErrMissingWALRecoveryDir{Dir: walPath, ExtraInfo: buf.String()}
 }
 
 // Validate verifies that the options are mutually consistent. For example,
@@ -2287,11 +2322,11 @@ func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstab
 			writerOpts.WritingToLowestLevel = true
 		}
 	}
-	levelOpts := o.Level(level)
+	levelOpts := o.Levels[level]
 	writerOpts.BlockRestartInterval = levelOpts.BlockRestartInterval
 	writerOpts.BlockSize = levelOpts.BlockSize
 	writerOpts.BlockSizeThreshold = levelOpts.BlockSizeThreshold
-	writerOpts.Compression = resolveDefaultCompression(levelOpts.Compression())
+	writerOpts.Compression = levelOpts.Compression()
 	writerOpts.FilterPolicy = levelOpts.FilterPolicy
 	writerOpts.FilterType = levelOpts.FilterType
 	writerOpts.IndexBlockSize = levelOpts.IndexBlockSize
@@ -2311,9 +2346,9 @@ func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstab
 // MakeBlobWriterOptions constructs blob.FileWriterOptions from the corresponding
 // options in the receiver.
 func (o *Options) MakeBlobWriterOptions(level int) blob.FileWriterOptions {
-	lo := o.Level(level)
+	lo := o.Levels[level]
 	return blob.FileWriterOptions{
-		Compression:  resolveDefaultCompression(lo.Compression()),
+		Compression:  lo.Compression(),
 		ChecksumType: block.ChecksumTypeCRC32c,
 		FlushGovernor: block.MakeFlushGovernor(
 			lo.BlockSize,
@@ -2324,11 +2359,21 @@ func (o *Options) MakeBlobWriterOptions(level int) blob.FileWriterOptions {
 	}
 }
 
-func resolveDefaultCompression(c Compression) Compression {
-	if c <= DefaultCompression || c >= block.NCompression {
-		c = SnappyCompression
+func (o *Options) MakeObjStorageProviderSettings(dirname string) objstorageprovider.Settings {
+	s := objstorageprovider.Settings{
+		Logger:        o.Logger,
+		FS:            o.FS,
+		FSDirName:     dirname,
+		FSCleaner:     o.Cleaner,
+		NoSyncOnClose: o.NoSyncOnClose,
+		BytesPerSync:  o.BytesPerSync,
 	}
-	return c
+	s.Local.ReadaheadConfig = o.Local.ReadaheadConfig
+	s.Remote.StorageFactory = o.Experimental.RemoteStorage
+	s.Remote.CreateOnShared = o.Experimental.CreateOnShared
+	s.Remote.CreateOnSharedLocator = o.Experimental.CreateOnSharedLocator
+	s.Remote.CacheSizeBytes = o.Experimental.SecondaryCacheSizeBytes
+	return s
 }
 
 // UserKeyCategories describes a partitioning of the user key space. Each
@@ -2425,4 +2470,27 @@ func (kc *UserKeyCategories) CategorizeKeyRange(startUserKey, endUserKey []byte)
 		return kc.cmp(endUserKey, kc.categories[p+1+i].UpperBound) < 0
 	})
 	return kc.rangeNames[p][q]
+}
+
+const storePathIdentifier = "{store_path}"
+
+// MakeStoreRelativePath takes a path that is relative to the store directory
+// and creates a path that can be used for Options.WALDir and wal.Dir.Dirname.
+//
+// This is used in metamorphic tests, so that the test run directory can be
+// copied or moved.
+func MakeStoreRelativePath(fs vfs.FS, relativePath string) string {
+	if relativePath == "" {
+		return storePathIdentifier
+	}
+	return fs.PathJoin(storePathIdentifier, relativePath)
+}
+
+// resolveStorePath is the inverse of MakeStoreRelativePath(). It replaces any
+// storePathIdentifier prefix with the store dir.
+func resolveStorePath(storeDir, path string) string {
+	if remainder, ok := strings.CutPrefix(path, storePathIdentifier); ok {
+		return storeDir + remainder
+	}
+	return path
 }

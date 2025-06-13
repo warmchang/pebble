@@ -528,7 +528,7 @@ func (i TableStatsInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 // on an sstable.
 type TableValidatedInfo struct {
 	JobID int
-	Meta  *tableMetadata
+	Meta  *manifest.TableMetadata
 }
 
 func (i TableValidatedInfo) String() string {
@@ -1233,7 +1233,7 @@ func (d *DB) reportCorruption(meta any, err error) error {
 	switch meta := meta.(type) {
 	case *manifest.TableMetadata:
 		return d.reportFileCorruption(base.FileTypeTable, meta.TableBacking.DiskFileNum, meta.UserKeyBounds(), err)
-	case *manifest.BlobFileMetadata:
+	case *manifest.PhysicalBlobFile:
 		// TODO(jackson): Add bounds for blob files.
 		return d.reportFileCorruption(base.FileTypeBlob, meta.FileNum, base.UserKeyBounds{}, err)
 	default:

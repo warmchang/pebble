@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/sstable/valblk"
@@ -35,18 +36,19 @@ type Layout struct {
 	// ValidateBlockChecksums, which validates a static list of BlockHandles
 	// referenced in this struct.
 
-	Data       []block.HandleWithProperties
-	Index      []block.Handle
-	TopIndex   block.Handle
-	Filter     []NamedBlockHandle
-	RangeDel   block.Handle
-	RangeKey   block.Handle
-	ValueBlock []block.Handle
-	ValueIndex block.Handle
-	Properties block.Handle
-	MetaIndex  block.Handle
-	Footer     block.Handle
-	Format     TableFormat
+	Data               []block.HandleWithProperties
+	Index              []block.Handle
+	TopIndex           block.Handle
+	Filter             []NamedBlockHandle
+	RangeDel           block.Handle
+	RangeKey           block.Handle
+	ValueBlock         []block.Handle
+	ValueIndex         block.Handle
+	Properties         block.Handle
+	MetaIndex          block.Handle
+	BlobReferenceIndex block.Handle
+	Footer             block.Handle
+	Format             TableFormat
 }
 
 // NamedBlockHandle holds a block.Handle and corresponding name.
@@ -96,6 +98,9 @@ func (l *Layout) orderedBlocks() []NamedBlockHandle {
 	}
 	if l.MetaIndex.Length != 0 {
 		blocks = append(blocks, NamedBlockHandle{l.MetaIndex, "meta-index"})
+	}
+	if l.BlobReferenceIndex.Length != 0 {
+		blocks = append(blocks, NamedBlockHandle{l.BlobReferenceIndex, "blob-reference-index"})
 	}
 	if l.Footer.Length != 0 {
 		if l.Footer.Length == levelDBFooterLen {
@@ -150,6 +155,11 @@ func (l *Layout) Describe(
 				panic("Error parsing table format.")
 			}
 
+			var attributes Attributes
+			if format >= TableFormatPebblev7 {
+				attributes = Attributes(binary.LittleEndian.Uint32(trailer[pebbleDBV7FooterAttributesOffset:]))
+			}
+
 			var computedChecksum uint32
 			var encodedChecksum uint32
 			if format >= TableFormatPebblev6 {
@@ -192,7 +202,6 @@ func (l *Layout) Describe(
 
 			if format >= TableFormatPebblev7 {
 				// Attributes should be just prior to the checksum.
-				attributes := Attributes(binary.LittleEndian.Uint32(trailer[pebbleDBV7FooterAttributesOffset:]))
 				tpNode.Childf("%03d  attributes: %s", offset-attributesLen, attributes.String())
 			}
 
@@ -265,7 +274,7 @@ func (l *Layout) Describe(
 				err = formatting.formatIndexBlock(tpNode, r, *b, h.BlockData())
 
 			case "properties":
-				h, err = r.blockReader.Read(ctx, block.NoReadEnv, noReadHandle, b.Handle, noInitBlockMetadataFn)
+				h, err = r.blockReader.Read(ctx, block.NoReadEnv, noReadHandle, b.Handle, blockkind.Metadata, noInitBlockMetadataFn)
 				if err != nil {
 					return err
 				}
@@ -359,6 +368,20 @@ func (l *Layout) Describe(
 			case "value-index":
 				// We have already read the value-index to construct the list of
 				// value-blocks, so no need to do it again.
+			case "blob-reference-index":
+				h, err = r.blockReader.Read(ctx, block.NoReadEnv, noReadHandle, b.Handle, blockkind.BlobReferenceValueLivenessIndex, noInitBlockMetadataFn)
+				if err != nil {
+					return err
+				}
+				var decoder colblk.ReferenceLivenessBlockDecoder
+				decoder.Init(h.BlockData())
+				offset := 0
+				for i := 0; i < decoder.BlockDecoder().Rows(); i++ {
+					value := decoder.LivenessAtReference(i)
+					length := len(value)
+					tpNode.Childf("%05d    %s (%d)", offset, value, length)
+					offset += length
+				}
 			}
 
 			// Format the trailer.
@@ -587,7 +610,7 @@ func decodeLayout(comparer *base.Comparer, data []byte, tableFormat TableFormat)
 	if err != nil {
 		return Layout{}, errors.Wrap(err, "decompressing properties")
 	}
-	props, err := decodePropertiesBlock(tableFormat, decompressedProps, nil /* deniedUserProperties */)
+	props, err := decodePropertiesBlock(tableFormat, decompressedProps)
 	if err != nil {
 		return Layout{}, err
 	}
@@ -754,7 +777,7 @@ func decodeColumnarMetaIndex(
 }
 
 // layoutWriter writes the structure of an sstable to durable storage. It
-// accepts serialized blocks, writes them to storage and returns a block handle
+// accepts serialized blocks, writes them to storage, and returns a block handle
 // describing the offset and length of the block.
 type layoutWriter struct {
 	writable objstorage.Writable
@@ -765,7 +788,7 @@ type layoutWriter struct {
 
 	// options copied from WriterOptions
 	tableFormat  TableFormat
-	compression  block.Compression
+	compressor   block.Compressor
 	checksumType block.ChecksumType
 
 	// Attribute bitset of the sstable, derived from sstable Properties at the time
@@ -791,7 +814,7 @@ func makeLayoutWriter(w objstorage.Writable, opts WriterOptions) layoutWriter {
 		writable:     w,
 		cacheOpts:    opts.internal.CacheOpts,
 		tableFormat:  opts.TableFormat,
-		compression:  opts.Compression,
+		compressor:   block.MakeCompressor(opts.Compression),
 		checksumType: opts.Checksum,
 		buf: blockBuf{
 			checksummer: block.Checksummer{Type: opts.Checksum},
@@ -810,13 +833,14 @@ func (w *layoutWriter) Abort() {
 	if w.writable != nil {
 		w.writable.Abort()
 		w.writable = nil
+		w.compressor.Close()
 	}
 }
 
 // WriteDataBlock constructs a trailer for the provided data block and writes
 // the block and trailer to the writer. It returns the block's handle.
 func (w *layoutWriter) WriteDataBlock(b []byte, buf *blockBuf) (block.Handle, error) {
-	return w.writeBlock(b, w.compression, buf)
+	return w.writeBlock(b, blockkind.SSTableData, &w.compressor, buf)
 }
 
 // WritePrecompressedDataBlock writes a pre-compressed data block and its
@@ -831,14 +855,14 @@ func (w *layoutWriter) WritePrecompressedDataBlock(blk block.PhysicalBlock) (blo
 // the last-written index block's handle and adds it to the file's meta index
 // when the writer is finished.
 func (w *layoutWriter) WriteIndexBlock(b []byte) (block.Handle, error) {
-	h, err := w.writeBlock(b, w.compression, &w.buf)
+	h, err := w.writeBlock(b, blockkind.SSTableIndex, &w.compressor, &w.buf)
 	if err == nil {
 		w.lastIndexBlockHandle = h
 	}
 	return h, err
 }
 
-// WriteFilterBlock finishes the provided filter, constructs a trailer and
+// WriteFilterBlock finishes the provided filter, constructs a trailer, and
 // writes the block and trailer to the writer. It automatically adds the filter
 // block to the file's meta index when the writer is finished.
 func (w *layoutWriter) WriteFilterBlock(f filterWriter) (bh block.Handle, err error) {
@@ -846,28 +870,37 @@ func (w *layoutWriter) WriteFilterBlock(f filterWriter) (bh block.Handle, err er
 	if err != nil {
 		return block.Handle{}, err
 	}
-	return w.writeNamedBlock(b, block.NoCompression, f.metaName())
+	return w.writeNamedBlock(b, blockkind.Filter, block.NoopCompressor, f.metaName())
 }
 
 // WritePropertiesBlock constructs a trailer for the provided properties block
 // and writes the block and trailer to the writer. It automatically adds the
 // properties block to the file's meta index when the writer is finished.
 func (w *layoutWriter) WritePropertiesBlock(b []byte) (block.Handle, error) {
+	compressor := &w.compressor
 	// In v6 and earlier, we use a row oriented block with an infinite restart
 	// interval, which provides very good prefix compression. Since v7, we use the
 	// columnar format without prefix compression for this block; we enable block
 	// compression to compensate.
-	if w.tableFormat >= TableFormatPebblev7 {
-		return w.writeNamedBlock(b, w.compression, metaPropertiesName)
+	if w.tableFormat < TableFormatPebblev7 {
+		compressor = block.NoopCompressor
 	}
-	return w.writeNamedBlock(b, block.NoCompression, metaPropertiesName)
+	return w.writeNamedBlock(b, blockkind.Metadata, compressor, metaPropertiesName)
 }
 
 // WriteRangeKeyBlock constructs a trailer for the provided range key block and
 // writes the block and trailer to the writer. It automatically adds the range
 // key block to the file's meta index when the writer is finished.
 func (w *layoutWriter) WriteRangeKeyBlock(b []byte) (block.Handle, error) {
-	return w.writeNamedBlock(b, block.NoCompression, metaRangeKeyName)
+	return w.writeNamedBlock(b, blockkind.RangeKey, block.NoopCompressor, metaRangeKeyName)
+}
+
+// WriteBlobRefIndexBlock constructs a trailer for the provided blob reference
+// index block and writes the block and trailer to the writer. It automatically
+// adds the blob reference index block to the file's meta index when the writer
+// is finished.
+func (w *layoutWriter) WriteBlobRefIndexBlock(b []byte) (block.Handle, error) {
+	return w.writeNamedBlock(b, blockkind.BlobReferenceValueLivenessIndex, &w.compressor, metaBlobRefIndexName)
 }
 
 // WriteRangeDeletionBlock constructs a trailer for the provided range deletion
@@ -875,13 +908,13 @@ func (w *layoutWriter) WriteRangeKeyBlock(b []byte) (block.Handle, error) {
 // the range deletion block to the file's meta index when the writer is
 // finished.
 func (w *layoutWriter) WriteRangeDeletionBlock(b []byte) (block.Handle, error) {
-	return w.writeNamedBlock(b, block.NoCompression, metaRangeDelV2Name)
+	return w.writeNamedBlock(b, blockkind.RangeDel, block.NoopCompressor, metaRangeDelV2Name)
 }
 
 func (w *layoutWriter) writeNamedBlock(
-	b []byte, compression block.Compression, name string,
+	b []byte, kind block.Kind, compressor *block.Compressor, name string,
 ) (bh block.Handle, err error) {
-	bh, err = w.writeBlock(b, compression, &w.buf)
+	bh, err = w.writeBlock(b, kind, compressor, &w.buf)
 	if err == nil {
 		w.recordToMetaindex(name, bh)
 	}
@@ -910,9 +943,9 @@ func (w *layoutWriter) WriteValueIndexBlock(
 
 // writeBlock checksums, compresses, and writes out a block.
 func (w *layoutWriter) writeBlock(
-	b []byte, compression block.Compression, buf *blockBuf,
+	b []byte, kind block.Kind, compressor *block.Compressor, buf *blockBuf,
 ) (block.Handle, error) {
-	pb := block.CompressAndChecksum(&buf.dataBuf, b, compression, &buf.checksummer)
+	pb := block.CompressAndChecksum(&buf.dataBuf, b, kind, compressor, &buf.checksummer)
 	h, err := w.writePrecompressedBlock(pb)
 	return h, err
 }
@@ -996,7 +1029,7 @@ func (w *layoutWriter) Finish() (size uint64, err error) {
 		}
 		b = bw.Finish()
 	}
-	metaIndexHandle, err := w.writeBlock(b, block.NoCompression, &w.buf)
+	metaIndexHandle, err := w.writeBlock(b, blockkind.Metadata, block.NoopCompressor, &w.buf)
 	if err != nil {
 		return 0, err
 	}
@@ -1017,5 +1050,6 @@ func (w *layoutWriter) Finish() (size uint64, err error) {
 
 	err = w.writable.Finish()
 	w.writable = nil
+	w.compressor.Close()
 	return w.offset, err
 }

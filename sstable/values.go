@@ -43,25 +43,25 @@ var DebugHandlesBlobContext = TableBlobContext{
 // sstable iterator to fetch the value stored in a blob file. It is the
 // caller's responsibility to close the ValueFetcher returned.
 func LoadValBlobContext(
-	rp blob.ReaderProvider, blobRefs BlobReferences,
+	fm blob.FileMapping, rp blob.ReaderProvider, blobRefs BlobReferences,
 ) (*blob.ValueFetcher, TableBlobContext) {
 	vf := &blob.ValueFetcher{}
-	vf.Init(rp, block.ReadEnv{})
+	vf.Init(fm, rp, block.ReadEnv{})
 	return vf, TableBlobContext{
 		ValueFetcher: vf,
 		References:   blobRefs,
 	}
 }
 
-// BlobReferences provides a mapping from an index to a file number for a
+// BlobReferences provides a mapping from an index to a blob file ID for a
 // sstable's blob references. In practice, this is implemented by
 // manifest.BlobReferences.
 type BlobReferences interface {
-	// FileNumByID returns the FileNum for the identified BlobReference.
-	FileNumByID(i blob.ReferenceID) base.DiskFileNum
-	// IDByFileNum returns the reference ID for the given FileNum. If the file
-	// number is not found, the second return value is false.
-	IDByFileNum(fileNum base.DiskFileNum) (blob.ReferenceID, bool)
+	// BlobFileIDByID returns the BlobFileID for the identified BlobReference.
+	BlobFileIDByID(i blob.ReferenceID) base.BlobFileID
+	// IDByBlobFileID returns the reference ID for the given BlobFileID. If the
+	// blob file ID is not found, the second return value is false.
+	IDByBlobFileID(fileID base.BlobFileID) (blob.ReferenceID, bool)
 }
 
 // TableBlobContext configures how values that reference external blob files
@@ -144,13 +144,18 @@ func (i *defaultInternalValueConstructor) GetInternalValueForPrefixAndValueHandl
 		i.env.Stats.SeparatedPointValue.ValueBytes += uint64(preface.ValueLen)
 	}
 
+	fetcher := i.blobContext.ValueFetcher
+	if fetcher == nil {
+		fetcher = base.NoBlobFetches
+	}
+
 	i.lazyFetcher = base.LazyFetcher{
-		Fetcher: i.blobContext.ValueFetcher,
+		Fetcher: fetcher,
 		Attribute: base.AttributeAndLen{
 			ValueLen:       preface.ValueLen,
 			ShortAttribute: vp.ShortAttribute(),
 		},
-		BlobFileNum: i.blobContext.References.FileNumByID(preface.ReferenceID),
+		BlobFileID: i.blobContext.References.BlobFileIDByID(preface.ReferenceID),
 	}
 	return base.MakeLazyValue(base.LazyValue{
 		ValueOrHandle: remainder,

@@ -74,7 +74,7 @@ func TestLevelOptions(t *testing.T) {
 		{6, (64 * 2) << 20},
 	}
 	for _, c := range testCases {
-		l := opts.Level(c.level)
+		l := opts.Levels[c.level]
 		if c.targetFileSize != l.TargetFileSize {
 			t.Fatalf("%d: expected target-file-size %d, but found %d",
 				c.level, c.targetFileSize, l.TargetFileSize)
@@ -144,24 +144,85 @@ func TestDefaultOptionsString(t *testing.T) {
   filter_type=table
   index_block_size=4096
   target_file_size=2097152
+
+[Level "1"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=4194304
+
+[Level "2"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=8388608
+
+[Level "3"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=16777216
+
+[Level "4"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=33554432
+
+[Level "5"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=67108864
+
+[Level "6"]
+  block_restart_interval=16
+  block_size=4096
+  block_size_threshold=90
+  compression=Snappy
+  filter_policy=none
+  filter_type=table
+  index_block_size=4096
+  target_file_size=134217728
 `
 
 	require.Equal(t, expected, DefaultOptions().String())
 }
 
 func TestOptionsCheckCompatibility(t *testing.T) {
+	storeDir := "/mnt/foo"
 	opts := DefaultOptions()
 	s := opts.String()
-	require.NoError(t, opts.CheckCompatibility(s))
-	require.Regexp(t, `invalid key=value syntax`, opts.CheckCompatibility("foo\n"))
+	require.NoError(t, opts.CheckCompatibility(storeDir, s))
+	require.Regexp(t, `invalid key=value syntax`, opts.CheckCompatibility(storeDir, "foo\n"))
 
 	tmp := *opts
 	tmp.Comparer = &Comparer{Name: "foo"}
-	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(s))
+	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(storeDir, s))
 
 	tmp = *opts
 	tmp.Merger = &Merger{Name: "foo"}
-	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(s))
+	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(storeDir, s))
 
 	// RocksDB uses a similar (INI-style) syntax for the OPTIONS file, but
 	// different section names and keys.
@@ -172,14 +233,14 @@ func TestOptionsCheckCompatibility(t *testing.T) {
 `
 	tmp = *opts
 	tmp.Comparer = &Comparer{Name: "foo"}
-	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(s))
+	require.Regexp(t, `comparer name from file.*!=.*`, tmp.CheckCompatibility(storeDir, s))
 
 	tmp.Comparer = &Comparer{Name: "rocksdb-comparer"}
 	tmp.Merger = &Merger{Name: "foo"}
-	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(s))
+	require.Regexp(t, `merger name from file.*!=.*`, tmp.CheckCompatibility(storeDir, s))
 
 	tmp.Merger = &Merger{Name: "rocksdb-merger"}
-	require.NoError(t, tmp.CheckCompatibility(s))
+	require.NoError(t, tmp.CheckCompatibility(storeDir, s))
 
 	// RocksDB allows the merge operator to be unspecified, in which case it
 	// shows up as "nullptr".
@@ -188,44 +249,75 @@ func TestOptionsCheckCompatibility(t *testing.T) {
   merge_operator=nullptr
 `
 	tmp = *opts
-	require.NoError(t, tmp.CheckCompatibility(s))
+	require.NoError(t, tmp.CheckCompatibility(storeDir, s))
 
 	// Check that an OPTIONS file that configured an explicit WALDir that will
 	// no longer be used errors if it's not also present in WALRecoveryDirs.
-	require.Equal(t, ErrMissingWALRecoveryDir{Dir: "external-wal-dir"},
-		DefaultOptions().CheckCompatibility(`
+	//require.Equal(t, ErrMissingWALRecoveryDir{Dir: "external-wal-dir"},
+	err := DefaultOptions().CheckCompatibility(storeDir, `
 [Options]
   wal_dir=external-wal-dir
-`))
+`)
+	var missingWALRecoveryDirErr ErrMissingWALRecoveryDir
+	require.True(t, errors.As(err, &missingWALRecoveryDirErr))
+	require.Equal(t, "external-wal-dir", missingWALRecoveryDirErr.Dir)
+
 	// But not if it's configured as a WALRecoveryDir or current WALDir.
 	opts = &Options{WALRecoveryDirs: []wal.Dir{{Dirname: "external-wal-dir"}}}
 	opts.EnsureDefaults()
-	require.NoError(t, opts.CheckCompatibility(`
+	require.NoError(t, opts.CheckCompatibility(storeDir, `
 [Options]
   wal_dir=external-wal-dir
 `))
 	opts = &Options{WALDir: "external-wal-dir"}
 	opts.EnsureDefaults()
-	require.NoError(t, opts.CheckCompatibility(`
+	require.NoError(t, opts.CheckCompatibility(storeDir, `
 [Options]
   wal_dir=external-wal-dir
 `))
 
+	// Check that an OPTIONS file that was configured without an explicit WALDir
+	// errors out if the store path is not in WALRecoveryDirs.
+	opts = &Options{WALDir: "external-wal-dir"}
+	opts.EnsureDefaults()
+	err = opts.CheckCompatibility(storeDir, `
+[Options]
+  wal_dir=
+`)
+	require.True(t, errors.As(err, &missingWALRecoveryDirErr))
+	require.Equal(t, storeDir, missingWALRecoveryDirErr.Dir)
+
+	// Should be the same as above.
+	err = opts.CheckCompatibility(storeDir, ``)
+	require.True(t, errors.As(err, &missingWALRecoveryDirErr))
+	require.Equal(t, storeDir, missingWALRecoveryDirErr.Dir)
+
+	opts.WALRecoveryDirs = []wal.Dir{{Dirname: storePathIdentifier}}
+	require.NoError(t, DefaultOptions().CheckCompatibility(storeDir, `
+[Options]
+  wal_dir=
+`))
+
+	// Should be the same as above.
+	require.NoError(t, DefaultOptions().CheckCompatibility(storeDir, ``))
+
 	// Check that an OPTIONS file that configured a secondary failover WAL dir
 	// that will no longer be used errors if it's not also present in
 	// WALRecoveryDirs.
-	require.Equal(t, ErrMissingWALRecoveryDir{Dir: "failover-wal-dir"},
-		DefaultOptions().CheckCompatibility(`
+	err = DefaultOptions().CheckCompatibility(storeDir, `
 [Options]
 
 [WAL Failover]
   secondary_dir=failover-wal-dir
-`))
+`)
+	require.True(t, errors.As(err, &missingWALRecoveryDirErr))
+	require.Equal(t, "failover-wal-dir", missingWALRecoveryDirErr.Dir)
+
 	// But not if it's configured as a WALRecoveryDir or current failover
 	// secondary dir.
 	opts = &Options{WALRecoveryDirs: []wal.Dir{{Dirname: "failover-wal-dir"}}}
 	opts.EnsureDefaults()
-	require.NoError(t, opts.CheckCompatibility(`
+	require.NoError(t, opts.CheckCompatibility(storeDir, `
 [Options]
 
 [WAL Failover]
@@ -233,7 +325,7 @@ func TestOptionsCheckCompatibility(t *testing.T) {
 `))
 	opts = &Options{WALFailover: &WALFailoverOptions{Secondary: wal.Dir{Dirname: "failover-wal-dir"}}}
 	opts.EnsureDefaults()
-	require.NoError(t, opts.CheckCompatibility(`
+	require.NoError(t, opts.CheckCompatibility(storeDir, `
 [Options]
 
 [WAL Failover]
@@ -293,7 +385,6 @@ func TestOptionsParse(t *testing.T) {
 			opts.Comparer = c.comparer
 			opts.Merger = c.merger
 			opts.WALDir = "wal"
-			opts.Levels = make([]LevelOptions, 3)
 			opts.Levels[0].BlockSize = 1024
 			opts.Levels[1].BlockSize = 2048
 			opts.Levels[2].BlockSize = 4096

@@ -47,7 +47,7 @@ var gcLabels = pprof.Labels("pebble", "gc")
 // compacted files. We avoid expanding the lower level file set of a compaction
 // if it would make the total compaction cover more than this many bytes.
 func expandedCompactionByteSizeLimit(opts *Options, level int, availBytes uint64) uint64 {
-	v := uint64(25 * opts.Level(level).TargetFileSize)
+	v := uint64(25 * opts.Levels[level].TargetFileSize)
 
 	// Never expand a compaction beyond half the available capacity, divided
 	// by the maximum number of concurrent compactions. Each of the concurrent
@@ -69,13 +69,13 @@ func expandedCompactionByteSizeLimit(opts *Options, level int, availBytes uint64
 // maxGrandparentOverlapBytes is the maximum bytes of overlap with level+1
 // before we stop building a single file in a level-1 to level compaction.
 func maxGrandparentOverlapBytes(opts *Options, level int) uint64 {
-	return uint64(10 * opts.Level(level).TargetFileSize)
+	return uint64(10 * opts.Levels[level].TargetFileSize)
 }
 
 // maxReadCompactionBytes is used to prevent read compactions which
 // are too wide.
 func maxReadCompactionBytes(opts *Options, level int) uint64 {
-	return uint64(10 * opts.Level(level).TargetFileSize)
+	return uint64(10 * opts.Levels[level].TargetFileSize)
 }
 
 // noCloseIter wraps around a FragmentIterator, intercepting and eliding
@@ -203,7 +203,7 @@ type compaction struct {
 	comparer  *base.Comparer
 	formatKey base.FormatKey
 	logger    Logger
-	version   *version
+	version   *manifest.Version
 	stats     base.InternalIteratorStats
 	beganAt   time.Time
 	// versionEditApplied is set to true when a compaction has completed and the
@@ -303,7 +303,8 @@ type compaction struct {
 
 	grantHandle CompactionGrantHandle
 
-	opts objstorage.CreateOptions
+	tableFormat   sstable.TableFormat
+	objCreateOpts objstorage.CreateOptions
 }
 
 // inputLargestSeqNumAbsolute returns the maximum LargestSeqNumAbsolute of any
@@ -368,12 +369,17 @@ func (c *compaction) userKeyBounds() base.UserKeyBounds {
 
 type getValueSeparation func(JobID, *compaction, sstable.TableFormat) compact.ValueSeparation
 
+// newCompaction constructs a compaction from the provided picked compaction.
+//
+// The compaction is created with a reference to its version that must be
+// released when the compaction is complete.
 func newCompaction(
 	pc *pickedCompaction,
 	opts *Options,
 	beganAt time.Time,
 	provider objstorage.Provider,
 	grantHandle CompactionGrantHandle,
+	tableFormat sstable.TableFormat,
 	getValueSeparation getValueSeparation,
 ) *compaction {
 	c := &compaction{
@@ -393,7 +399,23 @@ func newCompaction(
 		maxOverlapBytes:    pc.maxOverlapBytes,
 		pickerMetrics:      pc.pickerMetrics,
 		grantHandle:        grantHandle,
+		tableFormat:        tableFormat,
 	}
+	// Acquire a reference to the version to ensure that files and in-memory
+	// version state necessary for reading files remain available. Ignoring
+	// excises, this isn't strictly necessary for reading the sstables that are
+	// inputs to the compaction because those files are 'marked as compacting'
+	// and shouldn't be subject to any competing compactions. However with
+	// excises, a concurrent excise may remove a compaction's file from the
+	// Version and then cancel the compaction. The file shouldn't be physically
+	// removed until the cancelled compaction stops reading it.
+	//
+	// Additionally, we need any blob files referenced by input sstables to
+	// remain available, even if the blob file is rewritten. Maintaining a
+	// reference ensures that all these files remain available for the
+	// compaction's reads.
+	c.version.Ref()
+
 	c.startLevel = &c.inputs[0]
 	if pc.startLevel.l0SublevelInfo != nil {
 		c.startLevel.l0SublevelInfo = pc.startLevel.l0SublevelInfo
@@ -414,63 +436,98 @@ func newCompaction(
 	)
 	c.kind = pc.kind
 
-	preferSharedStorage := remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level)
-	// In addition to the default compaction, we also check whether a tombstone density compaction can be optimized into
-	// a move compaction. However, we want to avoid performing a move compaction into the lowest level, since the goal
-	// there is to actually remove the tombstones.
-	//
-	// Tombstone density compaction is meant to address cases where tombstones don't reclaim much space but are still
-	// expensive to scan over. We can only remove the tombstones once there's nothing at all underneath them.
-	if (c.kind == compactionKindDefault || (c.kind == compactionKindTombstoneDensity && c.outputLevel.level != numLevels-1)) &&
-		c.outputLevel.files.Empty() && !c.hasExtraLevelData() &&
-		c.startLevel.files.Len() == 1 && c.grandparents.AggregateSizeSum() <= c.maxOverlapBytes {
-		// This compaction can be converted into a move or copy from one level
-		// to the next. We avoid such a move if there is lots of overlapping
-		// grandparent data. Otherwise, the move could create a parent file
-		// that will require a very expensive merge later on.
-		iter := c.startLevel.files.Iter()
-		meta := iter.First()
-		isRemote := false
-		// We should always be passed a provider, except in some unit tests.
-		if provider != nil {
-			isRemote = !objstorage.IsLocalTable(provider, meta.TableBacking.DiskFileNum)
-		}
-		// Avoid a trivial move or copy if all of these are true, as rewriting a
-		// new file is better:
-		//
-		// 1) The source file is a virtual sstable
-		// 2) The existing file `meta` is on non-remote storage
-		// 3) The output level prefers shared storage
-		//
-		// We also want to prevent ssts with blob references from being
-		// selected for copy compaction, as we currently lack a mechanism
-		// to propagate blob references along with the sstable.
-		mustCopy := !isRemote && preferSharedStorage && meta.BlobReferenceDepth == 0
-		if mustCopy {
-			// If the source is virtual, it's best to just rewrite the file as
-			// all conditions in the above comment are met.
-			if !meta.Virtual {
-				c.kind = compactionKindCopy
-			}
-		} else {
-			c.kind = compactionKindMove
-		}
-	}
-
-	c.opts = objstorage.CreateOptions{
+	preferSharedStorage := tableFormat >= FormatMinForSharedObjects.MaxTableFormat() &&
+		remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level)
+	c.maybeSwitchToMoveOrCopy(preferSharedStorage, provider)
+	c.objCreateOpts = objstorage.CreateOptions{
 		PreferSharedStorage: preferSharedStorage,
 		WriteCategory:       getDiskWriteCategoryForCompaction(opts, c.kind),
 	}
-	if c.opts.PreferSharedStorage {
+	if preferSharedStorage {
 		c.getValueSeparation = neverSeparateValues
 	}
 
 	return c
 }
 
+// maybeSwitchToMoveOrCopy decides if the compaction can be changed into a move
+// or copy compaction, in which case c.kind is updated.
+func (c *compaction) maybeSwitchToMoveOrCopy(
+	preferSharedStorage bool, provider objstorage.Provider,
+) {
+	// Only non-multi-level compactions with a single input file can be
+	// considered.
+	if c.startLevel.files.Len() != 1 || !c.outputLevel.files.Empty() || c.hasExtraLevelData() {
+		return
+	}
+
+	// In addition to the default compaction, we also check whether a tombstone
+	// density compaction can be optimized into a move compaction. However, we
+	// want to avoid performing a move compaction into the lowest level, since the
+	// goal there is to actually remove the tombstones.
+	//
+	// Tombstone density compaction is meant to address cases where tombstones
+	// don't reclaim much space but are still expensive to scan over. We can only
+	// remove the tombstones once there's nothing at all underneath them.
+	switch c.kind {
+	case compactionKindDefault:
+		// Proceed.
+	case compactionKindTombstoneDensity:
+		// Tombstone density compaction can be optimized into a move compaction.
+		// However, we want to avoid performing a move compaction into the lowest
+		// level, since the goal there is to actually remove the tombstones; even if
+		// they don't prevent a lot of space from being reclaimed, tombstones can
+		// still be expensive to scan over.
+		if c.outputLevel.level == numLevels-1 {
+			return
+		}
+	default:
+		// Other compaction kinds not supported.
+		return
+	}
+
+	// We avoid a move or copy if there is lots of overlapping grandparent data.
+	// Otherwise, the move could create a parent file that will require a very
+	// expensive merge later on.
+	if c.grandparents.AggregateSizeSum() > c.maxOverlapBytes {
+		return
+	}
+
+	iter := c.startLevel.files.Iter()
+	meta := iter.First()
+
+	// We should always be passed a provider, except in some unit tests.
+	isRemote := provider != nil && !objstorage.IsLocalTable(provider, meta.TableBacking.DiskFileNum)
+
+	// Shared and external tables can always be moved. We can also move a local
+	// table unless we need the result to be on shared storage.
+	if isRemote || !preferSharedStorage {
+		c.kind = compactionKindMove
+		return
+	}
+
+	// We can rewrite the table (regular compaction) or we can use a copy compaction.
+	switch {
+	case meta.Virtual:
+		// We want to avoid a copy compaction if the table is virtual, as we may end
+		// up copying a lot more data than necessary.
+	case meta.BlobReferenceDepth != 0:
+		// We also want to avoid copy compactions for tables with blob references,
+		// as we currently lack a mechanism to propagate blob references along with
+		// the sstable.
+	default:
+		c.kind = compactionKindCopy
+	}
+}
+
+// newDeleteOnlyCompaction constructs a delete-only compaction from the provided
+// inputs.
+//
+// The compaction is created with a reference to its version that must be
+// released when the compaction is complete.
 func newDeleteOnlyCompaction(
 	opts *Options,
-	cur *version,
+	cur *manifest.Version,
 	inputs []compactionLevel,
 	beganAt time.Time,
 	hints []deleteCompactionHint,
@@ -490,6 +547,20 @@ func newDeleteOnlyCompaction(
 		exciseEnabled: exciseEnabled,
 		grantHandle:   noopGrantHandle{},
 	}
+	// Acquire a reference to the version to ensure that files and in-memory
+	// version state necessary for reading files remain available. Ignoring
+	// excises, this isn't strictly necessary for reading the sstables that are
+	// inputs to the compaction because those files are 'marked as compacting'
+	// and shouldn't be subject to any competing compactions. However with
+	// excises, a concurrent excise may remove a compaction's file from the
+	// Version and then cancel the compaction. The file shouldn't be physically
+	// removed until the cancelled compaction stops reading it.
+	//
+	// Additionally, we need any blob files referenced by input sstables to
+	// remain available, even if the blob file is rewritten. Maintaining a
+	// reference ensures that all these files remain available for the
+	// compaction's reads.
+	c.version.Ref()
 
 	// Set c.smallest, c.largest.
 	files := make([]iter.Seq[*manifest.TableMetadata], 0, len(inputs))
@@ -567,13 +638,25 @@ func adjustGrandparentOverlapBytesForFlush(c *compaction, flushingBytes uint64) 
 	}
 }
 
+// newFlush creates the state necessary for a flush (modeled with the compaction
+// struct).
+//
+// newFlush takes the current Version in order to populate grandparent flushing
+// limits, but it does not reference the version.
+//
+// TODO(jackson): Consider maintaining a reference to the version anyways since
+// in the future in-memory Version state may only be available while a Version
+// is referenced (eg, if we start recycling B-Tree nodes once they're no longer
+// referenced). There's subtlety around unref'ing the version at the right
+// moment, so we defer it for now.
 func newFlush(
 	opts *Options,
-	cur *version,
+	cur *manifest.Version,
 	l0Organizer *manifest.L0Organizer,
 	baseLevel int,
 	flushing flushableList,
 	beganAt time.Time,
+	tableFormat sstable.TableFormat,
 	getValueSeparation getValueSeparation,
 ) (*compaction, error) {
 	c := &compaction{
@@ -591,6 +674,7 @@ func newFlush(
 		maxOverlapBytes:    math.MaxUint64,
 		flushing:           flushing,
 		grantHandle:        noopGrantHandle{},
+		tableFormat:        tableFormat,
 	}
 	c.startLevel = &c.inputs[0]
 	c.outputLevel = &c.inputs[1]
@@ -604,11 +688,13 @@ func newFlush(
 		}
 	}
 
-	c.opts = objstorage.CreateOptions{
-		PreferSharedStorage: remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level),
+	preferSharedStorage := tableFormat >= FormatMinForSharedObjects.MaxTableFormat() &&
+		remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level)
+	c.objCreateOpts = objstorage.CreateOptions{
+		PreferSharedStorage: preferSharedStorage,
 		WriteCategory:       getDiskWriteCategoryForCompaction(opts, c.kind),
 	}
-	if c.opts.PreferSharedStorage {
+	if preferSharedStorage {
 		c.getValueSeparation = neverSeparateValues
 	}
 
@@ -683,7 +769,7 @@ func newFlush(
 	}
 
 	if opts.FlushSplitBytes > 0 {
-		c.maxOutputFileSize = uint64(opts.Level(0).TargetFileSize)
+		c.maxOutputFileSize = uint64(opts.Levels[0].TargetFileSize)
 		c.maxOverlapBytes = maxGrandparentOverlapBytes(opts, 0)
 		c.grandparents = c.version.Overlaps(baseLevel, c.userKeyBounds())
 		adjustGrandparentOverlapBytesForFlush(c, flushingBytes)
@@ -710,7 +796,7 @@ func (c *compaction) hasExtraLevelData() bool {
 // errorOnUserKeyOverlap returns an error if the last two written sstables in
 // this compaction have revisions of the same user key present in both sstables,
 // when it shouldn't (eg. when splitting flushes).
-func (c *compaction) errorOnUserKeyOverlap(ve *versionEdit) error {
+func (c *compaction) errorOnUserKeyOverlap(ve *manifest.VersionEdit) error {
 	if n := len(ve.NewTables); n > 1 {
 		meta := ve.NewTables[n-1].Meta
 		prevMeta := ve.NewTables[n-2].Meta
@@ -1304,14 +1390,14 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 
 	// Finding the target level for ingestion must use the latest version
 	// after the logLock has been acquired.
-	c.version = d.mu.versions.currentVersion()
+	version := d.mu.versions.currentVersion()
 
 	baseLevel := d.mu.versions.picker.getBaseLevel()
-	ve := &versionEdit{}
+	ve := &manifest.VersionEdit{}
 	var ingestSplitFiles []ingestSplitFile
 	ingestFlushable := c.flushing[0].flushable.(*ingestedFlushable)
 
-	updateLevelMetricsOnExcise := func(m *tableMetadata, level int, added []newTableEntry) {
+	updateLevelMetricsOnExcise := func(m *manifest.TableMetadata, level int, added []manifest.NewTableEntry) {
 		levelMetrics := c.metrics[level]
 		if levelMetrics == nil {
 			levelMetrics = &LevelMetrics{}
@@ -1343,11 +1429,11 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 			logger:   d.opts.Logger,
 			Category: categoryIngest,
 		},
-		v: c.version,
+		v: version,
 	}
-	replacedTables := make(map[base.TableNum][]newTableEntry)
+	replacedTables := make(map[base.TableNum][]manifest.NewTableEntry)
 	for _, file := range ingestFlushable.files {
-		var fileToSplit *tableMetadata
+		var fileToSplit *manifest.TableMetadata
 		var level int
 
 		// This file fits perfectly within the excise span, so we can slot it at L6.
@@ -1370,7 +1456,7 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 		}
 
 		// Add the current flushableIngest file to the version.
-		ve.NewTables = append(ve.NewTables, newTableEntry{Level: level, Meta: file})
+		ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{Level: level, Meta: file})
 		if fileToSplit != nil {
 			ingestSplitFiles = append(ingestSplitFiles, ingestSplitFile{
 				ingestFile: file,
@@ -1389,7 +1475,7 @@ func (d *DB) runIngestFlush(c *compaction) (*manifest.VersionEdit, error) {
 	if ingestFlushable.exciseSpan.Valid() {
 		exciseBounds := ingestFlushable.exciseSpan.UserKeyBounds()
 		// Iterate through all levels and find files that intersect with exciseSpan.
-		for layer, ls := range c.version.AllLevelsAndSublevels() {
+		for layer, ls := range version.AllLevelsAndSublevels() {
 			for m := range ls.Overlaps(d.cmp, ingestFlushable.exciseSpan.UserKeyBounds()).All() {
 				leftTable, rightTable, err := d.exciseTable(context.TODO(), exciseBounds, m, layer.Level(), tightExciseBounds)
 				if err != nil {
@@ -1503,7 +1589,7 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 	}
 
 	c, err := newFlush(d.opts, d.mu.versions.currentVersion(), d.mu.versions.l0Organizer,
-		d.mu.versions.picker.getBaseLevel(), d.mu.mem.queue[:n], d.timeNow(), d.determineCompactionValueSeparation)
+		d.mu.versions.picker.getBaseLevel(), d.mu.mem.queue[:n], d.timeNow(), d.TableFormat(), d.determineCompactionValueSeparation)
 	if err != nil {
 		return 0, err
 	}
@@ -1564,7 +1650,7 @@ func (d *DB) flush1() (bytesFlushed uint64, err error) {
 				// resulting in zero bytes in. Instead, use the number of bytes we
 				// flushed as the BytesIn. This ensures we get a reasonable w-amp
 				// calculation even when the WAL is disabled.
-				l0Metrics.TableBytesIn = l0Metrics.TableBytesFlushed
+				l0Metrics.TableBytesIn = l0Metrics.TableBytesFlushed + l0Metrics.BlobBytesFlushed
 			} else {
 				for i := 0; i < n; i++ {
 					l0Metrics.TableBytesIn += d.mu.mem.queue[i].logSize
@@ -1878,7 +1964,7 @@ func (d *DB) runPickedCompaction(pc *pickedCompaction, grantHandle CompactionGra
 	}
 
 	d.mu.compact.compactingCount++
-	compaction := newCompaction(pc, d.opts, d.timeNow(), d.ObjProvider(), grantHandle, d.determineCompactionValueSeparation)
+	compaction := newCompaction(pc, d.opts, d.timeNow(), d.ObjProvider(), grantHandle, d.TableFormat(), d.determineCompactionValueSeparation)
 	d.addInProgressCompaction(compaction)
 	go func() {
 		d.compact(compaction, doneChannel)
@@ -2106,7 +2192,7 @@ type deleteCompactionHint struct {
 	// be deleted.
 	tombstoneLevel int
 	// The file containing the range tombstone(s) that created the hint.
-	tombstoneFile *tableMetadata
+	tombstoneFile *manifest.TableMetadata
 	// The smallest and largest sequence numbers of the abutting tombstones
 	// merged to form this hint. All of a tables' keys must be less than the
 	// tombstone smallest sequence number to be deleted. All of a tables'
@@ -2145,7 +2231,7 @@ func (h deleteCompactionHint) String() string {
 }
 
 func (h *deleteCompactionHint) canDeleteOrExcise(
-	cmp Compare, m *tableMetadata, snapshots compact.Snapshots, exciseEnabled bool,
+	cmp Compare, m *manifest.TableMetadata, snapshots compact.Snapshots, exciseEnabled bool,
 ) deletionHintOverlap {
 	// The file can only be deleted if all of its keys are older than the
 	// earliest tombstone aggregated into the hint. Note that we use
@@ -2216,13 +2302,13 @@ func (h *deleteCompactionHint) canDeleteOrExcise(
 // The files that the resolved hints apply to, are returned as compactionLevels.
 func checkDeleteCompactionHints(
 	cmp Compare,
-	v *version,
+	v *manifest.Version,
 	hints []deleteCompactionHint,
 	snapshots compact.Snapshots,
 	exciseEnabled bool,
 ) (levels []compactionLevel, resolved, unresolved []deleteCompactionHint) {
-	var files map[*tableMetadata]bool
-	var byLevel [numLevels][]*tableMetadata
+	var files map[*manifest.TableMetadata]bool
+	var byLevel [numLevels][]*manifest.TableMetadata
 
 	// Delete-only compactions can be quadratic (O(mn)) in terms of runtime
 	// where m = number of files in the delete-only compaction and n = number
@@ -2287,7 +2373,7 @@ func checkDeleteCompactionHints(
 		// equal to the number of files it deletes. First, determine how many files are
 		// affected by this hint.
 		filesDeletedByCurrentHint := 0
-		var filesDeletedByLevel [7][]*tableMetadata
+		var filesDeletedByLevel [7][]*manifest.TableMetadata
 		for l := h.tombstoneLevel + 1; l < numLevels; l++ {
 			for m := range v.Overlaps(l, base.UserKeyBoundsEndExclusive(h.start, h.end)).All() {
 				doesHintApply := h.canDeleteOrExcise(cmp, m, snapshots, exciseEnabled)
@@ -2328,7 +2414,7 @@ func checkDeleteCompactionHints(
 				if files == nil {
 					// Construct files lazily, assuming most calls will not
 					// produce delete-only compactions.
-					files = make(map[*tableMetadata]bool)
+					files = make(map[*manifest.TableMetadata]bool)
 				}
 				files[m] = true
 			}
@@ -2369,23 +2455,43 @@ func (d *DB) compactionPprofLabels(c *compaction) pprof.LabelSet {
 // compact runs one compaction and maybe schedules another call to compact.
 func (d *DB) compact(c *compaction, errChannel chan error) {
 	pprof.Do(context.Background(), d.compactionPprofLabels(c), func(context.Context) {
-		d.mu.Lock()
-		c.grantHandle.Started()
-		if err := d.compact1(c, errChannel); err != nil {
-			d.handleCompactFailure(c, err)
-		}
-		if c.isDownload {
-			d.mu.compact.downloadingCount--
-		} else {
-			d.mu.compact.compactingCount--
-		}
-		delete(d.mu.compact.inProgress, c)
-		// Add this compaction's duration to the cumulative duration. NB: This
-		// must be atomic with the above removal of c from
-		// d.mu.compact.InProgress to ensure Metrics.Compact.Duration does not
-		// miss or double count a completing compaction's duration.
-		d.mu.compact.duration += d.timeNow().Sub(c.beganAt)
-		d.mu.Unlock()
+		func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			jobID := d.newJobIDLocked()
+
+			c.grantHandle.Started()
+			compactErr := d.compact1(jobID, c)
+			// The version stored in the compaction is ref'd when the
+			// compaction is created. We're responsible for un-refing it
+			// when the compaction is complete.
+			//
+			// Unreferencing the version may have accumulated obsolete
+			// files, so we schedule a deletion of obsolete files.
+			c.version.UnrefLocked()
+			d.deleteObsoleteFiles(jobID)
+			// We send on the error channel only after we've deleted
+			// obsolete files so that tests performing manual compactions
+			// block until the obsolete files are deleted, and the test
+			// observes the deletion.
+			if errChannel != nil {
+				errChannel <- compactErr
+			}
+			if compactErr != nil {
+				d.handleCompactFailure(c, compactErr)
+			}
+			if c.isDownload {
+				d.mu.compact.downloadingCount--
+			} else {
+				d.mu.compact.compactingCount--
+			}
+			delete(d.mu.compact.inProgress, c)
+			// Add this compaction's duration to the cumulative duration. NB: This
+			// must be atomic with the above removal of c from
+			// d.mu.compact.InProgress to ensure Metrics.Compact.Duration does not
+			// miss or double count a completing compaction's duration.
+			d.mu.compact.duration += d.timeNow().Sub(c.beganAt)
+		}()
 		// Done must not be called while holding any lock that needs to be
 		// acquired by Schedule. Also, it must be called after new Version has
 		// been installed, and metadata related to compactingCount and inProgress
@@ -2403,10 +2509,12 @@ func (d *DB) compact(c *compaction, errChannel chan error) {
 		// scheduled, so we also need to call maybeScheduleCompaction. And
 		// maybeScheduleCompaction encompasses all compactions, and not only those
 		// scheduled via the CompactionScheduler.
-		d.mu.Lock()
-		d.maybeScheduleCompaction()
-		d.mu.compact.cond.Broadcast()
-		d.mu.Unlock()
+		func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.maybeScheduleCompaction()
+			d.mu.compact.cond.Broadcast()
+		}()
 	})
 }
 
@@ -2446,23 +2554,23 @@ func (d *DB) handleCompactFailure(c *compaction, err error) {
 // for the application of a versionEdit that is no longer going to be applied.
 //
 // d.mu must be held when calling this method.
-func (d *DB) cleanupVersionEdit(ve *versionEdit) {
+func (d *DB) cleanupVersionEdit(ve *manifest.VersionEdit) {
 	obsoleteFiles := manifest.ObsoleteFiles{
 		TableBackings: make([]*manifest.TableBacking, 0, len(ve.NewTables)),
-		BlobFiles:     make([]*manifest.BlobFileMetadata, 0, len(ve.NewBlobFiles)),
+		BlobFiles:     make([]*manifest.PhysicalBlobFile, 0, len(ve.NewBlobFiles)),
 	}
 	deletedTables := make(map[base.TableNum]struct{})
 	for key := range ve.DeletedTables {
 		deletedTables[key.FileNum] = struct{}{}
 	}
 	for i := range ve.NewBlobFiles {
-		obsoleteFiles.AddBlob(ve.NewBlobFiles[i])
+		obsoleteFiles.AddBlob(ve.NewBlobFiles[i].Physical)
 		d.mu.versions.zombieBlobs.Add(objectInfo{
 			fileInfo: fileInfo{
-				FileNum:  ve.NewBlobFiles[i].FileNum,
-				FileSize: ve.NewBlobFiles[i].Size,
+				FileNum:  ve.NewBlobFiles[i].Physical.FileNum,
+				FileSize: ve.NewBlobFiles[i].Physical.Size,
 			},
-			isLocal: objstorage.IsLocalBlobFile(d.objProvider, ve.NewBlobFiles[i].FileNum),
+			isLocal: objstorage.IsLocalBlobFile(d.objProvider, ve.NewBlobFiles[i].Physical.FileNum),
 		})
 	}
 	for i := range ve.NewTables {
@@ -2501,14 +2609,7 @@ func (d *DB) cleanupVersionEdit(ve *versionEdit) {
 //
 // d.mu must be held when calling this, but the mutex may be dropped and
 // re-acquired during the course of this method.
-func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
-	if errChannel != nil {
-		defer func() {
-			errChannel <- err
-		}()
-	}
-
-	jobID := d.newJobIDLocked()
+func (d *DB) compact1(jobID JobID, c *compaction) (err error) {
 	info := c.makeInfo(jobID)
 	d.opts.EventListener.CompactionBegin(info)
 	startTime := d.timeNow()
@@ -2573,7 +2674,6 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 		d.updateReadStateLocked(d.opts.DebugCheck)
 		d.updateTableStatsLocked(ve.NewTables)
 	}
-	d.deleteObsoleteFiles(jobID)
 
 	return err
 }
@@ -2590,22 +2690,23 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 // doing IO.
 func (d *DB) runCopyCompaction(
 	jobID JobID, c *compaction,
-) (ve *versionEdit, stats compact.Stats, _ error) {
+) (ve *manifest.VersionEdit, stats compact.Stats, _ error) {
+	if c.cancel.Load() {
+		return nil, compact.Stats{}, ErrCancelledCompaction
+	}
 	iter := c.startLevel.files.Iter()
 	inputMeta := iter.First()
 	if iter.Next() != nil {
 		return nil, compact.Stats{}, base.AssertionFailedf("got more than one file for a move compaction")
 	}
-	if c.cancel.Load() {
-		return nil, compact.Stats{}, ErrCancelledCompaction
-	}
 	if inputMeta.BlobReferenceDepth > 0 || len(inputMeta.BlobReferences) > 0 {
-		return nil, compact.Stats{},
-			base.AssertionFailedf("copy compaction for %d with non-zero blob reference "+
-				"depth %d or references %v", inputMeta.TableNum, inputMeta.BlobReferenceDepth)
+		return nil, compact.Stats{}, base.AssertionFailedf(
+			"copy compaction for %s with blob references (depth=%d, refs=%d)",
+			inputMeta.TableNum, inputMeta.BlobReferenceDepth, len(inputMeta.BlobReferences),
+		)
 	}
-	ve = &versionEdit{
-		DeletedTables: map[manifest.DeletedTableEntry]*tableMetadata{
+	ve = &manifest.VersionEdit{
+		DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{
 			{Level: c.startLevel.level, FileNum: inputMeta.TableNum}: inputMeta,
 		},
 	}
@@ -2614,15 +2715,9 @@ func (d *DB) runCopyCompaction(
 	if err != nil {
 		return nil, compact.Stats{}, err
 	}
-	if !objMeta.IsExternal() {
-		if objMeta.IsRemote() || !remote.ShouldCreateShared(d.opts.Experimental.CreateOnShared, c.outputLevel.level) {
-			panic("pebble: scheduled a copy compaction that is not actually moving files to shared storage")
-		}
-		// Note that based on logic in the compaction picker, we're guaranteed
-		// inputMeta.Virtual is nil.
-		if inputMeta.Virtual {
-			panic(errors.AssertionFailedf("cannot do a copy compaction of a virtual sstable across local/remote storage"))
-		}
+	// This code does not support copying a shared table (which should never be necessary).
+	if objMeta.IsShared() {
+		return nil, compact.Stats{}, base.AssertionFailedf("copy compaction of shared table")
 	}
 
 	// We are in the relatively more complex case where we need to copy this
@@ -2631,7 +2726,7 @@ func (d *DB) runCopyCompaction(
 	// To ease up cleanup of the local file and tracking of refs, we create
 	// a new FileNum. This has the potential of making the block cache less
 	// effective, however.
-	newMeta := &tableMetadata{
+	newMeta := &manifest.TableMetadata{
 		Size:                     inputMeta.Size,
 		CreationTime:             inputMeta.CreationTime,
 		SmallestSeqNum:           inputMeta.SmallestSeqNum,
@@ -2656,13 +2751,6 @@ func (d *DB) runCopyCompaction(
 		// local -> shared copy. New file is guaranteed to not be virtual.
 		newMeta.InitPhysicalBacking()
 	}
-
-	// Before dropping the db mutex, grab a ref to the current version. This
-	// prevents any concurrent excises from deleting files that this compaction
-	// needs to read/maintain a reference to.
-	vers := d.mu.versions.currentVersion()
-	vers.Ref()
-	defer vers.UnrefLocked()
 
 	// NB: The order here is reversed, lock after unlock. This is similar to
 	// runCompaction.
@@ -2694,7 +2782,7 @@ func (d *DB) runCopyCompaction(
 		w, _, err := d.objProvider.Create(
 			ctx, base.FileTypeTable, newMeta.TableBacking.DiskFileNum,
 			objstorage.CreateOptions{
-				PreferSharedStorage: remote.ShouldCreateShared(d.opts.Experimental.CreateOnShared, c.outputLevel.level),
+				PreferSharedStorage: d.shouldCreateShared(c.outputLevel.level),
 			},
 		)
 		if err != nil {
@@ -2754,7 +2842,7 @@ func (d *DB) runCopyCompaction(
 		}
 		deleteOnExit = true
 	}
-	ve.NewTables = []newTableEntry{{
+	ve.NewTables = []manifest.NewTableEntry{{
 		Level: c.outputLevel.level,
 		Meta:  newMeta,
 	}}
@@ -2781,10 +2869,10 @@ func (d *DB) runCopyCompaction(
 // of tables deleted or excised.
 func (d *DB) applyHintOnFile(
 	h deleteCompactionHint,
-	f *tableMetadata,
+	f *manifest.TableMetadata,
 	level int,
 	levelMetrics *LevelMetrics,
-	ve *versionEdit,
+	ve *manifest.VersionEdit,
 	hintOverlap deletionHintOverlap,
 ) (newFiles []manifest.NewTableEntry, err error) {
 	if hintOverlap == hintDoesNotApply {
@@ -2820,7 +2908,7 @@ func (d *DB) applyHintOnFile(
 func (d *DB) runDeleteOnlyCompactionForLevel(
 	cl compactionLevel,
 	levelMetrics *LevelMetrics,
-	ve *versionEdit,
+	ve *manifest.VersionEdit,
 	snapshots compact.Snapshots,
 	fragments []deleteCompactionHintFragment,
 	exciseEnabled bool,
@@ -2938,10 +3026,10 @@ func fragmentDeleteCompactionHints(
 // d.mu must *not* be held when calling this.
 func (d *DB) runDeleteOnlyCompaction(
 	jobID JobID, c *compaction, snapshots compact.Snapshots,
-) (ve *versionEdit, stats compact.Stats, retErr error) {
+) (ve *manifest.VersionEdit, stats compact.Stats, retErr error) {
 	fragments := fragmentDeleteCompactionHints(d.cmp, c.deletionHints)
-	ve = &versionEdit{
-		DeletedTables: map[manifest.DeletedTableEntry]*tableMetadata{},
+	ve = &manifest.VersionEdit{
+		DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{},
 	}
 	for _, cl := range c.inputs {
 		levelMetrics := &LevelMetrics{}
@@ -2979,7 +3067,7 @@ func (d *DB) runDeleteOnlyCompaction(
 
 func (d *DB) runMoveCompaction(
 	jobID JobID, c *compaction,
-) (ve *versionEdit, stats compact.Stats, _ error) {
+) (ve *manifest.VersionEdit, stats compact.Stats, _ error) {
 	iter := c.startLevel.files.Iter()
 	meta := iter.First()
 	if iter.Next() != nil {
@@ -2992,11 +3080,11 @@ func (d *DB) runMoveCompaction(
 		TableBytesMoved: meta.Size,
 		TablesMoved:     1,
 	}
-	ve = &versionEdit{
-		DeletedTables: map[manifest.DeletedTableEntry]*tableMetadata{
+	ve = &manifest.VersionEdit{
+		DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{
 			{Level: c.startLevel.level, FileNum: meta.TableNum}: meta,
 		},
-		NewTables: []newTableEntry{
+		NewTables: []manifest.NewTableEntry{
 			{Level: c.outputLevel.level, Meta: meta},
 		},
 	}
@@ -3013,21 +3101,12 @@ func (d *DB) runMoveCompaction(
 // re-acquired during the course of this method.
 func (d *DB) runCompaction(
 	jobID JobID, c *compaction,
-) (ve *versionEdit, stats compact.Stats, retErr error) {
+) (ve *manifest.VersionEdit, stats compact.Stats, retErr error) {
 	if c.cancel.Load() {
 		return ve, stats, ErrCancelledCompaction
 	}
 	switch c.kind {
 	case compactionKindDeleteOnly:
-		// Before dropping the db mutex, grab a ref to the current version. This
-		// prevents any concurrent excises from deleting files that this compaction
-		// needs to read/maintain a reference to.
-		//
-		// Note that delete-only compactions can call excise(), which needs to be able
-		// to read these files.
-		vers := d.mu.versions.currentVersion()
-		vers.Ref()
-		defer vers.UnrefLocked()
 		// Release the d.mu lock while doing I/O.
 		// Note the unusual order: Unlock and then Lock.
 		snapshots := d.mu.snapshots.toSlice()
@@ -3044,23 +3123,6 @@ func (d *DB) runCompaction(
 
 	snapshots := d.mu.snapshots.toSlice()
 
-	if c.flushing == nil {
-		// Before dropping the db mutex, grab a ref to the current version. This
-		// prevents any concurrent excises from deleting files that this compaction
-		// needs to read/maintain a reference to.
-		//
-		// Note that unlike user iterators, compactionIter does not maintain a ref
-		// of the version or read state.
-		vers := d.mu.versions.currentVersion()
-		vers.Ref()
-		defer vers.UnrefLocked()
-	}
-
-	// The table is typically written at the maximum allowable format implied by
-	// the current format major version of the DB, but Options may define
-	// additional constraints.
-	tableFormat := d.TableFormat()
-
 	// Release the d.mu lock while doing I/O.
 	// Note the unusual order: Unlock and then Lock.
 	d.mu.Unlock()
@@ -3071,9 +3133,9 @@ func (d *DB) runCompaction(
 	// TODO(jackson): Currently we never separate values in non-tests. Choose
 	// and initialize the appropriate ValueSeparation implementation based on
 	// Options and the compaction inputs.
-	valueSeparation := c.getValueSeparation(jobID, c, tableFormat)
+	valueSeparation := c.getValueSeparation(jobID, c, c.tableFormat)
 
-	result := d.compactAndWrite(jobID, c, snapshots, tableFormat, valueSeparation)
+	result := d.compactAndWrite(jobID, c, snapshots, c.tableFormat, valueSeparation)
 	if result.Err == nil {
 		ve, result.Err = c.makeVersionEdit(result)
 	}
@@ -3081,7 +3143,7 @@ func (d *DB) runCompaction(
 		// Delete any created tables or blob files.
 		obsoleteFiles := manifest.ObsoleteFiles{
 			TableBackings: make([]*manifest.TableBacking, 0, len(result.Tables)),
-			BlobFiles:     make([]*manifest.BlobFileMetadata, 0, len(result.Blobs)),
+			BlobFiles:     make([]*manifest.PhysicalBlobFile, 0, len(result.Blobs)),
 		}
 		d.mu.Lock()
 		for i := range result.Tables {
@@ -3153,7 +3215,7 @@ func (d *DB) compactAndWrite(
 			categoryCompaction,
 		),
 	}
-	c.valueFetcher.Init(d.fileCache, blockReadEnv)
+	c.valueFetcher.Init(&c.version.BlobFiles, d.fileCache, blockReadEnv)
 	iiopts := internalIterOpts{
 		compaction:       true,
 		readEnv:          sstable.ReadEnv{Block: blockReadEnv},
@@ -3254,9 +3316,9 @@ func (d *DB) compactAndWrite(
 
 // makeVersionEdit creates the version edit for a compaction, based on the
 // tables in compact.Result.
-func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error) {
-	ve := &versionEdit{
-		DeletedTables: map[manifest.DeletedTableEntry]*tableMetadata{},
+func (c *compaction) makeVersionEdit(result compact.Result) (*manifest.VersionEdit, error) {
+	ve := &manifest.VersionEdit{
+		DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{},
 	}
 	for _, cl := range c.inputs {
 		for f := range cl.files.All() {
@@ -3267,9 +3329,12 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 		}
 	}
 	// Add any newly constructed blob files to the version edit.
-	ve.NewBlobFiles = make([]*manifest.BlobFileMetadata, len(result.Blobs))
+	ve.NewBlobFiles = make([]manifest.BlobFileMetadata, len(result.Blobs))
 	for i := range result.Blobs {
-		ve.NewBlobFiles[i] = result.Blobs[i].Metadata
+		ve.NewBlobFiles[i] = manifest.BlobFileMetadata{
+			FileID:   base.BlobFileID(result.Blobs[i].Metadata.FileNum),
+			Physical: result.Blobs[i].Metadata,
+		}
 	}
 
 	startLevelBytes := c.startLevel.files.TableSizeSum()
@@ -3277,8 +3342,8 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 		TableBytesIn: startLevelBytes,
 		// TODO(jackson):  This BytesRead value does not include any blob files
 		// written. It either should, or we should add a separate metric.
-		TableBytesRead:   c.outputLevel.files.TableSizeSum(),
-		BlobBytesWritten: result.Stats.CumulativeBlobFileSize,
+		TableBytesRead:     c.outputLevel.files.TableSizeSum(),
+		BlobBytesCompacted: result.Stats.CumulativeBlobFileSize,
 	}
 	if c.flushing != nil {
 		outputMetrics.BlobBytesFlushed = result.Stats.CumulativeBlobFileSize
@@ -3300,7 +3365,7 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 	}
 
 	inputLargestSeqNumAbsolute := c.inputLargestSeqNumAbsolute()
-	ve.NewTables = make([]newTableEntry, len(result.Tables))
+	ve.NewTables = make([]manifest.NewTableEntry, len(result.Tables))
 	for i := range result.Tables {
 		t := &result.Tables[i]
 
@@ -3311,7 +3376,7 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 			}
 		}
 
-		fileMeta := &tableMetadata{
+		fileMeta := &manifest.TableMetadata{
 			TableNum:           base.PhysicalTableFileNum(t.ObjMeta.DiskFileNum),
 			CreationTime:       t.CreationTime.Unix(),
 			Size:               t.WriterMeta.Size,
@@ -3347,7 +3412,7 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 			fileMeta.ExtendRangeKeyBounds(c.cmp, t.WriterMeta.SmallestRangeKey, t.WriterMeta.LargestRangeKey)
 		}
 
-		ve.NewTables[i] = newTableEntry{
+		ve.NewTables[i] = manifest.NewTableEntry{
 			Level: c.outputLevel.level,
 			Meta:  fileMeta,
 		}
@@ -3440,7 +3505,7 @@ func (d *DB) newCompactionOutputObj(
 		}
 	}
 
-	writable, objMeta, err := d.objProvider.Create(ctx, typ, diskFileNum, c.opts)
+	writable, objMeta, err := d.objProvider.Create(ctx, typ, diskFileNum, c.objCreateOpts)
 	if err != nil {
 		return nil, objstorage.ObjectMetadata{}, err
 	}
@@ -3458,7 +3523,7 @@ func (d *DB) newCompactionOutputObj(
 // validateVersionEdit validates that start and end keys across new and deleted
 // files in a versionEdit pass the given validation function.
 func validateVersionEdit(
-	ve *versionEdit, vk base.ValidateKey, format base.FormatKey, logger Logger,
+	ve *manifest.VersionEdit, vk base.ValidateKey, format base.FormatKey, logger Logger,
 ) {
 	validateKey := func(f *manifest.TableMetadata, key []byte) {
 		if err := vk.Validate(key); err != nil {

@@ -18,8 +18,10 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +31,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/errorfs"
-	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -37,7 +38,7 @@ import (
 type runAndCompareOptions struct {
 	seed              uint64
 	ops               randvar.Static
-	previousOpsPath   string
+	previousOpsPaths  []string
 	initialStatePath  string
 	initialStateDesc  string
 	traceFile         string
@@ -65,20 +66,21 @@ func (s Seed) apply(ro *runAndCompareOptions) { ro.seed = uint64(s) }
 // versions of Pebble, exercising upgrade code paths and cross-version
 // compatibility.
 //
-// The opsPath should be the filesystem path to the ops file containing the
-// operations run within the previous iteration of the metamorphic test. It's
-// used to inform operation generation to prefer using keys used in the previous
-// run, which are therefore more likely to be "interesting."
+// The opsPaths should be the filesystem paths for the ops files containing the
+// runs that resulted in the initial state. It's used to inform operation
+// generation to prefer using keys used in the previous run, which are therefore
+// more likely to be "interesting."; it is also required in order to issue
+// SingleDelete operations correctly.
 //
-// The initialStatePath argument should be the filesystem path to the data
-// directory containing the database where the previous run of the metamorphic
-// test left off.
+// The initialStatePath argument should be the filesystem path to the directory
+// containing the test state for the previous run of the metamorphic test left
+// off (with the store in a "data" subdirectory).
 //
 // The initialStateDesc argument is presentational and should hold a
 // human-readable description of the initial state.
-func ExtendPreviousRun(opsPath, initialStatePath, initialStateDesc string) RunOption {
+func ExtendPreviousRun(opsPaths []string, initialStatePath, initialStateDesc string) RunOption {
 	return closureOpt(func(ro *runAndCompareOptions) {
-		ro.previousOpsPath = opsPath
+		ro.previousOpsPaths = opsPaths
 		ro.initialStatePath = initialStatePath
 		ro.initialStateDesc = initialStateDesc
 	})
@@ -185,16 +187,17 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		cfg.numInstances = runOpts.numInstances
 	}
 	g := newGenerator(rng, cfg, km)
-	if runOpts.previousOpsPath != "" {
+	for _, opsPath := range runOpts.previousOpsPaths {
 		// During cross-version testing, we load keys from an `ops` file
 		// produced by a metamorphic test run of an earlier Pebble version.
 		// Seeding the keys ensure we generate interesting operations, including
 		// ones with key shadowing, merging, etc.
-		opsPath := filepath.Join(filepath.Dir(filepath.Clean(runOpts.previousOpsPath)), "ops")
 		opsData, err := os.ReadFile(opsPath)
 		require.NoError(t, err)
 		ops, err := parse(opsData, parserOpts{})
-		require.NoError(t, err)
+		if err != nil {
+			t.Fatalf("failed to parse previous ops file %q: %v", opsPath, err)
+		}
 		loadPrecedingKeys(ops, g.keyGenerator, km)
 	}
 
@@ -241,7 +244,15 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 		cmd := exec.Command(binary, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf(`
+			historyPath := filepath.Join(runDir, "history")
+			historyLines := strings.Split(readFile(historyPath), "\n")
+			// Show only the last 30 lines of history.
+			if maxLines := 30; len(historyLines) > maxLines {
+				start := len(historyLines) - maxLines
+				historyLines = append([]string{fmt.Sprintf("...[%d lines skipped]...", start)}, historyLines[start:]...)
+			}
+
+			t.Fatalf(`error running %v
 ===== SEED =====
 %d
 ===== ERR =====
@@ -254,13 +265,16 @@ func RunAndCompare(t *testing.T, rootDir string, rOpts ...RunOption) {
 %s
 ===== HISTORY =====
 %s
+%s
 To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir %s --try-to-reduce -v`,
+				cmd.String(),
 				runOpts.seed,
 				err,
 				out,
 				optionsStr,
 				opsPath,
-				readFile(filepath.Join(runDir, "history")),
+				historyPath,
+				strings.Join(historyLines, "\n"),
 				topLevelTestName, runDir,
 			)
 		}
@@ -303,14 +317,8 @@ To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir
 			t.Run(names[i], func(t *testing.T) {
 				lines := readHistory(t, getHistoryPath(names[i]))
 				lines = reorderHistory(lines)
-				diff := difflib.UnifiedDiff{
-					A:       base,
-					B:       lines,
-					Context: 5,
-				}
-				text, err := difflib.GetUnifiedDiffString(diff)
-				require.NoError(t, err)
-				if text != "" {
+				diff := lineByLineDiff(base, lines)
+				if diff != "" {
 					// NB: We force an exit rather than using t.Fatal because the latter
 					// will run another instance of the test if -count is specified, while
 					// we're happy to exit on the first failure.
@@ -332,7 +340,7 @@ To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --run-dir
 To reduce:  go test ./internal/metamorphic -tags invariants -run '%s$' --compare "%s/{%s,%s}" --try-to-reduce -v
 `,
 						runOpts.seed,
-						metaDir, names[0], names[i], text,
+						metaDir, names[0], names[i], diff,
 						names[0], optionsStrA,
 						names[i], optionsStrB,
 						opsPath,
@@ -403,6 +411,7 @@ type runOnceOptions struct {
 	failRegexp          *regexp.Regexp
 	numInstances        int
 	keyFormat           KeyFormat
+	initialStatePath    string
 	customOptionParsers map[string]func(string) (CustomOption, bool)
 }
 
@@ -456,6 +465,12 @@ type MultiInstance int
 func (m MultiInstance) apply(ro *runAndCompareOptions) { ro.numInstances = int(m) }
 func (m MultiInstance) applyOnce(ro *runOnceOptions)   { ro.numInstances = int(m) }
 
+// RunOnceInitialStatePath is used to set an initial database state path for a
+// single run.
+type RunOnceInitialStatePath string
+
+func (i RunOnceInitialStatePath) applyOnce(ro *runOnceOptions) { ro.initialStatePath = string(i) }
+
 // RunOnce performs one run of the metamorphic tests. RunOnce expects the
 // directory named by `runDir` to already exist and contain an `OPTIONS` file
 // containing the test run's configuration. The history of the run is persisted
@@ -484,6 +499,10 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 	testOpts := defaultTestOptions(runOpts.keyFormat)
 	opts := testOpts.Opts
 	require.NoError(t, parseOptions(testOpts, string(optionsData), runOpts.customOptionParsers))
+
+	if runOpts.initialStatePath != "" {
+		testOpts.initialStatePath = runOpts.initialStatePath
+	}
 
 	ops, err := parse(opsData, parserOpts{
 		parseFormattedUserKey:       testOpts.KeyFormat.ParseFormattedKey,
@@ -523,13 +542,13 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 		testOpts.Threads = runOpts.maxThreads
 	}
 
-	dir := opts.FS.PathJoin(runDir, "data")
+	dataDir := opts.FS.PathJoin(runDir, "data")
 	// Set up the initial database state if configured to start from a non-empty
 	// database. By default tests start from an empty database, but split
 	// version testing may configure a previous metamorphic tests's database
 	// state as the initial state.
 	if testOpts.initialStatePath != "" {
-		require.NoError(t, setupInitialState(dir, testOpts))
+		require.NoError(t, setupInitialState(dataDir, testOpts))
 	}
 
 	if testOpts.Opts.WALFailover != nil {
@@ -540,19 +559,13 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 			testOpts.Opts.WALFailover = nil
 		} else {
 			testOpts.Opts.WALFailover.Secondary.FS = opts.FS
-			testOpts.Opts.WALFailover.Secondary.Dirname = opts.FS.PathJoin(
-				runDir, testOpts.Opts.WALFailover.Secondary.Dirname)
 		}
 	}
 
-	if opts.WALDir != "" {
-		if runOpts.numInstances > 1 {
-			// TODO(bilal): Allow opts to diverge on a per-instance basis, and use
-			// that to set unique WAL dirs for all instances in multi-instance mode.
-			opts.WALDir = ""
-		} else {
-			opts.WALDir = opts.FS.PathJoin(runDir, opts.WALDir)
-		}
+	if runOpts.numInstances > 1 {
+		// TODO(bilal): Allow opts to diverge on a per-instance basis, and use
+		// that to set unique WAL dirs for all instances in multi-instance mode.
+		opts.WALDir = ""
 	}
 
 	historyFile, err := os.Create(historyPath)
@@ -567,7 +580,7 @@ func RunOnce(t TestingT, runDir string, seed uint64, historyPath string, rOpts .
 	defer h.Close()
 
 	m := newTest(ops)
-	require.NoError(t, m.init(h, dir, testOpts, runOpts.numInstances, runOpts.opTimeout))
+	require.NoError(t, m.init(h, dataDir, testOpts, runOpts.numInstances, runOpts.opTimeout))
 
 	if err := Execute(m); err != nil {
 		fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
@@ -706,4 +719,44 @@ func readFile(path string) string {
 	}
 
 	return string(history)
+}
+
+// lineByLineDiff performs a line-by-line diff of two histories and returns the
+// first chunk of differences.
+//
+// This is preferable to unified diffs (which groups differences into sections)
+// because it's easier to see the difference in each particular operation.
+//
+// Returns "" if the two slices are equal (modulo any trailing empty lines).
+func lineByLineDiff(a, b []string) string {
+	// Make the two slices the same length.
+	for len(a) < len(b) {
+		a = append(a, "")
+	}
+	for len(b) < len(a) {
+		b = append(b, "")
+	}
+	if slices.Equal(a, b) {
+		return ""
+	}
+	firstDiff := 0
+	for ; a[firstDiff] == b[firstDiff]; firstDiff++ {
+	}
+	start := max(0, firstDiff-8)
+	end := min(firstDiff+8, len(a))
+	var buf strings.Builder
+	extraLine := false
+	for i := start; i < end; i++ {
+		if a[i] == b[i] {
+			if extraLine {
+				fmt.Fprintf(&buf, "\n")
+				extraLine = false
+			}
+			fmt.Fprintf(&buf, "%s\n", strings.TrimSuffix(a[i], "\n"))
+		} else {
+			fmt.Fprintf(&buf, "\n-%s\n+%s\n", strings.TrimSuffix(a[i], "\n"), strings.TrimSuffix(b[i], "\n"))
+			extraLine = true
+		}
+	}
+	return buf.String()
 }

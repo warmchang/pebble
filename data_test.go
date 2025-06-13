@@ -10,11 +10,9 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"math/rand/v2"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -136,6 +134,8 @@ func runIterCmd(d *datadriven.TestData, iter *Iterator, closeIter bool) string {
 					op = "seeklt"
 				}
 				fmt.Fprintf(&b, "%s=%q\n", field, op)
+			case "value.Len()":
+				fmt.Fprintf(&b, "%s=%d\n", field, iter.value.Len())
 			default:
 				return fmt.Sprintf("unrecognized inspect field %q\n", field)
 			}
@@ -925,13 +925,13 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 	// them to the final version edit.
 	valueSeparator := &defineDBValueSeparator{
 		pbr:   &preserveBlobReferences{},
-		metas: make(map[base.DiskFileNum]*manifest.BlobFileMetadata),
+		metas: make(map[base.BlobFileID]*manifest.PhysicalBlobFile),
 	}
 
 	var mem *memTable
 	var start, end *base.InternalKey
 	var blobDepth manifest.BlobReferenceDepth
-	ve := &versionEdit{}
+	ve := &manifest.VersionEdit{}
 	level := -1
 
 	maybeFlush := func() error {
@@ -944,7 +944,7 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 			flushed:   make(chan struct{}),
 		}}
 		c, err := newFlush(d.opts, d.mu.versions.currentVersion(), d.mu.versions.l0Organizer,
-			d.mu.versions.picker.getBaseLevel(), toFlush, time.Now(), d.determineCompactionValueSeparation)
+			d.mu.versions.picker.getBaseLevel(), toFlush, time.Now(), d.TableFormat(), d.determineCompactionValueSeparation)
 		if err != nil {
 			return err
 		}
@@ -982,7 +982,7 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 			if largestSeqNum <= f.Meta.LargestSeqNum {
 				largestSeqNum = f.Meta.LargestSeqNum + 1
 			}
-			ve.NewTables = append(ve.NewTables, newTableEntry{
+			ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
 				Level: level,
 				Meta:  f.Meta,
 			})
@@ -1003,12 +1003,12 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 	}
 
 	// Example, a-c.
-	parseMeta := func(s string) (*tableMetadata, error) {
+	parseMeta := func(s string) (*manifest.TableMetadata, error) {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			return nil, errors.Errorf("malformed table spec: %s", s)
 		}
-		m := (&tableMetadata{}).ExtendPointKeyBounds(
+		m := (&manifest.TableMetadata{}).ExtendPointKeyBounds(
 			opts.Comparer.Compare,
 			InternalKey{UserKey: []byte(parts[0])},
 			InternalKey{UserKey: []byte(parts[1])},
@@ -1171,11 +1171,17 @@ func runDBDefineCmdReuseFS(td *datadriven.TestData, opts *Options) (*DB, error) 
 			return nil, err
 		}
 		for f, stats := range fileStats {
-			valueSeparator.metas[f].Size = stats.FileLen
-			valueSeparator.metas[f].ValueSize = stats.UncompressedValueBytes
+			valueSeparator.metas[base.BlobFileID(f)].Size = stats.FileLen
+			valueSeparator.metas[base.BlobFileID(f)].ValueSize = stats.UncompressedValueBytes
 		}
 
-		ve.NewBlobFiles = slices.Collect(maps.Values(valueSeparator.metas))
+		ve.NewBlobFiles = make([]manifest.BlobFileMetadata, 0, len(valueSeparator.metas))
+		for blobFileID, m := range valueSeparator.metas {
+			ve.NewBlobFiles = append(ve.NewBlobFiles, manifest.BlobFileMetadata{
+				FileID:   blobFileID,
+				Physical: m,
+			})
+		}
 
 		jobID := d.newJobIDLocked()
 		err = d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
@@ -1257,7 +1263,7 @@ func runTableFileSizesCmd(td *datadriven.TestData, d *DB) string {
 	return runVersionFileSizes(d.mu.versions.currentVersion())
 }
 
-func runVersionFileSizes(v *version) string {
+func runVersionFileSizes(v *manifest.Version) string {
 	var buf bytes.Buffer
 	for l, levelMetadata := range v.Levels {
 		if levelMetadata.Empty() {
@@ -1280,7 +1286,7 @@ func runVersionFileSizes(v *version) string {
 func runMetadataCommand(t *testing.T, td *datadriven.TestData, d *DB) string {
 	var table int
 	td.ScanArgs(t, "file", &table)
-	var m *tableMetadata
+	var m *manifest.TableMetadata
 	d.mu.Lock()
 	currVersion := d.mu.versions.currentVersion()
 	for _, level := range currVersion.Levels {
@@ -1304,7 +1310,7 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 
 	// See if we can grab the TableMetadata associated with the file. This is
 	// needed to easily construct virtual sstable properties.
-	var m *tableMetadata
+	var m *manifest.TableMetadata
 	d.mu.Lock()
 	currVersion := d.mu.versions.currentVersion()
 	for _, level := range currVersion.Levels {
@@ -1343,15 +1349,19 @@ func runSSTablePropertiesCmd(t *testing.T, td *datadriven.TestData, d *DB) strin
 	}
 	r, err := sstable.NewReader(context.Background(), readable, readerOpts)
 	if err != nil {
-		return err.Error()
+		return errors.CombineErrors(err, readable.Close()).Error()
 	}
 	defer r.Close()
 
-	props := r.Properties.String()
+	loadedProps, err := r.ReadPropertiesBlock(context.Background(), nil /* buffer pool */)
+	if err != nil {
+		return err.Error()
+	}
+	props := loadedProps.String()
 	env := sstable.ReadEnv{}
 	if m != nil && m.Virtual {
 		env.Virtual = m.VirtualParams
-		scaledProps := r.Properties.GetScaledProperties(m.TableBacking.Size, m.Size)
+		scaledProps := loadedProps.GetScaledProperties(m.TableBacking.Size, m.Size)
 		props = scaledProps.String()
 	}
 	if len(td.Input) == 0 {
@@ -1383,7 +1393,7 @@ func runLayoutCmd(t *testing.T, td *datadriven.TestData, d *DB) string {
 	}
 	r, err := sstable.NewReader(context.Background(), readable, d.opts.MakeReaderOptions())
 	if err != nil {
-		return err.Error()
+		return errors.CombineErrors(err, readable.Close()).Error()
 	}
 	defer r.Close()
 	l, err := r.Layout()
@@ -1457,9 +1467,9 @@ func runExciseCmd(td *datadriven.TestData, d *DB) error {
 	return d.Excise(context.Background(), exciseSpan)
 }
 
-func runExciseDryRunCmd(td *datadriven.TestData, d *DB) (*versionEdit, error) {
-	ve := &versionEdit{
-		DeletedTables: map[manifest.DeletedTableEntry]*tableMetadata{},
+func runExciseDryRunCmd(td *datadriven.TestData, d *DB) (*manifest.VersionEdit, error) {
+	ve := &manifest.VersionEdit{
+		DeletedTables: map[manifest.DeletedTableEntry]*manifest.TableMetadata{},
 	}
 	var exciseSpan KeyRange
 	if len(td.CmdArgs) != 2 {
@@ -1634,7 +1644,8 @@ func describeLSM(d *DB, verbose bool) string {
 	if blobFileMetas := d.mu.versions.blobFiles.Metadatas(); len(blobFileMetas) > 0 {
 		buf.WriteString("Blob files:\n")
 		for _, meta := range blobFileMetas {
-			fmt.Fprintf(&buf, "  %s: %d physical bytes, %d value bytes\n", meta.FileNum, meta.Size, meta.ValueSize)
+			fmt.Fprintf(&buf, "  %s: [%s] %d physical bytes, %d value bytes\n",
+				meta.FileID, meta.Physical.FileNum, meta.Physical.Size, meta.Physical.ValueSize)
 		}
 	}
 	return buf.String()
@@ -1761,8 +1772,8 @@ func parseDBOptionsArgs(opts *Options, args []datadriven.CmdArg) error {
 			}
 			opts.Experimental.SpanPolicyFunc = MakeStaticSpanPolicyFunc(opts.Comparer.Compare, span, policy)
 		case "target-file-sizes":
-			if len(opts.Levels) < len(cmdArg.Vals) {
-				opts.Levels = slices.Grow(opts.Levels, len(cmdArg.Vals)-len(opts.Levels))[0:len(cmdArg.Vals)]
+			if len(cmdArg.Vals) > len(opts.Levels) {
+				return errors.New("too many target-file-sizes")
 			}
 			for i := range cmdArg.Vals {
 				size, err := strconv.ParseInt(cmdArg.Vals[i], 10, 64)
@@ -1770,6 +1781,12 @@ func parseDBOptionsArgs(opts *Options, args []datadriven.CmdArg) error {
 					return err
 				}
 				opts.Levels[i].TargetFileSize = size
+			}
+			// Set the remaining file sizes. Normally, EnsureDefaults() would do that
+			// for us but it was already called and the target file sizes for all
+			// levels are now set to the defaults.
+			for i := len(cmdArg.Vals); i < len(opts.Levels); i++ {
+				opts.Levels[i].TargetFileSize = opts.Levels[i-1].TargetFileSize * 2
 			}
 		case "value-separation":
 			if len(cmdArg.Vals) != 3 {

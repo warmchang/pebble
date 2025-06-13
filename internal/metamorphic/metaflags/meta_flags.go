@@ -17,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/buildtags"
 	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/cockroachdb/pebble/metamorphic"
@@ -48,6 +49,9 @@ type CommonFlags struct {
 	// KeyFormatName is the name of the KeyFormat to use. Defaults to "testkeys".
 	// Acceptable values are "testkeys" and "cockroachkvs".
 	KeyFormatName string
+	// InitialStatePath is the path to a database data directory from a previous
+	// run. See the "initial-state" flag below.
+	InitialStatePath string
 }
 
 // KeyFormat returns the KeyFormat indicated by the flags KeyFormatName.
@@ -104,6 +108,10 @@ func initCommonFlags() *CommonFlags {
 	flag.StringVar(&c.KeyFormatName, "key-format", "testkeys",
 		"name of the key format to use")
 
+	flag.StringVar(&c.InitialStatePath, "initial-state", "",
+		`path to a database's data directory, used to prepopulate the test run's databases.
+		Must be used in conjunction with --previous-ops (unless --run or --compare is used).`)
+
 	return c
 }
 
@@ -126,23 +134,39 @@ type RunOnceFlags struct {
 
 func initRunOnceFlags(c *CommonFlags) *RunOnceFlags {
 	ro := &RunOnceFlags{CommonFlags: c}
-	flag.StringVar(&ro.RunDir, "run-dir", "",
+	ro.registerRunOnceFlags(flag.CommandLine)
+	return ro
+}
+
+func (ro *RunOnceFlags) registerRunOnceFlags(flagSet *flag.FlagSet) {
+	flagSet.StringVar(&ro.RunDir, "run-dir", "",
 		`directory containing the specific configuration to (re-)run (used for post-mortem debugging).
 Example: --run-dir _meta/231220-164251.3552792807512/random-003`)
 
-	flag.StringVar(&ro.Compare, "compare", "",
+	flagSet.StringVar(&ro.Compare, "compare", "",
 		`runs to compare, in the format _meta/test-root-dir/{run1,run2,...}. The result
 of each run is compared with the result of the first run.
 Example, --compare '_meta/231220-164251.3552792807512/{standard-000,random-025}'`)
 
-	flag.BoolVar(&ro.TryToReduce, "try-to-reduce", false,
+	flagSet.BoolVar(&ro.TryToReduce, "try-to-reduce", false,
 		`if set, we will try to reduce the number of operations that cause a failure. The
 verbose flag should be used with this flag.`)
 
-	flag.IntVar(&ro.ReduceAttempts, "reduce-attempts", 100,
+	flagSet.IntVar(&ro.ReduceAttempts, "reduce-attempts", 100,
 		`the number of attempts to reduce, for each probability; only used with --try-to-reduce.`)
+}
 
-	return ro
+// RunOnceOnlyFlagNames returns the names of the flags that are used only for
+// RunOnce/Compare.
+func RunOnceOnlyFlagNames() map[string]struct{} {
+	flagSet := flag.NewFlagSet("tmp", flag.ContinueOnError)
+	var ro RunOnceFlags
+	ro.registerRunOnceFlags(flagSet)
+	res := make(map[string]struct{})
+	flagSet.VisitAll(func(f *flag.Flag) {
+		res[f.Name] = struct{}{}
+	})
+	return res
 }
 
 // RunFlags contains flags that apply only to metamorphic.Run.
@@ -160,9 +184,6 @@ type RunFlags struct {
 	// PreviousOps is the path to the ops file of a previous run. See the
 	// "previous-ops" flag below.
 	PreviousOps string
-	// InitialStatePath is the path to a database data directory from a previous
-	// run. See the "initial-state" flag below.
-	InitialStatePath string
 	// InitialStateDesc is a human-readable description of the initial database
 	// state. See "initial-state-desc" flag below.
 	InitialStateDesc string
@@ -170,10 +191,15 @@ type RunFlags struct {
 
 func initRunFlags(c *CommonFlags) *RunFlags {
 	r := &RunFlags{CommonFlags: c}
-	flag.StringVar(&r.FS, "fs", "rand",
+	r.registerRunFlags(flag.CommandLine)
+	return r
+}
+
+func (r *RunFlags) registerRunFlags(flagSet *flag.FlagSet) {
+	flagSet.StringVar(&r.FS, "fs", "rand",
 		`force the tests to use either memory or disk-backed filesystems (valid: "mem", "disk", "rand")`)
 
-	flag.StringVar(&r.TraceFile, "trace-file", "",
+	flagSet.StringVar(&r.TraceFile, "trace-file", "",
 		"write an execution trace to `<run-dir>/file`")
 
 	ops := "uniform:5000-10000"
@@ -185,9 +211,9 @@ func initRunFlags(c *CommonFlags) *RunFlags {
 	if err := r.Ops.Set(ops); err != nil {
 		panic(err)
 	}
-	flag.Var(&r.Ops, "ops", "uniform:min-max")
+	flagSet.Var(&r.Ops, "ops", "uniform:min-max")
 
-	flag.StringVar(&r.InnerBinary, "inner-binary", "",
+	flagSet.StringVar(&r.InnerBinary, "inner-binary", "",
 		`binary to run for each instance of the test (this same binary by default); cannot be used
 with --run-dir or --compare`)
 
@@ -197,19 +223,30 @@ with --run-dir or --compare`)
 	// switches to the later Pebble SHA, setting the below options to point to
 	// the `ops` file and one of the previous run's data directories.
 
-	flag.StringVar(&r.PreviousOps, "previous-ops", "",
-		"path to an ops file, used to prepopulate the set of keys operations draw from")
+	flagSet.StringVar(&r.PreviousOps, "previous-ops", "",
+		`paths to the ops files for the previous runs that resulted in the initial state
+(separated by commas); used to prepopulate the set of keys operations draw from.
+Must be used in conjunction with --initial-state.`)
 
-	flag.StringVar(&r.InitialStatePath, "initial-state", "",
-		"path to a database's data directory, used to prepopulate the test run's databases")
-
-	flag.StringVar(&r.InitialStateDesc, "initial-state-desc", "",
+	flagSet.StringVar(&r.InitialStateDesc, "initial-state-desc", "",
 		`a human-readable description of the initial database state.
-		If set this parameter is written to the OPTIONS to aid in
-		debugging. It's intended to describe the lineage of a
-		database's state, including sufficient information for
-		reproduction (eg, SHA, prng seed, etc).`)
-	return r
+If set this parameter is written to the OPTIONS to aid in
+debugging. It's intended to describe the lineage of a
+database's state, including sufficient information for
+reproduction (eg, SHA, prng seed, etc).`)
+}
+
+// RunOnlyFlagNames returns the names of the flags that are used only for
+// metamorphic.Run.
+func RunOnlyFlagNames() map[string]struct{} {
+	flagSet := flag.NewFlagSet("tmp", flag.ContinueOnError)
+	var r RunFlags
+	r.registerRunFlags(flagSet)
+	res := make(map[string]struct{})
+	flagSet.VisitAll(func(f *flag.Flag) {
+		res[f.Name] = struct{}{}
+	})
+	return res
 }
 
 // InitRunOnceFlags initializes the flags that are used for a single run of the
@@ -244,6 +281,9 @@ func (ro *RunOnceFlags) MakeRunOnceOptions() []metamorphic.RunOnceOption {
 	if ro.NumInstances > 1 {
 		onceOpts = append(onceOpts, metamorphic.MultiInstance(ro.NumInstances))
 	}
+	if ro.InitialStatePath != "" {
+		onceOpts = append(onceOpts, metamorphic.RunOnceInitialStatePath(ro.InitialStatePath))
+	}
 	return onceOpts
 }
 
@@ -277,7 +317,7 @@ func (ro *RunOnceFlags) tryParseCompare() (testRootDir string, runSubdirs []stri
 }
 
 // MakeRunOptions constructs RunOptions based on the flags.
-func (r *RunFlags) MakeRunOptions() []metamorphic.RunOption {
+func (r *RunFlags) MakeRunOptions() ([]metamorphic.RunOption, error) {
 	opts := []metamorphic.RunOption{
 		metamorphic.Seed(r.Seed),
 		metamorphic.OpCount(r.Ops.Static),
@@ -298,7 +338,12 @@ func (r *RunFlags) MakeRunOptions() []metamorphic.RunOption {
 		opts = append(opts, metamorphic.RuntimeTrace(r.TraceFile))
 	}
 	if r.PreviousOps != "" {
-		opts = append(opts, metamorphic.ExtendPreviousRun(r.PreviousOps, r.InitialStatePath, r.InitialStateDesc))
+		if r.InitialStatePath == "" {
+			return nil, errors.Newf("--previous-ops requires --initial-state")
+		}
+		opts = append(opts, metamorphic.ExtendPreviousRun(strings.Split(r.PreviousOps, ","), r.InitialStatePath, r.InitialStateDesc))
+	} else if r.InitialStatePath != "" {
+		return nil, errors.Newf("--initial-state requires --previous-ops")
 	}
 	if r.NumInstances > 1 {
 		opts = append(opts, metamorphic.MultiInstance(r.NumInstances))
@@ -318,5 +363,5 @@ func (r *RunFlags) MakeRunOptions() []metamorphic.RunOption {
 	if r.InnerBinary != "" {
 		opts = append(opts, metamorphic.InnerBinary(r.InnerBinary))
 	}
-	return opts
+	return opts, nil
 }

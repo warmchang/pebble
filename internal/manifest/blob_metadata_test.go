@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBlobFileMetadata_ParseRoundTrip(t *testing.T) {
+func TestPhysicalBlobFile_ParseRoundTrip(t *testing.T) {
 	testCases := []struct {
 		name   string
 		input  string
@@ -33,6 +33,41 @@ func TestBlobFileMetadata_ParseRoundTrip(t *testing.T) {
 			name:   "humanized sizes are optional",
 			input:  "000001 size:[903530] vals:[39531]",
 			output: "000001 size:[903530 (882KB)] vals:[39531 (39KB)]",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := ParsePhysicalBlobFileDebug(tc.input)
+			require.NoError(t, err)
+			got := m.String()
+			want := tc.input
+			if tc.output != "" {
+				want = tc.output
+			}
+			require.Equal(t, want, got)
+		})
+	}
+}
+
+func TestBlobFileMetadata_ParseRoundTrip(t *testing.T) {
+	testCases := []struct {
+		name   string
+		input  string
+		output string
+	}{
+		{
+			name:  "verbatim",
+			input: "B000002 physical:{000001 size:[903530 (882KB)] vals:[39531 (39KB)]}",
+		},
+		{
+			name:   "whitespace is insignificant",
+			input:  "B000002          physical : {000001   size  : [ 903530 (882KB )] vals: [ 39531 ( 39KB ) ]  }",
+			output: "B000002 physical:{000001 size:[903530 (882KB)] vals:[39531 (39KB)]}",
+		},
+		{
+			name:   "humanized sizes are optional",
+			input:  "B000002 physical:{000001 size:[903530] vals:[39531]}",
+			output: "B000002 physical:{000001 size:[903530 (882KB)] vals:[39531 (39KB)]}",
 		},
 	}
 	for _, tc := range testCases {
@@ -105,4 +140,47 @@ func TestCurrentBlobFileSet(t *testing.T) {
 		}
 		return ""
 	})
+}
+
+func TestBlobFileSet_Lookup(t *testing.T) {
+	const numBlobFiles = 10000
+	set, files := makeTestBlobFiles(numBlobFiles)
+	for i := 0; i < numBlobFiles; i++ {
+		fn, ok := set.Lookup(base.BlobFileID(i))
+		require.True(t, ok)
+		require.Equal(t, files[i].FileNum, fn)
+	}
+}
+
+func makeTestBlobFiles(numBlobFiles int) (BlobFileSet, []PhysicalBlobFile) {
+	files := make([]PhysicalBlobFile, numBlobFiles)
+	for i := 0; i < numBlobFiles; i++ {
+		fileNum := base.DiskFileNum(i)
+		if i%2 == 0 {
+			fileNum = base.DiskFileNum(2*numBlobFiles + i)
+		}
+		files[i] = PhysicalBlobFile{
+			FileNum:      fileNum,
+			Size:         uint64(i),
+			ValueSize:    uint64(i),
+			CreationTime: uint64(i),
+		}
+	}
+	set := MakeBlobFileSet(nil)
+	for i := 0; i < numBlobFiles; i++ {
+		set.insert(BlobFileMetadata{
+			FileID:   base.BlobFileID(i % numBlobFiles),
+			Physical: &files[i],
+		})
+	}
+	return set, files
+}
+
+func BenchmarkBlobFileSet_Lookup(b *testing.B) {
+	const numBlobFiles = 10000
+	set, _ := makeTestBlobFiles(numBlobFiles)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = set.Lookup(base.BlobFileID(i % numBlobFiles))
+	}
 }

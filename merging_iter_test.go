@@ -148,7 +148,7 @@ func TestMergingIterDataDriven(t *testing.T) {
 	cmp := DefaultComparer.Compare
 	fmtKey := DefaultComparer.FormatKey
 	opts := DefaultOptions()
-	var v *version
+	var v *manifest.Version
 	var buf bytes.Buffer
 
 	// Indexed by FileNum.
@@ -206,7 +206,7 @@ func TestMergingIterDataDriven(t *testing.T) {
 			if err != nil {
 				d.Fatalf(t, "%v", err)
 			}
-			var files [numLevels][]*tableMetadata
+			var files [numLevels][]*manifest.TableMetadata
 			for l := range levels {
 				if levels[l].Value() != "L" {
 					d.Fatalf(t, "top-level strings should be L")
@@ -268,7 +268,7 @@ func TestMergingIterDataDriven(t *testing.T) {
 					}
 					r, err := sstable.NewReader(context.Background(), readable, opts.MakeReaderOptions())
 					if err != nil {
-						return err.Error()
+						return errors.CombineErrors(err, readable.Close()).Error()
 					}
 					readers[m.TableNum] = r
 				}
@@ -396,7 +396,7 @@ func buildMergingIterTables(
 		opts.CacheOpts.FileNum = base.DiskFileNum(i)
 		readers[i], err = sstable.NewReader(context.Background(), readable, opts)
 		if err != nil {
-			b.Fatal(err)
+			b.Fatal(errors.CombineErrors(err, readable.Close()))
 		}
 	}
 	return readers, keys, func() {
@@ -662,19 +662,19 @@ func buildLevelsForMergingIterSeqSeek(
 			fileCount++
 			r, err := sstable.NewReader(context.Background(), readable, opts)
 			if err != nil {
-				b.Fatal(err)
+				b.Fatal(errors.CombineErrors(err, readable.Close()))
 			}
 			readers[i] = append(readers[i], r)
 		}
 	}
 	levelSlices = make([]manifest.LevelSlice, levelCount)
 	for i := range readers {
-		meta := make([]*tableMetadata, len(readers[i]))
+		meta := make([]*manifest.TableMetadata, len(readers[i]))
 		for j := range readers[i] {
 			iter, err := readers[i][j].NewIter(sstable.NoTransforms, nil /* lower */, nil /* upper */, sstable.AssertNoBlobHandles)
 			require.NoError(b, err)
 			smallest := iter.First()
-			meta[j] = &tableMetadata{}
+			meta[j] = &manifest.TableMetadata{}
 			// The same FileNum is being reused across different levels, which
 			// is harmless for the benchmark since each level has its own iterator
 			// creation func.

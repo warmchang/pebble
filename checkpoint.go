@@ -70,7 +70,7 @@ type CheckpointSpan struct {
 // excludeFromCheckpoint returns true if an SST file should be excluded from the
 // checkpoint because it does not overlap with the spans of interest
 // (opt.restrictToSpans).
-func excludeFromCheckpoint(f *tableMetadata, opt *checkpointOptions, cmp Compare) bool {
+func excludeFromCheckpoint(f *manifest.TableMetadata, opt *checkpointOptions, cmp Compare) bool {
 	if len(opt.restrictToSpans) == 0 {
 		// Option not set; don't exclude anything.
 		return false
@@ -170,6 +170,9 @@ func (d *DB) Checkpoint(
 	}
 
 	// Disable file deletions.
+	// We acquire a reference on the version down below that will prevent any
+	// sstables or blob files from becoming "obsolete" and potentially deleted,
+	// but this doesn't protect the current WALs or manifests.
 	d.mu.Lock()
 	d.disableFileDeletions()
 	defer func() {
@@ -204,10 +207,17 @@ func (d *DB) Checkpoint(
 	// before our call to List.
 	allLogicalLogs := d.mu.log.manager.List()
 
-	// Release the manifest and DB.mu so we don't block other operations on
-	// the database.
+	// Release the manifest and DB.mu so we don't block other operations on the
+	// database.
+	//
+	// But first reference the version to ensure that the version's in-memory
+	// state and its physical files remain available for the checkpoint. In
+	// particular, the Version.BlobFileSet is only valid while a version is
+	// referenced.
+	current.Ref()
 	d.mu.versions.logUnlock()
 	d.mu.Unlock()
+	defer current.Unref()
 
 	// Wrap the normal filesystem with one which wraps newly created files with
 	// vfs.NewSyncingFile.
@@ -264,8 +274,8 @@ func (d *DB) Checkpoint(
 		}
 	}
 
-	var excludedTables map[manifest.DeletedTableEntry]*tableMetadata
-	var includedBlobFiles map[base.DiskFileNum]struct{}
+	var excludedTables map[manifest.DeletedTableEntry]*manifest.TableMetadata
+	var includedBlobFiles map[base.BlobFileID]struct{}
 	var remoteFiles []base.DiskFileNum
 	// Set of TableBacking.DiskFileNum which will be required by virtual sstables
 	// in the checkpoint.
@@ -297,7 +307,7 @@ func (d *DB) Checkpoint(
 		for f := iter.First(); f != nil; f = iter.Next() {
 			if excludeFromCheckpoint(f, opt, d.cmp) {
 				if excludedTables == nil {
-					excludedTables = make(map[manifest.DeletedTableEntry]*tableMetadata)
+					excludedTables = make(map[manifest.DeletedTableEntry]*manifest.TableMetadata)
 				}
 				excludedTables[manifest.DeletedTableEntry{
 					Level:   l,
@@ -309,12 +319,18 @@ func (d *DB) Checkpoint(
 			// Copy any referenced blob files that have not already been copied.
 			if len(f.BlobReferences) > 0 {
 				if includedBlobFiles == nil {
-					includedBlobFiles = make(map[base.DiskFileNum]struct{})
+					includedBlobFiles = make(map[base.BlobFileID]struct{})
 				}
 				for _, ref := range f.BlobReferences {
-					if _, ok := includedBlobFiles[ref.FileNum]; !ok {
-						includedBlobFiles[ref.FileNum] = struct{}{}
-						ckErr = copyFile(base.FileTypeBlob, ref.FileNum)
+					if _, ok := includedBlobFiles[ref.FileID]; !ok {
+						includedBlobFiles[ref.FileID] = struct{}{}
+
+						// Map the BlobFileID to a DiskFileNum in the current version.
+						diskFileNum, ok := current.BlobFiles.Lookup(ref.FileID)
+						if !ok {
+							return errors.Errorf("blob file %s not found", ref.FileID)
+						}
+						ckErr = copyFile(base.FileTypeBlob, diskFileNum)
 						if ckErr != nil {
 							return ckErr
 						}
@@ -348,12 +364,15 @@ func (d *DB) Checkpoint(
 	// When we write the MANIFEST of the checkpoint, we'll include a final
 	// VersionEdit that removes these blob files so that the checkpointed
 	// manifest is consistent.
-	var excludedBlobFiles map[base.DiskFileNum]*manifest.BlobFileMetadata
+	var excludedBlobFiles map[manifest.DeletedBlobFileEntry]*manifest.PhysicalBlobFile
 	if len(includedBlobFiles) < len(versionBlobFiles) {
-		excludedBlobFiles = make(map[base.DiskFileNum]*manifest.BlobFileMetadata, len(versionBlobFiles)-len(includedBlobFiles))
-		for _, blobFile := range versionBlobFiles {
-			if _, ok := includedBlobFiles[blobFile.FileNum]; !ok {
-				excludedBlobFiles[blobFile.FileNum] = blobFile
+		excludedBlobFiles = make(map[manifest.DeletedBlobFileEntry]*manifest.PhysicalBlobFile, len(versionBlobFiles)-len(includedBlobFiles))
+		for _, meta := range versionBlobFiles {
+			if _, ok := includedBlobFiles[meta.FileID]; !ok {
+				excludedBlobFiles[manifest.DeletedBlobFileEntry{
+					FileID:  meta.FileID,
+					FileNum: meta.Physical.FileNum,
+				}] = meta.Physical
 			}
 		}
 	}
@@ -462,9 +481,9 @@ func (d *DB) writeCheckpointManifest(
 	destDir vfs.File,
 	manifestFileNum base.DiskFileNum,
 	manifestSize int64,
-	excludedTables map[manifest.DeletedTableEntry]*tableMetadata,
+	excludedTables map[manifest.DeletedTableEntry]*manifest.TableMetadata,
 	removeBackingTables []base.DiskFileNum,
-	excludedBlobFiles map[base.DiskFileNum]*manifest.BlobFileMetadata,
+	excludedBlobFiles map[manifest.DeletedBlobFileEntry]*manifest.PhysicalBlobFile,
 ) error {
 	// Copy the MANIFEST, and create a pointer to it. We copy rather
 	// than link because additional version edits added to the
@@ -515,7 +534,7 @@ func (d *DB) writeCheckpointManifest(
 
 		if len(excludedTables) > 0 || len(excludedBlobFiles) > 0 {
 			// Write out an additional VersionEdit that deletes the excluded SST files.
-			ve := versionEdit{
+			ve := manifest.VersionEdit{
 				DeletedTables:        excludedTables,
 				RemovedBackingTables: removeBackingTables,
 				DeletedBlobFiles:     excludedBlobFiles,

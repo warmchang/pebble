@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
@@ -412,6 +413,13 @@ func (d *DB) TableFormat() sstable.TableFormat {
 	return f
 }
 
+// shouldCreateShared returns true if the database should use shared objects
+// when creating new objects on the given level.
+func (d *DB) shouldCreateShared(targetLevel int) bool {
+	return remote.ShouldCreateShared(d.opts.Experimental.CreateOnShared, targetLevel) &&
+		d.FormatMajorVersion() >= FormatMinForSharedObjects
+}
+
 // RatchetFormatMajorVersion ratchets the opened database's format major
 // version to the provided version. It errors if the provided format
 // major version is below the database's current version. Once a
@@ -543,7 +551,7 @@ func (d *DB) compactMarkedFilesLocked() error {
 // findFilesFunc scans the LSM for files, returning true if at least one
 // file was found. The returned array contains the matched files, if any, per
 // level.
-type findFilesFunc func(v *version) (found bool, files [numLevels][]*tableMetadata, _ error)
+type findFilesFunc func(v *manifest.Version) (found bool, files [numLevels][]*manifest.TableMetadata, _ error)
 
 // This method is not used currently, but it will be useful the next time we need
 // to mark files for compaction.
@@ -561,7 +569,7 @@ func (d *DB) markFilesLocked(findFn findFilesFunc) error {
 	rs := d.loadReadState()
 	var (
 		found bool
-		files [numLevels][]*tableMetadata
+		files [numLevels][]*manifest.TableMetadata
 		err   error
 	)
 	func() {

@@ -21,12 +21,9 @@ import (
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
-	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
@@ -107,7 +104,7 @@ Print the records in the sstables. The sstables are scanned in command line
 order which means the records will be printed in that order. Raw range
 tombstones are displayed interleaved with point records.
 
-When --blob-mode=load is specified, the path to a directory containing a 
+When --blob-mode=load is specified, the path to a directory containing a
 manifest and blob file must be provided as the last argument.
 `,
 		Args: cobra.MinimumNArgs(1),
@@ -153,7 +150,9 @@ inclusive-inclusive range specified by --start and --end.
 	return s
 }
 
-func (s *sstableT) newReader(f vfs.File, cacheHandle *cache.Handle) (*sstable.Reader, error) {
+func (s *sstableT) newReader(
+	f vfs.File, cacheHandle *cache.Handle, fn string,
+) (*sstable.Reader, error) {
 	readable, err := sstable.NewSimpleReadable(f)
 	if err != nil {
 		return nil, err
@@ -162,16 +161,27 @@ func (s *sstableT) newReader(f vfs.File, cacheHandle *cache.Handle) (*sstable.Re
 	o.Comparers = s.comparers
 	o.Mergers = s.mergers
 	o.CacheOpts = sstableinternal.CacheOptions{CacheHandle: cacheHandle}
-	return sstable.NewReader(context.Background(), readable, o)
+	if cacheHandle != nil {
+		_, fileNum, ok := base.ParseFilename(s.opts.FS, fn)
+		if ok {
+			o.CacheOpts.FileNum = fileNum
+		}
+	}
+	reader, err := sstable.NewReader(context.Background(), readable, o)
+	if err != nil {
+		return nil, errors.CombineErrors(err, readable.Close())
+	}
+	return reader, nil
 }
 
 func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
-	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
+	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader, props sstable.Properties) {
 		fmt.Fprintf(stdout, "%s\n", path)
+
 		// Update the internal formatter if this comparator has one specified.
-		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
-		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
+		s.fmtKey.setForComparer(props.ComparerName, s.comparers)
+		s.fmtValue.setForComparer(props.ComparerName, s.comparers)
 
 		iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 		if err != nil {
@@ -220,12 +230,13 @@ func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 
 func (s *sstableT) runLayout(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
-	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
+	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader, props sstable.Properties) {
+		// If the file is empty, print a message and return.
 		fmt.Fprintf(stdout, "%s\n", path)
 
 		// Update the internal formatter if this comparator has one specified.
-		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
-		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
+		s.fmtKey.setForComparer(props.ComparerName, s.comparers)
+		s.fmtValue.setForComparer(props.ComparerName, s.comparers)
 
 		l, err := r.Layout()
 		if err != nil {
@@ -247,11 +258,11 @@ func (s *sstableT) runLayout(cmd *cobra.Command, args []string) {
 
 func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
-	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
+	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader, props sstable.Properties) {
 		fmt.Fprintf(stdout, "%s\n", path)
 
 		if s.verbose {
-			fmt.Fprintf(stdout, "%s", r.Properties.String())
+			fmt.Fprintf(stdout, "%s", props.String())
 			return
 		}
 
@@ -279,47 +290,48 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 		}
 		fmt.Fprintf(tw, "size\t\n")
 		fmt.Fprintf(tw, "  file\t%s\n", humanize.Bytes.Int64(stat.Size()))
-		fmt.Fprintf(tw, "  data\t%s\n", humanize.Bytes.Uint64(r.Properties.DataSize))
-		fmt.Fprintf(tw, "    blocks\t%d\n", r.Properties.NumDataBlocks)
-		fmt.Fprintf(tw, "  index\t%s\n", humanize.Bytes.Uint64(r.Properties.IndexSize))
-		fmt.Fprintf(tw, "    blocks\t%d\n", 1+r.Properties.IndexPartitions)
-		fmt.Fprintf(tw, "    top-level\t%s\n", humanize.Bytes.Uint64(r.Properties.TopLevelIndexSize))
-		fmt.Fprintf(tw, "  filter\t%s\n", humanize.Bytes.Uint64(r.Properties.FilterSize))
-		fmt.Fprintf(tw, "  raw-key\t%s\n", humanize.Bytes.Uint64(r.Properties.RawKeySize))
-		fmt.Fprintf(tw, "  raw-value\t%s\n", humanize.Bytes.Uint64(r.Properties.RawValueSize))
-		fmt.Fprintf(tw, "  pinned-key\t%d\n", r.Properties.SnapshotPinnedKeySize)
-		fmt.Fprintf(tw, "  pinned-val\t%d\n", r.Properties.SnapshotPinnedValueSize)
-		fmt.Fprintf(tw, "  point-del-key-size\t%d\n", r.Properties.RawPointTombstoneKeySize)
-		fmt.Fprintf(tw, "  point-del-value-size\t%d\n", r.Properties.RawPointTombstoneValueSize)
-		fmt.Fprintf(tw, "records\t%d\n", r.Properties.NumEntries)
-		fmt.Fprintf(tw, "  set\t%d\n", r.Properties.NumEntries-
-			(r.Properties.NumDeletions+r.Properties.NumMergeOperands))
-		fmt.Fprintf(tw, "  delete\t%d\n", r.Properties.NumPointDeletions())
-		fmt.Fprintf(tw, "  delete-sized\t%d\n", r.Properties.NumSizedDeletions)
-		fmt.Fprintf(tw, "  range-delete\t%d\n", r.Properties.NumRangeDeletions)
-		fmt.Fprintf(tw, "  range-key-set\t%d\n", r.Properties.NumRangeKeySets)
-		fmt.Fprintf(tw, "  range-key-unset\t%d\n", r.Properties.NumRangeKeyUnsets)
-		fmt.Fprintf(tw, "  range-key-delete\t%d\n", r.Properties.NumRangeKeyDels)
-		fmt.Fprintf(tw, "  merge\t%d\n", r.Properties.NumMergeOperands)
-		fmt.Fprintf(tw, "  pinned\t%d\n", r.Properties.SnapshotPinnedKeys)
+		fmt.Fprintf(tw, "  data\t%s\n", humanize.Bytes.Uint64(props.DataSize))
+		fmt.Fprintf(tw, "    blocks\t%d\n", props.NumDataBlocks)
+		fmt.Fprintf(tw, "  index\t%s\n", humanize.Bytes.Uint64(props.IndexSize))
+		fmt.Fprintf(tw, "    blocks\t%d\n", 1+props.IndexPartitions)
+		fmt.Fprintf(tw, "    top-level\t%s\n", humanize.Bytes.Uint64(props.TopLevelIndexSize))
+		fmt.Fprintf(tw, "  filter\t%s\n", humanize.Bytes.Uint64(props.FilterSize))
+		fmt.Fprintf(tw, "  raw-key\t%s\n", humanize.Bytes.Uint64(props.RawKeySize))
+		fmt.Fprintf(tw, "  raw-value\t%s\n", humanize.Bytes.Uint64(props.RawValueSize))
+		fmt.Fprintf(tw, "  pinned-key\t%d\n", props.SnapshotPinnedKeySize)
+		fmt.Fprintf(tw, "  pinned-val\t%d\n", props.SnapshotPinnedValueSize)
+		fmt.Fprintf(tw, "  point-del-key-size\t%d\n", props.RawPointTombstoneKeySize)
+		fmt.Fprintf(tw, "  point-del-value-size\t%d\n", props.RawPointTombstoneValueSize)
+		fmt.Fprintf(tw, "records\t%d\n", props.NumEntries)
+		fmt.Fprintf(tw, "  set\t%d\n", props.NumEntries-
+			(props.NumDeletions+props.NumMergeOperands))
+		fmt.Fprintf(tw, "  delete\t%d\n", props.NumPointDeletions())
+		fmt.Fprintf(tw, "  delete-sized\t%d\n", props.NumSizedDeletions)
+		fmt.Fprintf(tw, "  range-delete\t%d\n", props.NumRangeDeletions)
+		fmt.Fprintf(tw, "  range-key-set\t%d\n", props.NumRangeKeySets)
+		fmt.Fprintf(tw, "  range-key-unset\t%d\n", props.NumRangeKeyUnsets)
+		fmt.Fprintf(tw, "  range-key-delete\t%d\n", props.NumRangeKeyDels)
+		fmt.Fprintf(tw, "  merge\t%d\n", props.NumMergeOperands)
+		fmt.Fprintf(tw, "  pinned\t%d\n", props.SnapshotPinnedKeys)
 		fmt.Fprintf(tw, "index\t\n")
 		fmt.Fprintf(tw, "  key\t")
 		fmt.Fprintf(tw, "  value\t")
-		fmt.Fprintf(tw, "comparer\t%s\n", r.Properties.ComparerName)
-		fmt.Fprintf(tw, "key-schema\t%s\n", formatNull(r.Properties.KeySchemaName))
-		fmt.Fprintf(tw, "merger\t%s\n", formatNull(r.Properties.MergerName))
-		fmt.Fprintf(tw, "filter\t%s\n", formatNull(r.Properties.FilterPolicyName))
-		fmt.Fprintf(tw, "compression\t%s\n", r.Properties.CompressionName)
-		fmt.Fprintf(tw, "  options\t%s\n", r.Properties.CompressionOptions)
+		fmt.Fprintf(tw, "comparer\t%s\n", props.ComparerName)
+		fmt.Fprintf(tw, "key-schema\t%s\n", formatNull(props.KeySchemaName))
+		fmt.Fprintf(tw, "merger\t%s\n", formatNull(props.MergerName))
+		fmt.Fprintf(tw, "filter\t%s\n", formatNull(props.FilterPolicyName))
+		fmt.Fprintf(tw, "compression\t%s\n", props.CompressionName)
+		fmt.Fprintf(tw, "  options\t%s\n", props.CompressionOptions)
 		fmt.Fprintf(tw, "user properties\t\n")
-		fmt.Fprintf(tw, "  collectors\t%s\n", r.Properties.PropertyCollectorNames)
-		keys := make([]string, 0, len(r.Properties.UserProperties))
-		for key := range r.Properties.UserProperties {
+		fmt.Fprintf(tw, "  collectors\t%s\n", props.PropertyCollectorNames)
+		// Read UserProperties directly from reader.
+		keys := make([]string, 0, len(r.UserProperties))
+		for key := range r.UserProperties {
 			keys = append(keys, key)
 		}
 		slices.Sort(keys)
 		for _, key := range keys {
-			fmt.Fprintf(tw, "  %s\t%s\n", key, r.Properties.UserProperties[key])
+			fmt.Fprintf(tw, "  %s\t%s\n", key, r.UserProperties[key])
 		}
 		_ = tw.Flush()
 	})
@@ -331,6 +343,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 	// containing the manifest(s) and blob file(s).
 	blobMode := ConvertToBlobRefMode(s.blobMode)
 	var blobDir string
+	var blobMappings *blobFileMappings
 	if blobMode == BlobRefModeLoad {
 		if len(args) < 2 {
 			fmt.Fprintf(stderr, "when --blob-mode=load is specified, the path to a "+
@@ -339,11 +352,23 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 		blobDir = args[len(args)-1]
 		args = args[:len(args)-1]
+		manifests, err := findManifests(stderr, s.opts.FS, blobDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s\n", err)
+			return
+		}
+		blobMappings, err = newBlobFileMappings(stderr, s.opts.FS, blobDir, manifests)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s\n", err)
+			return
+		}
+		defer func() { _ = blobMappings.Close() }()
 	}
-	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
+
+	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader, props sstable.Properties) {
 		// Update the internal formatter if this comparator has one specified.
-		s.fmtKey.setForComparer(r.Properties.ComparerName, s.comparers)
-		s.fmtValue.setForComparer(r.Properties.ComparerName, s.comparers)
+		s.fmtKey.setForComparer(props.ComparerName, s.comparers)
+		s.fmtValue.setForComparer(props.ComparerName, s.comparers)
 
 		// In filter-mode, we prefix ever line that is output with the sstable
 		// filename.
@@ -357,21 +382,17 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		var blobContext sstable.TableBlobContext
 		switch blobMode {
 		case BlobRefModePrint:
+			s.fmtValue.mustSet("[%s]")
 			blobContext = sstable.DebugHandlesBlobContext
 		case BlobRefModeLoad:
-			blobRefs, err := findAndReadManifests(stderr, s.opts.FS, blobDir)
-			if err != nil {
-				fmt.Fprintf(stderr, "%s\n", err)
+			// If the file number is unset, we are likely trying to read a
+			// non numerically named file.
+			if r.BlockReader().FileNum() == 0 {
+				fmt.Fprintf(stderr, "unset file in path %s\n", path)
 				return
 			}
-			provider := debugReaderProvider{
-				fs:  s.opts.FS,
-				dir: blobDir,
-			}
 			s.fmtValue.mustSet("[%s]")
-			var vf *blob.ValueFetcher
-			vf, blobContext = sstable.LoadValBlobContext(&provider, &blobRefs)
-			defer func() { _ = vf.Close() }()
+			blobContext = blobMappings.LoadValueBlobContext(base.PhysicalTableFileNum(r.BlockReader().FileNum()))
 		default:
 			blobContext = sstable.AssertNoBlobHandles
 		}
@@ -541,7 +562,7 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 
 func (s *sstableT) runSpace(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
-	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader) {
+	s.foreachSstable(stderr, args, func(path string, r *sstable.Reader, props sstable.Properties) {
 		bytes, err := r.EstimateDiskUsage(s.start, s.end, sstable.NoReadEnv)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s\n", err)
@@ -554,7 +575,9 @@ func (s *sstableT) runSpace(cmd *cobra.Command, args []string) {
 // foreachSstable opens each sstable specified in the args (if an arg is a
 // directory, it is walked for sstable files) and calls the given function.
 func (s *sstableT) foreachSstable(
-	stderr io.Writer, args []string, fn func(path string, r *sstable.Reader),
+	stderr io.Writer,
+	args []string,
+	fn func(path string, r *sstable.Reader, props sstable.Properties),
 ) {
 	pathFn := func(path string) {
 		f, err := s.opts.FS.Open(path)
@@ -563,18 +586,25 @@ func (s *sstableT) foreachSstable(
 			return
 		}
 
+		// TODO(annie): Use a BufferPool.
 		c := pebble.NewCache(128 << 20 /* 128 MB */)
 		defer c.Unref()
 		ch := c.NewHandle()
 		defer ch.Close()
 
-		r, err := s.newReader(f, ch)
+		r, err := s.newReader(f, ch, path)
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: %s\n", path, err)
 			return
 		}
 		defer func() { _ = r.Close() }()
-		fn(path, r)
+
+		props, err := r.ReadPropertiesBlock(context.Background(), nil /* buffer pool */)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s\n", err)
+			return
+		}
+		fn(path, r, props)
 	}
 
 	// listed and fn is invoked on any file with an .sst or .ldb suffix.
@@ -586,67 +616,4 @@ func (s *sstableT) foreachSstable(
 			}
 		})
 	}
-}
-
-// findAndReadManifests finds and reads all manifests in the specified
-// directory to gather blob references.
-func findAndReadManifests(
-	stderr io.Writer, fs vfs.FS, dir string,
-) (manifest.BlobReferences, error) {
-	var manifests []fileLoc
-	walk(stderr, fs, dir, func(path string) {
-		ft, fileNum, ok := base.ParseFilename(fs, path)
-		if !ok {
-			return
-		}
-		fl := fileLoc{DiskFileNum: fileNum, path: path}
-		switch ft {
-		case base.FileTypeManifest:
-			manifests = append(manifests, fl)
-		}
-	})
-	if len(manifests) == 0 {
-		return nil, errors.New("no MANIFEST files found in the given path")
-	}
-	blobMetas := make(map[base.DiskFileNum]struct{})
-	for _, fl := range manifests {
-		func() {
-			mf, err := fs.Open(fl.path)
-			if err != nil {
-				fmt.Fprintf(stderr, "%s\n", err)
-				return
-			}
-			defer mf.Close()
-
-			rr := record.NewReader(mf, 0 /* logNum */)
-			for {
-				r, err := rr.Next()
-				if err != nil {
-					if err != io.EOF {
-						fmt.Fprintf(stderr, "%s: %s\n", fl.path, err)
-					}
-					break
-				}
-				var ve manifest.VersionEdit
-				if err = ve.Decode(r); err != nil {
-					fmt.Fprintf(stderr, "%s: %s\n", fl.path, err)
-					break
-				}
-				for _, bf := range ve.NewBlobFiles {
-					if _, ok := blobMetas[bf.FileNum]; !ok {
-						blobMetas[bf.FileNum] = struct{}{}
-					}
-				}
-			}
-		}()
-	}
-	blobRefs := make(manifest.BlobReferences, len(blobMetas))
-	i := 0
-	for fn := range blobMetas {
-		blobRefs[i] = manifest.BlobReference{
-			FileNum: fn,
-		}
-		i++
-	}
-	return blobRefs, nil
 }

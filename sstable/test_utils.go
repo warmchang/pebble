@@ -31,7 +31,7 @@ func ReadAll(
 ) (points []base.InternalKV, rangeDels, rangeKeys []keyspan.Span, err error) {
 	reader, err := NewReader(context.Background(), r, ro)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.CombineErrors(err, r.Close())
 	}
 	defer func() { _ = reader.Close() }()
 	pointIter, err := reader.NewIter(NoTransforms, nil /* lower */, nil /* upper */, AssertNoBlobHandles)
@@ -276,14 +276,10 @@ func ParseWriterOptions[StringOrStringer any](o *WriterOptions, args ...StringOr
 			return errors.Errorf("%q is deprecated", key)
 
 		case "compression":
-			o.Compression, err = func() (block.Compression, error) {
-				for c := block.DefaultCompression; c < block.NCompression; c++ {
-					if strings.EqualFold(c.String(), value) {
-						return c, nil
-					}
-				}
-				return 0, errors.Errorf("unknown compression %q", value)
-			}()
+			o.Compression = block.CompressionProfileByName(value)
+			if o.Compression == nil {
+				return errors.Errorf("unknown compression %q", value)
+			}
 
 		default:
 			// TODO(radu): ignoring unknown keys is error-prone; we need to find an

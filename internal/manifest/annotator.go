@@ -79,7 +79,7 @@ type annotation struct {
 	valid atomic.Bool
 }
 
-func (a *Annotator[T]) findExistingAnnotation(n *node) *annotation {
+func (a *Annotator[T]) findExistingAnnotation(n *node[*TableMetadata]) *annotation {
 	n.annotMu.RLock()
 	defer n.annotMu.RUnlock()
 	for i := range n.annot {
@@ -92,7 +92,7 @@ func (a *Annotator[T]) findExistingAnnotation(n *node) *annotation {
 
 // findAnnotation finds this Annotator's annotation on a node, creating
 // one if it doesn't already exist.
-func (a *Annotator[T]) findAnnotation(n *node) *annotation {
+func (a *Annotator[T]) findAnnotation(n *node[*TableMetadata]) *annotation {
 	if a := a.findExistingAnnotation(n); a != nil {
 		return a
 	}
@@ -111,7 +111,7 @@ func (a *Annotator[T]) findAnnotation(n *node) *annotation {
 // nodeAnnotation computes this annotator's annotation of this node across all
 // files in the node's subtree. The second return value indicates whether the
 // annotation is stable and thus cacheable.
-func (a *Annotator[T]) nodeAnnotation(n *node) (t *T, cacheOK bool) {
+func (a *Annotator[T]) nodeAnnotation(n *node[*TableMetadata]) (t *T, cacheOK bool) {
 	annot := a.findAnnotation(n)
 	// If the annotation is already marked as valid, we can return it without
 	// recomputing anything.
@@ -153,7 +153,7 @@ func (a *Annotator[T]) nodeAnnotation(n *node) (t *T, cacheOK bool) {
 // files in the node's subtree which overlap with the range defined by bounds.
 // The computed annotation is accumulated into a.scratch.
 func (a *Annotator[T]) accumulateRangeAnnotation(
-	n *node,
+	n *node[*TableMetadata],
 	cmp base.Compare,
 	bounds base.UserKeyBounds,
 	// fullyWithinLowerBound and fullyWithinUpperBound indicate whether this
@@ -237,7 +237,7 @@ func (a *Annotator[T]) accumulateRangeAnnotation(
 
 // InvalidateAnnotation removes any existing cached annotations from this
 // annotator from a node's subtree.
-func (a *Annotator[T]) invalidateNodeAnnotation(n *node) {
+func (a *Annotator[T]) invalidateNodeAnnotation(n *node[*TableMetadata]) {
 	annot := a.findAnnotation(n)
 	annot.valid.Store(false)
 	if !n.leaf {
@@ -280,14 +280,16 @@ func (a *Annotator[T]) MultiLevelAnnotation(lms []LevelMetadata) *T {
 // [lowerBound, upperBound). A pointer to the Annotator is used as the key for
 // pre-calculated values, so the same Annotator must be used to avoid duplicate
 // computation.
-func (a *Annotator[T]) LevelRangeAnnotation(lm LevelMetadata, bounds base.UserKeyBounds) *T {
+func (a *Annotator[T]) LevelRangeAnnotation(
+	cmp base.Compare, lm LevelMetadata, bounds base.UserKeyBounds,
+) *T {
 	if lm.Empty() {
 		return a.Aggregator.Zero(nil)
 	}
 
 	var dst *T
 	dst = a.Aggregator.Zero(dst)
-	dst = a.accumulateRangeAnnotation(lm.tree.root, lm.tree.cmp, bounds, false, false, dst)
+	dst = a.accumulateRangeAnnotation(lm.tree.root, cmp, bounds, false, false, dst)
 	return dst
 }
 

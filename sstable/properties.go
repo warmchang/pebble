@@ -229,8 +229,7 @@ func writeProperties(loaded map[uintptr]struct{}, v reflect.Value, buf *bytes.Bu
 		}
 
 		f := v.Field(i)
-		// TODO(peter): Use f.IsZero() when we can rely on go1.13.
-		if zero := reflect.Zero(f.Type()); zero.Interface() == f.Interface() {
+		if f.IsZero() {
 			// Skip printing of zero values which were not loaded from disk.
 			if _, ok := loaded[ft.Offset]; !ok {
 				continue
@@ -317,9 +316,7 @@ func (p *Properties) String() string {
 	return buf.String()
 }
 
-func (p *Properties) load(
-	i iter.Seq2[[]byte, []byte], deniedUserProperties map[string]struct{},
-) error {
+func (p *Properties) load(i iter.Seq2[[]byte, []byte]) error {
 	p.Loaded = make(map[uintptr]struct{})
 	v := reflect.ValueOf(p).Elem()
 
@@ -346,7 +343,7 @@ func (p *Properties) load(
 			p.UserProperties = make(map[string]string)
 		}
 
-		if _, denied := deniedUserProperties[string(key)]; !denied {
+		if _, denied := ignoredInternalProperties[string(key)]; !denied {
 			p.UserProperties[intern.Bytes(key)] = string(val)
 		}
 	}
@@ -537,6 +534,9 @@ func (p *Properties) toAttributes() Attributes {
 	}
 	if p.NumValuesInBlobFiles > 0 {
 		attributes.Add(AttributeBlobValues)
+	}
+	if p.NumDataBlocks > 0 {
+		attributes.Add(AttributePointKeys)
 	}
 
 	return attributes

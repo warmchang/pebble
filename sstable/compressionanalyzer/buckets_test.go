@@ -7,12 +7,14 @@ package compressionanalyzer
 import (
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/crlib/crstrings"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 )
 
 func TestBuckets(t *testing.T) {
@@ -60,8 +62,9 @@ func TestBuckets(t *testing.T) {
 func exampleBuckets() Buckets {
 	var buckets Buckets
 	r := rand.New(rand.NewPCG(0, 0))
+	kinds := slices.Collect(blockkind.All())
 	for n := 0; n < 10; n++ {
-		k := BlockKind(r.IntN(int(numBlockKinds)))
+		k := kinds[r.IntN(len(kinds))]
 		sz := BlockSize(r.IntN(int(numBlockSizes)))
 		c := Compressibility(r.IntN(int(numCompressibility)))
 		b := &buckets[k][sz][c]
@@ -69,9 +72,10 @@ func exampleBuckets() Buckets {
 			b.UncompressedSize.Add(100 + float64(r.IntN(64*1024)))
 			for j := range b.Experiments {
 				e := &b.Experiments[j]
-				e.CompressionRatio.Add(float64(j+1) + 0.1*float64(r.IntN(10)))
-				e.CompressionTime.Add(float64((j+1)*10) + 0.1*float64(r.IntN(10)))
-				e.DecompressionTime.Add(float64((j+1)*100) + 0.1*float64(r.IntN(10)))
+				blockSize := uint64(50 + r.IntN(100))
+				e.CompressionRatio.Add(float64(j+1)+0.1*float64(r.IntN(10)), blockSize)
+				e.CompressionTime.Add(float64((j+1)*10)+0.1*float64(r.IntN(10)), blockSize)
+				e.DecompressionTime.Add(float64((j+1)*100)+0.1*float64(r.IntN(10)), blockSize)
 			}
 		}
 	}

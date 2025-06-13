@@ -105,9 +105,9 @@ type LevelMetrics struct {
 	// to values referenced by sstables that were inputs into compactions
 	// outputting into this level.
 	BlobBytesReadEstimate uint64
-	// BlobBytesWritten is the number of bytes written to blob files while
+	// BlobBytesCompacted is the number of bytes written to blob files while
 	// compacting sstables in this level.
-	BlobBytesWritten uint64
+	BlobBytesCompacted uint64
 	// BlobBytesFlushed is the number of bytes written to blob files while
 	// flushing sstables. This metric is always zero for all levels other than
 	// L0.
@@ -165,7 +165,7 @@ func (m *LevelMetrics) Add(u *LevelMetrics) {
 	m.TablesFlushed += u.TablesFlushed
 	m.TablesIngested += u.TablesIngested
 	m.TablesMoved += u.TablesMoved
-	m.BlobBytesWritten += u.BlobBytesWritten
+	m.BlobBytesCompacted += u.BlobBytesCompacted
 	m.BlobBytesFlushed += u.BlobBytesFlushed
 	m.BlobBytesReadEstimate += u.BlobBytesReadEstimate
 	m.MultiLevel.TableBytesInTop += u.MultiLevel.TableBytesInTop
@@ -177,16 +177,22 @@ func (m *LevelMetrics) Add(u *LevelMetrics) {
 }
 
 // WriteAmp computes the write amplification for compactions at this
-// level. Computed as:
+// level.
 //
-//	TableBytesFlushed + TableBytesCompacted + BlobBytesFlushed
-//	---------------------------------------------------------
-//	            TableBytesIn + BlobBytesWritten
+// The write amplification is computed as the quantity of physical bytes written
+// divided by the quantity of logical bytes written.
+//
+// Concretely, it's computed as:
+//
+//	TableBytesFlushed + TableBytesCompacted + BlobBytesFlushed + BlobBytesCompacted
+//	-------------------------------------------------------------------------------
+//	                              TableBytesIn
 func (m *LevelMetrics) WriteAmp() float64 {
 	if m.TableBytesIn == 0 {
 		return 0
 	}
-	return float64(m.TableBytesFlushed+m.TableBytesCompacted+m.BlobBytesFlushed) / float64(m.TableBytesIn+m.BlobBytesWritten)
+	return float64(m.TableBytesFlushed+m.TableBytesCompacted+m.BlobBytesFlushed+m.BlobBytesCompacted) /
+		float64(m.TableBytesIn)
 }
 
 var categoryCompaction = block.RegisterCategory("pebble-compaction", block.NonLatencySensitiveQoSLevel)
@@ -250,7 +256,12 @@ type Metrics struct {
 
 	Flush struct {
 		// The total number of flushes.
-		Count           int64
+		Count int64
+		// TODO(sumeer): the IdleDuration in this metric is flawed. It only
+		// measures idle duration when a flush finishes, representing the idleness
+		// before the start of a flush. So computing deltas over this metric over
+		// some time interval D may observe the sum of IdleDuration+WorkDuration
+		// to be either much smaller or much larger than D.
 		WriteThroughput ThroughputMetric
 		// Number of flushes that are in-progress. In the current implementation
 		// this will always be zero or one.
@@ -872,9 +883,15 @@ func percent(numerator, denominator int64) float64 {
 func (m *Metrics) StringForTests() string {
 	mCopy := *m
 	if math.MaxInt == math.MaxInt32 {
-		// This is the difference in Sizeof(sstable.Reader{})) between 64 and 32 bit
-		// platforms.
-		const tableCacheSizeAdjustment = 212
+		// README: This is the difference in Sizeof(sstable.Reader{})) + Sizeof(blob.FileReader{})
+		// between 64 and 32 bit platforms. See Metrics() in file_cache.go for more details.
+		// This magic number must be updated if the sstable.Reader or blob.FileReader struct changes.
+		// On 64-bit platforms, the size of the sstable.Reader struct is 616 bytes.
+		// On 32-bit platforms, the size of the sstable.Reader struct is 496 bytes.
+		// On 64-bit platforms, the size of the blob.FileReader struct is 88 bytes.
+		// On 32-bit platforms, the size of the blob.FileReader struct is 56 bytes.
+		// The difference is 616 - 496 + 88 - 56 = 152 bytes.
+		const tableCacheSizeAdjustment = 152
 		mCopy.FileCache.Size += mCopy.FileCache.Count * tableCacheSizeAdjustment
 	}
 	// Don't show cgo memory statistics as they can vary based on architecture,

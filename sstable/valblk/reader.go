@@ -6,12 +6,10 @@ package valblk
 
 import (
 	"context"
-	"math/rand/v2"
 	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
-	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
 
@@ -59,7 +57,7 @@ func (bpwc blockProviderWhenClosed) ReadValueBlock(
 	// TODO(sumeer): consider fixing this. See
 	// https://github.com/cockroachdb/pebble/pull/3065#issue-1991175365 for an
 	// alternative.
-	ctx := objiotracing.WithBlockType(context.Background(), objiotracing.ValueBlock)
+	ctx := context.Background()
 	// TODO(jackson,sumeer): Consider whether to use a buffer pool in this case.
 	// The bpwc is not allowed to outlive the iterator tree, so it cannot
 	// outlive the buffer pool.
@@ -165,11 +163,12 @@ type valueBlockFetcher struct {
 	valueBlockPtr unsafe.Pointer
 	valueCache    block.BufferHandle
 	closed        bool
-	bufToMangle   []byte
 
 	// lazyFetcher is the LazyFetcher value embedded in any LazyValue that we
 	// return. It is used to avoid having a separate allocation for that.
 	lazyFetcher base.LazyFetcher
+
+	bufMangler invariants.BufMangler
 }
 
 var _ base.ValueFetcher = (*valueBlockFetcher)(nil)
@@ -190,12 +189,12 @@ func newValueBlockFetcher(
 
 // Fetch implements base.ValueFetcher.
 func (f *valueBlockFetcher) Fetch(
-	ctx context.Context, handle []byte, blobFileNum base.DiskFileNum, valLen uint32, buf []byte,
+	ctx context.Context, handle []byte, _ base.BlobFileID, valLen uint32, buf []byte,
 ) (val []byte, callerOwned bool, err error) {
 	if !f.closed {
-		val, err := f.getValueInternal(handle, valLen)
+		val, err = f.getValueInternal(handle, valLen)
 		if invariants.Enabled {
-			val = f.doValueMangling(val)
+			val = f.bufMangler.MaybeMangleLater(val)
 		}
 		return val, false, err
 	}
@@ -233,21 +232,6 @@ func (f *valueBlockFetcher) close() {
 	f.closed = true
 	// rp, vbih, stats remain valid, so that LazyFetcher.ValueFetcher can be
 	// implemented.
-}
-
-// doValueMangling attempts to uncover violations of the contract listed in
-// the declaration comment of LazyValue. It is expensive, hence only called
-// when invariants.Enabled.
-func (f *valueBlockFetcher) doValueMangling(v []byte) []byte {
-	// Randomly set the bytes in the previous retrieved value to 0, since
-	// property P1 only requires the valueBlockReader to maintain the memory of
-	// one fetched value.
-	if rand.IntN(2) == 0 {
-		clear(f.bufToMangle)
-	}
-	// Store the current value in a new buffer for future mangling.
-	f.bufToMangle = append([]byte(nil), v...)
-	return f.bufToMangle
 }
 
 func (f *valueBlockFetcher) getValueInternal(handle []byte, valLen uint32) (val []byte, err error) {

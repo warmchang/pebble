@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
+	"github.com/cockroachdb/pebble/sstable/block/blockkind"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/sstable/valblk"
@@ -53,11 +54,12 @@ type RawColumnWriter struct {
 		// tombstone-dense for the purposes of compaction.
 		deletionSize int
 	}
-	indexBlock         colblk.IndexBlockWriter
-	topLevelIndexBlock colblk.IndexBlockWriter
-	rangeDelBlock      colblk.KeyspanBlockWriter
-	rangeKeyBlock      colblk.KeyspanBlockWriter
-	valueBlock         *valblk.Writer // nil iff WriterOptions.DisableValueBlocks=true
+	indexBlock                colblk.IndexBlockWriter
+	topLevelIndexBlock        colblk.IndexBlockWriter
+	rangeDelBlock             colblk.KeyspanBlockWriter
+	rangeKeyBlock             colblk.KeyspanBlockWriter
+	valueBlock                *valblk.Writer // nil iff WriterOptions.DisableValueBlocks=true
+	blobRefLivenessIndexBlock blobRefValueLivenessWriter
 	// filter accumulates the filter block. If populated, the filter ingests
 	// either the output of w.split (i.e. a prefix extractor) if w.split is not
 	// nil, or the full keys otherwise.
@@ -148,9 +150,9 @@ func newColumnarWriter(
 	if !o.DisableValueBlocks {
 		w.valueBlock = valblk.NewWriter(
 			block.MakeFlushGovernor(o.BlockSize, o.BlockSizeThreshold, o.SizeClassAwareThreshold, o.AllocatorSizeClasses),
-			w.opts.Compression, w.opts.Checksum, func(compressedSize int) {})
+			&w.compressor, w.opts.Checksum, func(compressedSize int) {})
 	}
-	if o.FilterPolicy != nil {
+	if o.FilterPolicy != base.NoFilterPolicy {
 		switch o.FilterType {
 		case TableFilter:
 			w.filterBlock = newTableFilterWriter(o.FilterPolicy)
@@ -185,7 +187,7 @@ func newColumnarWriter(
 	w.props.PropertyCollectorNames = buf.String()
 
 	w.props.ComparerName = o.Comparer.Name
-	w.props.CompressionName = o.Compression.String()
+	w.props.CompressionName = o.Compression.Name
 	w.props.KeySchemaName = o.KeySchema.Name
 	w.props.MergerName = o.MergerName
 
@@ -194,7 +196,7 @@ func newColumnarWriter(
 	w.cpuMeasurer = cpuMeasurer
 	go w.drainWriteQueue()
 
-	w.compressor = block.GetCompressor(w.opts.Compression)
+	w.compressor = block.MakeCompressor(w.opts.Compression)
 	return w
 }
 
@@ -442,6 +444,9 @@ func (w *RawColumnWriter) AddWithBlobHandle(
 		return err
 	}
 	w.props.NumValuesInBlobFiles++
+	if err := w.blobRefLivenessIndexBlock.addLiveValue(h.ReferenceID, h.BlockID, h.ValueID, uint64(h.ValueLen)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -720,10 +725,11 @@ func (w *RawColumnWriter) enqueueDataBlock(
 	// Serialize the data block, compress it and send it to the write queue.
 	cb := compressedBlockPool.Get().(*compressedBlock)
 	cb.blockBuf.checksummer.Type = w.opts.Checksum
-	cb.physical = block.CompressAndChecksumWithCompressor(
+	cb.physical = block.CompressAndChecksum(
 		&cb.blockBuf.dataBuf,
 		serializedBlock,
-		w.compressor,
+		blockkind.SSTableData,
+		&w.compressor,
 		&cb.blockBuf.checksummer,
 	)
 	return w.enqueuePhysicalBlock(cb, separator)
@@ -1000,6 +1006,19 @@ func (w *RawColumnWriter) Close() (err error) {
 		w.props.ValueBlocksSize = vbStats.ValueBlocksAndIndexSize
 	}
 
+	// Write the blob reference index block if non-empty.
+	if w.blobRefLivenessIndexBlock.numReferences() > 0 {
+		var encoder colblk.ReferenceLivenessBlockEncoder
+		encoder.Init()
+		for _, buf := range w.blobRefLivenessIndexBlock.bufs {
+			encoder.AddReferenceLiveness(buf)
+		}
+		if _, err := w.layout.WriteBlobRefIndexBlock(encoder.Finish()); err != nil {
+			return err
+		}
+		encoder.Reset()
+	}
+
 	// Write the properties block.
 	{
 		// Finish and record the prop collectors if props are not yet recorded.
@@ -1133,10 +1152,14 @@ func (w *RawColumnWriter) rewriteSuffixes(
 	}
 
 	if len(blocks) > 0 {
+		props, err := r.ReadPropertiesBlock(context.TODO(), nil /* buffer pool */)
+		if err != nil {
+			return errors.Wrap(err, "reading properties block")
+		}
 		w.meta.updateSeqNum(blocks[0].start.SeqNum())
-		w.props.NumEntries = r.Properties.NumEntries
-		w.props.RawKeySize = r.Properties.RawKeySize
-		w.props.RawValueSize = r.Properties.RawValueSize
+		w.props.NumEntries = props.NumEntries
+		w.props.RawKeySize = props.RawKeySize
+		w.props.RawValueSize = props.RawValueSize
 		w.meta.SetSmallestPointKey(blocks[0].start)
 		w.meta.SetLargestPointKey(blocks[len(blocks)-1].end)
 	}
@@ -1243,10 +1266,11 @@ func (w *RawColumnWriter) addDataBlock(b, sep []byte, bhp block.HandleWithProper
 	// Serialize the data block, compress it and send it to the write queue.
 	cb := compressedBlockPool.Get().(*compressedBlock)
 	cb.blockBuf.checksummer.Type = w.opts.Checksum
-	cb.physical = block.CompressAndChecksumWithCompressor(
+	cb.physical = block.CompressAndChecksum(
 		&cb.blockBuf.dataBuf,
 		b,
-		w.compressor,
+		blockkind.SSTableData,
+		&w.compressor,
 		&cb.blockBuf.checksummer,
 	)
 	if err := w.enqueuePhysicalBlock(cb, sep); err != nil {
@@ -1258,10 +1282,7 @@ func (w *RawColumnWriter) addDataBlock(b, sep []byte, bhp block.HandleWithProper
 // copyFilter copies the specified filter to the table. It's specifically used
 // by the sstable copier that can copy parts of an sstable to a new sstable,
 // using CopySpan().
-func (w *RawColumnWriter) copyFilter(filter []byte, filterName string) error {
-	if w.filterBlock != nil && filterName != w.filterBlock.policyName() {
-		return errors.New("mismatched filters")
-	}
+func (w *RawColumnWriter) copyFilter(filter []byte) error {
 	w.filterBlock = copyFilterWriter{
 		origPolicyName: w.filterBlock.policyName(), origMetaName: w.filterBlock.metaName(), data: filter,
 	}

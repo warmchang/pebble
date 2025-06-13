@@ -6,7 +6,6 @@ package tool
 
 import (
 	"bytes"
-	"cmp"
 	"fmt"
 	"io"
 	"slices"
@@ -20,6 +19,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 )
 
@@ -102,46 +102,6 @@ Check the contents of the MANIFEST files.
 	return m
 }
 
-func (m *manifestT) printLevels(cmp base.Compare, stdout io.Writer, v *manifest.Version) {
-	for level := range v.Levels {
-		if level == 0 && len(v.L0SublevelFiles) > 0 && !v.Levels[level].Empty() {
-			for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
-				fmt.Fprintf(stdout, "--- L0.%d ---\n", sublevel)
-				for f := range v.L0SublevelFiles[sublevel].All() {
-					if !anyOverlapFile(cmp, f, m.filterStart, m.filterEnd) {
-						continue
-					}
-					fmt.Fprintf(stdout, "  %s:%d", f.TableNum, f.Size)
-					formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
-					smallest := f.Smallest()
-					largest := f.Largest()
-					formatKeyRange(stdout, m.fmtKey, &smallest, &largest)
-					if f.Virtual {
-						fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.TableBacking.DiskFileNum)
-					}
-					fmt.Fprintf(stdout, "\n")
-				}
-			}
-			continue
-		}
-		fmt.Fprintf(stdout, "--- L%d ---\n", level)
-		for f := range v.Levels[level].All() {
-			if !anyOverlapFile(cmp, f, m.filterStart, m.filterEnd) {
-				continue
-			}
-			fmt.Fprintf(stdout, "  %s:%d", f.TableNum, f.Size)
-			formatSeqNumRange(stdout, f.SmallestSeqNum, f.LargestSeqNum)
-			smallest := f.Smallest()
-			largest := f.Largest()
-			formatKeyRange(stdout, m.fmtKey, &smallest, &largest)
-			if f.Virtual {
-				fmt.Fprintf(stdout, "(virtual:backingNum=%s)", f.TableBacking.DiskFileNum)
-			}
-			fmt.Fprintf(stdout, "\n")
-		}
-	}
-}
-
 func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 	stdout, stderr := cmd.OutOrStdout(), cmd.OutOrStderr()
 	for _, arg := range args {
@@ -194,67 +154,15 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 					continue
 				}
 
-				empty := true
 				if ve.ComparerName != "" {
-					empty = false
-					fmt.Fprintf(stdout, "  comparer:     %s", ve.ComparerName)
 					comparer = m.comparers[ve.ComparerName]
 					if comparer == nil {
-						fmt.Fprintf(stdout, " (unknown)")
+						fmt.Fprintf(stderr, " comparer %q unknown\n", ve.ComparerName)
 					}
-					fmt.Fprintf(stdout, "\n")
 					m.fmtKey.setForComparer(ve.ComparerName, m.comparers)
 				}
-				if ve.MinUnflushedLogNum != 0 {
-					empty = false
-					fmt.Fprintf(stdout, "  log-num:       %d\n", ve.MinUnflushedLogNum)
-				}
-				if ve.ObsoletePrevLogNum != 0 {
-					empty = false
-					fmt.Fprintf(stdout, "  prev-log-num:  %d\n", ve.ObsoletePrevLogNum)
-				}
-				if ve.NextFileNum != 0 {
-					empty = false
-					fmt.Fprintf(stdout, "  next-file-num: %d\n", ve.NextFileNum)
-				}
-				if ve.LastSeqNum != 0 {
-					empty = false
-					fmt.Fprintf(stdout, "  last-seq-num:  %d\n", ve.LastSeqNum)
-				}
-				entries := make([]manifest.DeletedTableEntry, 0, len(ve.DeletedTables))
-				for df := range ve.DeletedTables {
-					empty = false
-					entries = append(entries, df)
-				}
-				slices.SortFunc(entries, func(a, b manifest.DeletedTableEntry) int {
-					if v := cmp.Compare(a.Level, b.Level); v != 0 {
-						return v
-					}
-					return cmp.Compare(a.FileNum, b.FileNum)
-				})
-				for _, df := range entries {
-					fmt.Fprintf(stdout, "  deleted:       L%d %s\n", df.Level, df.FileNum)
-				}
-				for _, nf := range ve.NewTables {
-					empty = false
-					fmt.Fprintf(stdout, "  added:         L%d %s:%d",
-						nf.Level, nf.Meta.TableNum, nf.Meta.Size)
-					formatSeqNumRange(stdout, nf.Meta.SmallestSeqNum, nf.Meta.LargestSeqNum)
-					smallest := nf.Meta.Smallest()
-					largest := nf.Meta.Largest()
-					formatKeyRange(stdout, m.fmtKey, &smallest, &largest)
-					if nf.Meta.CreationTime != 0 {
-						fmt.Fprintf(stdout, " (%s)",
-							time.Unix(nf.Meta.CreationTime, 0).UTC().Format(time.RFC3339))
-					}
-					fmt.Fprintf(stdout, "\n")
-				}
-				if empty {
-					// NB: An empty version edit can happen if we log a version edit with
-					// a zero field. RocksDB does this with a version edit that contains
-					// `LogNum == 0`.
-					fmt.Fprintf(stdout, "  <empty>\n")
-				}
+
+				fmt.Fprint(stdout, ve.DebugString(m.fmtKey.fn))
 				editIdx++
 			}
 
@@ -267,14 +175,14 @@ func (m *manifestT) runDump(cmd *cobra.Command, args []string) {
 					return
 				}
 				l0Organizer.PerformUpdate(l0Organizer.PrepareUpdate(&bve, v), v)
-				m.printLevels(comparer.Compare, stdout, v)
+				fmt.Fprint(stdout, v.DebugStringFormatKey(m.fmtKey.fn))
 			}
 		}()
 	}
 }
 
 func anyOverlap(cmp base.Compare, ve *manifest.VersionEdit, start, end key) bool {
-	if start == nil && end == nil {
+	if start == nil && end == nil || len(ve.NewTables) == 0 && len(ve.DeletedTables) == 0 {
 		return true
 	}
 	for _, df := range ve.DeletedTables {
@@ -623,9 +531,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 					return
 				}
 
-				empty := true
 				if ve.ComparerName != "" {
-					empty = false
 					cmp = m.comparers[ve.ComparerName]
 					if cmp == nil {
 						fmt.Fprintf(stdout, "%s: offset: %d comparer %s not found",
@@ -635,12 +541,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 					}
 					m.fmtKey.setForComparer(ve.ComparerName, m.comparers)
 				}
-				empty = empty && ve.MinUnflushedLogNum == 0 && ve.ObsoletePrevLogNum == 0 &&
-					ve.LastSeqNum == 0 && len(ve.DeletedTables) == 0 &&
-					len(ve.NewTables) == 0
-				if empty {
-					continue
-				}
+
 				// TODO(sbhola): add option to Apply that reports all errors instead of
 				// one error.
 				if v == nil {
@@ -652,7 +553,7 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 					fmt.Fprintf(stdout, "%s: offset: %d err: %s\n",
 						arg, offset, err)
 					fmt.Fprintf(stdout, "Version state before failed Apply\n")
-					m.printLevels(cmp.Compare, stdout, v)
+					fmt.Fprint(stdout, v.DebugStringFormatKey(m.fmtKey.fn))
 					fmt.Fprintf(stdout, "Version edit that failed\n")
 					for df := range ve.DeletedTables {
 						fmt.Fprintf(stdout, "  deleted: L%d %s\n", df.Level, df.FileNum)
@@ -677,4 +578,17 @@ func (m *manifestT) runCheck(cmd *cobra.Command, args []string) {
 	if ok {
 		fmt.Fprintf(stdout, "OK\n")
 	}
+}
+
+func findManifests(stderr io.Writer, fs vfs.FS, dir string) ([]fileLoc, error) {
+	var manifests []fileLoc
+	walk(stderr, fs, dir, func(path string) {
+		ft, fileNum, ok := base.ParseFilename(fs, path)
+		if !ok || ft != base.FileTypeManifest {
+			return
+		}
+		manifests = append(manifests, fileLoc{DiskFileNum: fileNum, path: path})
+	})
+	slices.SortFunc(manifests, cmpFileLoc)
+	return manifests, nil
 }

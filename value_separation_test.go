@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -80,12 +79,12 @@ func TestValueSeparationPolicy(t *testing.T) {
 				case "preserve-blob-references":
 					pbr := &preserveBlobReferences{}
 					lines := crstrings.Lines(d.Input)
-					pbr.inputBlobMetadatas = make([]*manifest.BlobFileMetadata, 0, len(lines))
+					pbr.inputBlobPhysicalFiles = make(map[base.BlobFileID]*manifest.PhysicalBlobFile, len(lines))
 					for _, line := range lines {
 						bfm, err := manifest.ParseBlobFileMetadataDebug(line)
 						require.NoError(t, err)
-						fn = max(fn, bfm.FileNum)
-						pbr.inputBlobMetadatas = append(pbr.inputBlobMetadatas, bfm)
+						fn = max(fn, bfm.Physical.FileNum)
+						pbr.inputBlobPhysicalFiles[bfm.FileID] = bfm.Physical
 					}
 					vs = pbr
 				case "write-new-blob-files":
@@ -142,7 +141,7 @@ func TestValueSeparationPolicy(t *testing.T) {
 				} else {
 					fmt.Fprintln(&buf, "blobrefs:[")
 					for i, ref := range meta.BlobReferences {
-						fmt.Fprintf(&buf, " %d: %s %d\n", i, ref.FileNum, ref.ValueSize)
+						fmt.Fprintf(&buf, " %d: %s %d\n", i, ref.FileID, ref.ValueSize)
 					}
 					fmt.Fprintln(&buf, "]")
 				}
@@ -180,7 +179,7 @@ func (w *loggingRawWriter) AddWithBlobHandle(
 // references from values.
 type defineDBValueSeparator struct {
 	bv    blobtest.Values
-	metas map[base.DiskFileNum]*manifest.BlobFileMetadata
+	metas map[base.BlobFileID]*manifest.PhysicalBlobFile
 	pbr   *preserveBlobReferences
 	kv    base.InternalKV
 }
@@ -220,22 +219,22 @@ func (vs *defineDBValueSeparator) Add(
 	}
 	lv := iv.LazyValue()
 	// If we haven't seen this blob file before, fabricate a metadata for it.
-	fileNum := lv.Fetcher.BlobFileNum
-	meta, ok := vs.metas[fileNum]
+	fileID := lv.Fetcher.BlobFileID
+	meta, ok := vs.metas[fileID]
 	if !ok {
-		meta = &manifest.BlobFileMetadata{
-			FileNum:      fileNum,
+		meta = &manifest.PhysicalBlobFile{
+			FileNum:      base.DiskFileNum(fileID),
 			CreationTime: uint64(time.Now().Unix()),
 		}
-		vs.metas[fileNum] = meta
+		vs.metas[fileID] = meta
 	}
 	meta.Size += uint64(lv.Fetcher.Attribute.ValueLen)
 	meta.ValueSize += uint64(lv.Fetcher.Attribute.ValueLen)
 
-	// If it's not already in pbr.inputBlobMetadatas, add it.
-	if !slices.Contains(vs.pbr.inputBlobMetadatas, meta) {
-		vs.pbr.inputBlobMetadatas = append(vs.pbr.inputBlobMetadatas, meta)
+	if vs.pbr.inputBlobPhysicalFiles == nil {
+		vs.pbr.inputBlobPhysicalFiles = make(map[base.BlobFileID]*manifest.PhysicalBlobFile)
 	}
+	vs.pbr.inputBlobPhysicalFiles[fileID] = meta
 	// Return a KV that uses the original key but our constructed blob reference.
 	vs.kv.K = kv.K
 	vs.kv.V = iv

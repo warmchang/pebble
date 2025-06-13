@@ -44,7 +44,7 @@ func (d *db) close() {
 }
 
 func main() {
-	const dir = "tool/testdata/find-db-val-sep"
+	const dir = "tool/testdata/find-val-sep-db"
 
 	fs := vfs.Default
 	if err := fs.RemoveAll(dir); err != nil {
@@ -78,5 +78,9 @@ func main() {
 	tdb.set("bbb", "mai")
 	tdb.set("ccc", "poiandyaya")
 	tdb.set("ddd", "6")
+	tdb.flush()
+
+	tdb.set("eee", "pigeon")
+	tdb.set("fff", "chicken")
 	tdb.flush()
 }
